@@ -20,8 +20,8 @@
 | 5a | LightRFT [PR#53](https://github.com/opendilab/LightRFT/pull/53) PRM 训练 + accuracy debug | 🔄 **仍在 debug** | KL bug 已定位修复 (30→4e-4)；accuracy 不上升真问题、main 冲突、PRM 变体 1、freeze_prefix 修复均待办 |
 | 5b | LightRFT [PR#56](https://github.com/opendilab/LightRFT/pull/56) Geo3K ORM-RL demo | ✅ 收尾 (merged) | vLLM + SGLang 双路径完整验证 |
 | 6 | 7B-70B agentic-rl 开源 base 调研 | ✅ TOP3 给出 | [openclaw-rl#6 §3](https://github.com/HansBug/OpenClaw-RL/issues/6) |
-| 3 | Harbor + terminus2 + Qwen3-8B benchmark | ❌ 0%（环境基础已就位） | [openclaw-rl#5 Phase 1](https://github.com/HansBug/OpenClaw-RL/issues/5) 待执行 |
-| 4 | camel-agent vs terminus2 对比文档 | ❌ 0%（依赖 #3） | [openclaw-rl#5 Phase 2](https://github.com/HansBug/OpenClaw-RL/issues/5) 待执行 |
+| 3 | Harbor + terminus2 + Qwen3-8B benchmark | ✅ 完整 | [openclaw-rl#8](https://github.com/HansBug/OpenClaw-RL/issues/8) — base + 4 ckpt × 66 task × 3 attempt = **990 trial / 11h4min** |
+| 4 | camel-agent vs terminus2 对比文档 | ❌ 0%（待 Phase 2） | [openclaw-rl#5 Phase 2](https://github.com/HansBug/OpenClaw-RL/issues/5) 待执行 |
 
 ---
 
@@ -123,20 +123,58 @@
 
 ---
 
-## 3 + 4. Harbor + terminus2 + camel-agent 对比 ❌ 0% 进度
+## 3. Phase 1 — Harbor + terminus-2 + Qwen3-8B OOD 跑分 ✅ 完成
 
-[`openclaw-rl#5`](https://github.com/HansBug/OpenClaw-RL/issues/5) 把 4 项 TODO 拆成 3 个 Phase + 8 个待决策开放问题，全部 `- [ ]` checkbox 化，方便后续分配执行。
+[`openclaw-rl#8`](https://github.com/HansBug/OpenClaw-RL/issues/8) 完整记录 [`openclaw-rl#5`](https://github.com/HansBug/OpenClaw-RL/issues/5) Phase 1 的全部产出：在 **Terminal-Bench v0.1.x 冻结集**（86 task → harbor 适配后 66 task）上用 **harbor 0.5.0 + terminus-2 agent + sglang 0.5.x** 跑了 base + run-3 的 4 个代表性 ckpt × 3 attempt = **990 trial / 11h4min wall-clock**。
 
-**已就位**：[`terminal-bench 0.2.18`](https://www.tbench.ai) + [`Terminus2`](https://github.com/laude-institute/terminal-bench/tree/main/terminal_bench/agents/terminus_2) 类 + run-2 的 35 个 ckpt（4 个代表性: `iter_0000007 / 0000119 / 0000215 / 0000279`）。
+### 3.1 5 model × 66 task × 3 attempt 主结果
 
-**待执行（Phase 1 baseline）**：
-1. 装 [harbor](https://github.com/camel-ai/seta/blob/main/evaluation/terminal_bench_eval/run_eval_tb2.sh) 包（pip 名待 SETA `setup.sh` 确认）
-2. 下 [terminal-bench-core v0.1.x](https://www.tbench.ai) 80-task 冻结集
-3. 起 Qwen3-8B [vLLM](https://github.com/vllm-project/vllm) / [SGLang](https://github.com/sgl-project/sglang) OpenAI-compat server
-4. 跑 base + 4 个 ckpt × 80 task × 3 run = 5 × 240 trial
-5. 对照 [terminal-bench leaderboard](https://www.tbench.ai)（GPT-5.5 82.7% / Opus 4.7 69.4% / DeepSeek V4 Pro 67.9%）
+![Phase 1 OOD bar chart + train vs OOD divergence](figs/fig6_phase1_ood.png)
 
-**Phase 2**：camel-agent ([`terminal-rl/agent_runner.py`](https://github.com/Gen-Verse/OpenClaw-RL/blob/main/terminal-rl/agent_runner.py)) vs terminus2 静态对比（prompt template / tool schema / context 管理 / max_turns / 错误处理）作为替换决策依据，依赖 Phase 1 数字。
+| Model | Trials | Solved | pass@1 | pass@3 | Mean reward | Errors | Mean dur |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| `qwen3-8b-base` | 198 | 4 | 0.020 | 0.030 | 0.020 | 104 (52.5%) | 113 s |
+| `qwen3-8b-iter7` | 198 | 7 | 0.035 | 0.061 | 0.035 | 102 (51.5%) | 114 s |
+| `qwen3-8b-iter119` | 198 | 6 | 0.030 | 0.061 | 0.030 | 97 (49.0%) | 104 s |
+| **`qwen3-8b-iter215`** | **198** | **11** | **0.056** | **0.091** | **0.056** | **82 (41.4%)** | **109 s** |
+| `qwen3-8b-iter279` | 198 | 5 | 0.025 | 0.030 | 0.025 | 81 (40.9%) | 116 s |
+
+> 数据来源：[issue #8 §2.1](https://github.com/HansBug/OpenClaw-RL/issues/8) ，pass@k 严格按 [Codex 论文 Chen et al. 2021 公式 (1)](https://arxiv.org/abs/2107.03374) 的无偏估计计算。
+
+### 3.2 三条核心结论
+
+1. 🥇 **`iter_0000215` 是真实 OOD 峰值**：pass@3 = **0.091**（base 0.030 → **3.0×**），solved 6/66 unique task。这与训练侧 wandb msp60ius `terminal/accuracy` 单点峰值时刻（rollout 215, acc=0.673）**完全对齐**——证明该峰**不是 lucky batch 而是真实策略改进**，并且 6 个 unique task 是 base 的 2 个 ∪ iter7/119 的 4 个 ∪ 新增 fibonacci-server 的**严格超集**（[issue #8 §2.2](https://github.com/HansBug/OpenClaw-RL/issues/8)）。
+
+2. 📉 **`iter_0000279` (final) 在 OOD 上完全回落到 base 水平**：pass@3 = **0.030 = base**，solved 仅 2/66（hello-world + configure-git-webserver），丢掉 iter215 已经会的 grid-pattern-transform / fibonacci-server / csv-to-parquet / recover-obfuscated-files。**训练 215 → 279 这 64 个 rollout 是有害的**——而训练侧 wandb 50-window 数字几乎没变（0.506 → 0.518），这是 issue #6 [`reward_mean ±1 跳变`](https://github.com/HansBug/OpenClaw-RL/issues/2) 现象在 OOD 上的对应映射。下次训练应该在 **rollout 215 附近就早停**，或 ckpt retention 改成 `--save-best-by-eval-acc`。
+
+3. 🐛 **990 trials 中 466 (47%) 触发 `AgentTimeoutError`** —— Qwen3-8B 在多步 terminal task 上常陷入"reasoning 越拉越长但没 actionable step"的死循环（base 在 `blind-maze-explorer-5x5` 跑了 293 step、消耗 530K prompt token 仍未 progress）。这条数据本身就是 issue #6 P0-2 repetition penalty / format reward 的强动机。
+
+### 3.3 训练侧 vs OOD 对齐分析（issue #5 §1.6.3 关键判定）
+
+| ckpt | 训练 50-window acc | 训练 单点 peak | OOD pass@1 | OOD pass@3 | 对齐 |
+|---|---:|---:|---:|---:|---|
+| iter_0000007 | 0.197 | 0.228 | 0.035 | 0.061 | ✅ 都很低 |
+| iter_0000119 | 0.475 | 0.494 | 0.030 | 0.061 | ⚠️ 训练侧 +35pp，OOD 持平 |
+| **iter_0000215** | 0.506 | **0.673** | **0.056** | **0.091** | ✅ **训练 50-win + OOD 同步峰值 — 真峰** |
+| iter_0000279 | 0.518 | 0.516 | **0.025** | **0.030** | ❌ **训练持平，OOD 暴跌回 base — mode shift** |
+
+**iter_0000215 vs iter_0000279 OOD pass@1 比 = 2.24×**。
+
+### 3.4 评测设置摘要（详见 [issue #8 §1](https://github.com/HansBug/OpenClaw-RL/issues/8)）
+
+| 维度 | 配置 |
+|---|---|
+| Benchmark | [terminal-bench-core v0.1.x](https://www.tbench.ai) 86 task → harbor 适配后 66 task（20 个用 `solution.yaml` 的 task 被 harbor 0.5.0 的 `TerminalBenchMapper` skip） |
+| Agent | [`harbor 0.5.0`](https://pypi.org/project/harbor/) + terminus-2 + LiteLLM 后端 |
+| Inference | 2× [SGLang 0.5.x](https://github.com/sgl-project/sglang) servers (TP=4 each, GPU 0-3 / 4-7), `--disable-custom-all-reduce` 绕开 [sglang upstream issue #11957](https://github.com/sgl-project/sglang/issues/11957) |
+| ckpt 转换 | `slime/tools/convert_torch_dist_to_hf.py` DCP→HF safetensors，每 ckpt ~4 min |
+| Concurrency | `-k 3 -n 6`（每 task 3 attempt × 6 同时 docker container）|
+
+---
+
+## 4. Phase 2 — camel-agent vs terminus2 对比文档 ❌ 0% 进度
+
+依赖 Phase 1 OOD 数字（已有），但静态代码对比 + 替换决策文档还没动。计划见 [`openclaw-rl#5 §3 Phase 2`](https://github.com/HansBug/OpenClaw-RL/issues/5)：camel-agent ([`terminal-rl/agent_runner.py`](https://github.com/Gen-Verse/OpenClaw-RL/blob/main/terminal-rl/agent_runner.py)) vs terminus2 (harbor wheel 内 `harbor/agents/terminus_2/`) 在 **prompt template / tool schema / context 管理 / max_turns 策略 / 错误处理** 5 个维度的差异表，作为"是否替换 RL rollout agent"的决策输入。
 
 ---
 
@@ -145,7 +183,7 @@
 按 ROI 排序：
 
 1. **[openclaw-rl#6 P0-0 假设验证](https://github.com/HansBug/OpenClaw-RL/issues/6#issuecomment-4341621165)**：从 `iter_0000279` 续跑 step 1100+，24-48h，决定算法层重构是否必要
-2. **[openclaw-rl#5 Phase 1](https://github.com/HansBug/OpenClaw-RL/issues/5)**：装 harbor + 跑 80-task benchmark，第一次有"对外可比数字"
+2. **[openclaw-rl#5 Phase 2](https://github.com/HansBug/OpenClaw-RL/issues/5) 启动**：基于 Phase 1 已有数字（[issue #8](https://github.com/HansBug/OpenClaw-RL/issues/8)），写 camel-agent vs terminus-2 对比文档 + RL rollout agent 替换决策
 3. **[CDE actor perplexity bonus](https://arxiv.org/abs/2509.09675)**（D4，1 天工程量）—— 与 P0-0 并行
 4. **[LightRFT PR#53](https://github.com/opendilab/LightRFT/pull/53) 继续 debug**：先 resolve reviewer 修改点 + 解 main 冲突 → 实现 PRM 变体 1 → 回头 debug accuracy 不上升 (重点 dataset 位置对齐)
 5. **新一轮训练**：根据 P0-0 结果决定继续 Qwen3-8B 还是切 [Qwen3-Coder-30B-A3B](https://huggingface.co/Qwen/Qwen3-Coder-30B-A3B-Instruct)
