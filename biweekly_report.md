@@ -18,7 +18,7 @@
 | 1 | Qwen3-8B SETA terminal-rl 训练 | ✅ | 3 次 run + env-pool 全栈复盘 + 4 个 issue |
 | 2 | agentic-rl 探索/利用改进调研 | ✅ | [openclaw-rl#6](https://github.com/HansBug/OpenClaw-RL/issues/6) |
 | 5a | LightRFT [PR#53](https://github.com/opendilab/LightRFT/pull/53) PRM 训练 + accuracy debug | 🔄 **仍在 debug** | KL bug 已定位修复 (30→4e-4)；accuracy 不上升真问题、main 冲突、PRM 变体 1、freeze_prefix 修复均待办 |
-| 5b | LightRFT [PR#56](https://github.com/opendilab/LightRFT/pull/56) Geo3K ORM-RL demo | ✅ 收尾 (merged) | HF + SGLang 双路径完整验证 |
+| 5b | LightRFT [PR#56](https://github.com/opendilab/LightRFT/pull/56) Geo3K ORM-RL demo | ✅ 收尾 (merged) | vLLM + SGLang 双路径完整验证 |
 | 6 | 7B-70B agentic-rl 开源 base 调研 | ✅ TOP3 给出 | [openclaw-rl#6 §3](https://github.com/HansBug/OpenClaw-RL/issues/6) |
 | 3 | Harbor + terminus2 + Qwen3-8B benchmark | ❌ 0%（环境基础已就位） | [openclaw-rl#5 Phase 1](https://github.com/HansBug/OpenClaw-RL/issues/5) 待执行 |
 | 4 | camel-agent vs terminus2 对比文档 | ❌ 0%（依赖 #3） | [openclaw-rl#5 Phase 2](https://github.com/HansBug/OpenClaw-RL/issues/5) 待执行 |
@@ -97,14 +97,14 @@
 
 [`opendilab/LightRFT#56`](https://github.com/opendilab/LightRFT/pull/56)（state: **MERGED** @ 2026-04-29）：最小化的端到端 ORM-RL demo 实验，专门让 ORM RL workflow 容易理解、运行、debug。两条 rollout 路径完整长训验证后已收尾合入 main：
 
-| Rollout 后端 | wandb run | 配置 |
-|---|---|---|
-| HF rollout | [`pcwonr2h`](https://wandb.ai/hansbug/ORM-RL-Demo-QwenVL-7B-Geo3K/runs/pcwonr2h) | `ORM-RL-Demo-Geo3K-General-04161630` (2 GPU) |
-| SGLang rollout | [`zrekazyw`](https://wandb.ai/hansbug/ORM-RL-Demo-QwenVL-7B-Geo3K/runs/zrekazyw) | `ORM-RL-Demo-Geo3K-General-SGLang-20260417_150451` |
+| Rollout 后端 | wandb run | run name | 配置 |
+|---|---|---|---|
+| **vLLM** rollout | [`pcwonr2h`](https://wandb.ai/hansbug/ORM-RL-Demo-QwenVL-7B-Geo3K/runs/pcwonr2h) | `ORM-RL-Demo-Geo3K-General-04161630` | 2 GPU / 320 step / `rollout engine = vllm` / `rm_use_engine=True (vllm)` |
+| **SGLang** rollout | [`zrekazyw`](https://wandb.ai/hansbug/ORM-RL-Demo-QwenVL-7B-Geo3K/runs/zrekazyw) | `ORM-RL-Demo-Geo3K-General-SGLang-20260417_150451` | 同等配置切到 SGLang + RM engine |
 
-![LightRFT PR#56 Geo3K HF vs SGLang](figs/fig4_lightrft_pr56.png)
+![LightRFT PR#56 Geo3K vLLM vs SGLang](figs/fig4_lightrft_pr56.png)
 
-> 4 panel：train/eval 的 accuracy_reward_mean、rollout/reward、response_length。两条路径独立训练曲线收敛到相近的 reward 水位（train acc reward ~0.65，eval acc reward ~0.55），证明 PR#56 的 demo 在两个 rollout 后端下都能正确跑通 ORM-RL 学习。响应长度上 HF rollout 略稳定（350 token 区间），SGLang 后期开始下行。
+> 4 panel：train/eval 的 accuracy_reward_mean、rollout/reward、response_length。两条 rollout 后端独立训练，曲线收敛到相近的 reward 水位（train acc reward ~0.65，eval acc reward ~0.55），证明 PR#56 demo 在 vLLM 与 SGLang 两条路径下都能正确跑通 ORM-RL 学习。响应长度上 vLLM 略稳定（350 token 区间），SGLang 后期开始下行。
 
 ---
 
