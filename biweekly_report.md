@@ -17,8 +17,8 @@
 |---:|---|:---:|---|
 | 1 | Qwen3-8B SETA terminal-rl 训练 | ✅ | 3 次 run + env-pool 全栈复盘 + 4 个 issue |
 | 2 | agentic-rl 探索/利用改进调研 | ✅ | [openclaw-rl#6](https://github.com/HansBug/OpenClaw-RL/issues/6) |
-| 5a | LightRFT [PR#53](https://github.com/opendilab/LightRFT/pull/53) PRM 训练 + accuracy debug | ✅ silent gather 错位 bug 已定位修复 | KL 30 → 4e-4 (5 个数量级落差) |
-| 5b | LightRFT [PR#56](https://github.com/opendilab/LightRFT/pull/56) Geo3K ORM-RL demo | ✅ merged | HF + SGLang 双路径完整验证 |
+| 5a | LightRFT [PR#53](https://github.com/opendilab/LightRFT/pull/53) PRM 训练 + accuracy debug | 🔄 **仍在 debug** | KL bug 已定位修复 (30→4e-4)；accuracy 不上升真问题、main 冲突、PRM 变体 1、freeze_prefix 修复均待办 |
+| 5b | LightRFT [PR#56](https://github.com/opendilab/LightRFT/pull/56) Geo3K ORM-RL demo | ✅ 收尾 (merged) | HF + SGLang 双路径完整验证 |
 | 6 | 7B-70B agentic-rl 开源 base 调研 | ✅ TOP3 给出 | [openclaw-rl#6 §3](https://github.com/HansBug/OpenClaw-RL/issues/6) |
 | 3 | Harbor + terminus2 + Qwen3-8B benchmark | ❌ 0%（环境基础已就位） | [openclaw-rl#5 Phase 1](https://github.com/HansBug/OpenClaw-RL/issues/5) 待执行 |
 | 4 | camel-agent vs terminus2 对比文档 | ❌ 0%（依赖 #3） | [openclaw-rl#5 Phase 2](https://github.com/HansBug/OpenClaw-RL/issues/5) 待执行 |
@@ -69,11 +69,11 @@
 
 ## 5. LightRFT 训练侧两个 PR
 
-### 5.1 PR#53 — URSA-MATH Stage3 PRM ✅ 关键 bug 修复
+### 5.1 PR#53 — URSA-MATH Stage3 PRM 🔄 仍在 debug
 
-[`opendilab/LightRFT#53`](https://github.com/opendilab/LightRFT/pull/53) 现状：Phase 1-7 全部 done（数据 / URSA 对齐 / 全数据训练链 / 启动器 / 观察健康），仅余 rollout 性能优化作 follow-up。
+[`opendilab/LightRFT#53`](https://github.com/opendilab/LightRFT/pull/53)（state: **OPEN**, mergeable: **CONFLICTING**, review: **CHANGES_REQUESTED**）：核心训练链 Phase 1-7 已 done，但 **accuracy 不上升的真问题还没解决**。本周期 KL=30 这条线索做了一次完整诊断闭环，但只是众多 debug 步骤之一。
 
-本周期最重要的进展是 **silent gather 错位 bug 定位修复**（comment chain [4343948369](https://github.com/opendilab/LightRFT/pull/53#issuecomment-4343948369) → [4350355425](https://github.com/opendilab/LightRFT/pull/53#issuecomment-4350355425) → [4350418489](https://github.com/opendilab/LightRFT/pull/53#issuecomment-4350418489)）：
+**本周期内进展**（仅是阶段性）：silent gather 错位 bug 定位修复（comment chain [4343948369](https://github.com/opendilab/LightRFT/pull/53#issuecomment-4343948369) → [4350355425](https://github.com/opendilab/LightRFT/pull/53#issuecomment-4350355425) → [4350418489](https://github.com/opendilab/LightRFT/pull/53#issuecomment-4350418489)）：
 
 | 阶段 | wandb run | 现象 / 修复 |
 |---|---|---|
@@ -86,11 +86,16 @@
 
 > 左图：broken run 7b71y4ft 的 215 步 KL 单调爬到 ~30 nat 持续告警（log scale，峰值 409 nat）。右图：修复前后 KL 5 个数量级落差对照（30 → 1e-4）。
 
-**还需做**：(a) `freeze_prefix` 三层覆盖小 bug；(b) PR#53 与 main 冲突解决；(c) PRM 变体 1 实现（stage3 原始 outcome-reward 的 dataset 位置对齐部分仍要 debug）。
+**核心未解决问题：accuracy 训练中不上升**。怀疑根因在 stage3 原始实现里"汇总到一个最终 outcome-reward"的 **dataset 位置对齐**部分。下一步按顺序：
+1. 把 PRM 这边 reviewer 标过的修改建议点一遍 resolve
+2. 解决 PR#53 与 main 的冲突（当前 mergeable=CONFLICTING）
+3. 先实现 **PRM 变体 1**（最小改动版）
+4. **再回头 debug accuracy 不上升的问题** — 重点查 dataset 位置对齐
+5. follow-up：`freeze_prefix` 三层覆盖小 bug
 
-### 5.2 PR#56 — Qwen2.5-VL-7B + Geo3K + Qwen2.5-VL-72B ORM Demo ✅ Merged
+### 5.2 PR#56 — Qwen2.5-VL-7B + Geo3K + Qwen2.5-VL-72B ORM Demo ✅ 收尾
 
-[`opendilab/LightRFT#56`](https://github.com/opendilab/LightRFT/pull/56) 已 merged。这是一个最小化的端到端 ORM-RL demo，专门让 ORM RL workflow 容易理解、运行、debug。两条 rollout 路径都做了完整长训验证：
+[`opendilab/LightRFT#56`](https://github.com/opendilab/LightRFT/pull/56)（state: **MERGED** @ 2026-04-29）：最小化的端到端 ORM-RL demo 实验，专门让 ORM RL workflow 容易理解、运行、debug。两条 rollout 路径完整长训验证后已收尾合入 main：
 
 | Rollout 后端 | wandb run | 配置 |
 |---|---|---|
@@ -142,5 +147,5 @@
 1. **[openclaw-rl#6 P0-0 假设验证](https://github.com/HansBug/OpenClaw-RL/issues/6#issuecomment-4341621165)**：从 `iter_0000279` 续跑 step 1100+，24-48h，决定算法层重构是否必要
 2. **[openclaw-rl#5 Phase 1](https://github.com/HansBug/OpenClaw-RL/issues/5)**：装 harbor + 跑 80-task benchmark，第一次有"对外可比数字"
 3. **[CDE actor perplexity bonus](https://arxiv.org/abs/2509.09675)**（D4，1 天工程量）—— 与 P0-0 并行
-4. **[LightRFT PR#53](https://github.com/opendilab/LightRFT/pull/53) 收尾**：解决 main 冲突 + freeze_prefix 修复 + PRM 变体 1 实现
+4. **[LightRFT PR#53](https://github.com/opendilab/LightRFT/pull/53) 继续 debug**：先 resolve reviewer 修改点 + 解 main 冲突 → 实现 PRM 变体 1 → 回头 debug accuracy 不上升 (重点 dataset 位置对齐)
 5. **新一轮训练**：根据 P0-0 结果决定继续 Qwen3-8B 还是切 [Qwen3-Coder-30B-A3B](https://huggingface.co/Qwen/Qwen3-Coder-30B-A3B-Instruct)
