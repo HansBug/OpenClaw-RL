@@ -18,9 +18,29 @@ class SweEnvClient:
         self.default_max_retries = int(os.getenv("SWE_ENV_HTTP_MAX_RETRIES", "10"))
         self.evaluate_max_retries = int(os.getenv("SWE_EVALUATE_MAX_RETRIES", "3"))
 
+    async def _post(self, endpoint: str, payload: dict[str, Any], max_retries: int) -> dict[str, Any]:
+        url = f"{self.base_url}{endpoint}"
+        try:
+            out = await post(url, payload, max_retries=max_retries)
+        except Exception as exc:  # noqa: BLE001
+            response = getattr(exc, "response", None)
+            if response is not None:
+                body = getattr(response, "text", "") or ""
+                body = body.strip()
+                if len(body) > 2000:
+                    body = body[:2000] + "...<truncated>"
+                status_code = getattr(response, "status_code", "?")
+                raise RuntimeError(
+                    f"SWE pool request failed: {url}; status={status_code}; body={body or '<empty>'}"
+                ) from exc
+            raise RuntimeError(f"SWE pool request failed: {url}; error={exc}") from exc
+        if not isinstance(out, dict):
+            raise RuntimeError(f"SWE pool returned non-JSON response from {url}: {out!r}")
+        return out
+
     async def allocate(self, image: str, instance_id: str = "") -> dict[str, Any]:
-        out = await post(
-            f"{self.base_url}/allocate",
+        out = await self._post(
+            "/allocate",
             {"image": image, "instance_id": instance_id},
             max_retries=self.default_max_retries,
         )
@@ -29,8 +49,8 @@ class SweEnvClient:
         return out
 
     async def heartbeat(self, lease_id: str) -> None:
-        out = await post(
-            f"{self.base_url}/heartbeat",
+        out = await self._post(
+            "/heartbeat",
             {"lease_id": lease_id},
             max_retries=self.default_max_retries,
         )
@@ -40,8 +60,8 @@ class SweEnvClient:
     async def exec(self, lease_id: str, command: str, cwd: str = "/testbed",
                    timeout: int = 180, env: dict | None = None) -> dict[str, Any]:
         """Execute a command in the container. Returns {ok, returncode, output}."""
-        out = await post(
-            f"{self.base_url}/exec",
+        out = await self._post(
+            "/exec",
             {
                 "lease_id": lease_id,
                 "command": command,
@@ -57,8 +77,8 @@ class SweEnvClient:
 
     async def diff(self, lease_id: str, cwd: str = "/testbed") -> str:
         """Get git diff from the container. Returns the patch string."""
-        out = await post(
-            f"{self.base_url}/diff",
+        out = await self._post(
+            "/diff",
             {"lease_id": lease_id, "cwd": cwd},
             max_retries=self.default_max_retries,
         )
@@ -69,8 +89,8 @@ class SweEnvClient:
     async def evaluate(self, lease_id: str, patch: str, eval_script: str,
                        cwd: str = "/testbed", timeout: int = 3600) -> dict[str, Any]:
         """Apply patch + run eval script. Returns {ok, resolved, ...}."""
-        out = await post(
-            f"{self.base_url}/evaluate",
+        out = await self._post(
+            "/evaluate",
             {
                 "lease_id": lease_id,
                 "patch": patch,
@@ -85,8 +105,8 @@ class SweEnvClient:
         return out
 
     async def close(self, lease_id: str) -> None:
-        out = await post(
-            f"{self.base_url}/close",
+        out = await self._post(
+            "/close",
             {"lease_id": lease_id},
             max_retries=self.default_max_retries,
         )

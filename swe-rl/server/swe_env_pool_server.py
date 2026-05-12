@@ -31,15 +31,28 @@ logger = logging.getLogger("swe.env_pool_server")
 app = Flask(__name__)
 
 
+def _format_http_error(resp: requests.Response, limit: int = 2000) -> str:
+    body = resp.text.strip()
+    if len(body) > limit:
+        body = body[:limit] + "...<truncated>"
+    return f"{resp.status_code} {resp.reason} from {resp.url}; body={body or '<empty>'}"
+
+
 def _post_exec(url: str, payload: dict, timeout: int = 300) -> dict:
     resp = requests.post(url, json=payload, timeout=timeout)
-    resp.raise_for_status()
+    try:
+        resp.raise_for_status()
+    except requests.HTTPError as exc:
+        raise RuntimeError(_format_http_error(resp)) from exc
     return resp.json()
 
 
 def _get_exec(url: str, timeout: int = 30) -> dict:
     resp = requests.get(url, timeout=timeout)
-    resp.raise_for_status()
+    try:
+        resp.raise_for_status()
+    except requests.HTTPError as exc:
+        raise RuntimeError(_format_http_error(resp)) from exc
     return resp.json()
 
 
@@ -202,6 +215,23 @@ class SweEnvPool:
                 ],
             }
 
+    def images(self) -> dict[str, Any]:
+        nodes = []
+        for node in self.nodes:
+            try:
+                result = _get_exec(f"{node.url}/images", timeout=30)
+                images = result.get("images", []) if isinstance(result, dict) else []
+                nodes.append({
+                    "url": node.url,
+                    "ok": bool(result.get("ok", False)) if isinstance(result, dict) else False,
+                    "count": len(images),
+                    "images": images,
+                })
+            except Exception as exc:  # noqa: BLE001
+                logger.exception("Failed to list images from exec node %s", node.url)
+                nodes.append({"url": node.url, "ok": False, "error": str(exc), "count": 0, "images": []})
+        return {"nodes": nodes}
+
     def health_check(self) -> None:
         for node in self.nodes:
             try:
@@ -243,7 +273,15 @@ def allocate():
         result = POOL.allocate(image=image, instance_id=instance_id)
         return jsonify({"ok": True, **result})
     except Exception as e:
+        logger.exception("[SWE-POOL] Allocate failed: image=%s instance_id=%s", image, instance_id)
         return jsonify({"ok": False, "error": str(e)}), 500
+
+
+@app.get("/images")
+def images():
+    if POOL is None:
+        return jsonify({"ok": False, "error": "Pool not initialized"}), 500
+    return jsonify({"ok": True, **POOL.images()})
 
 
 @app.post("/heartbeat")

@@ -171,6 +171,36 @@ def _is_valid_git_patch(patch_text: str) -> bool:
     return has_old and has_new
 
 
+
+
+def _compute_patch_similarity(predicted_patch: str, golden_patch: str) -> float:
+    """Compute token-level similarity between predicted and golden diff patches.
+
+    Uses difflib.SequenceMatcher on changed lines (+/-) only.
+    Returns a score in [0.0, 0.9]:
+      - 0.0 if predicted patch is empty
+      - 0.05 if patch has header but no +/- content lines
+      - 0.05 + ratio * 0.85 otherwise  (never reaches 1.0, which is reserved for resolved)
+
+    Ref: Meta SWE-RL (arXiv:2502.18449) — similarity reward to provide dense
+    gradient signal for non-resolved rollouts.
+    """
+    from difflib import SequenceMatcher
+    if not predicted_patch or not golden_patch:
+        return 0.0
+    pred_lines = [
+        l for l in predicted_patch.splitlines()
+        if l.startswith(("+", "-")) and not l.startswith(("+++", "---"))
+    ]
+    gold_lines = [
+        l for l in golden_patch.splitlines()
+        if l.startswith(("+", "-")) and not l.startswith(("+++", "---"))
+    ]
+    if not pred_lines or not gold_lines:
+        return 0.05  # Has patch structure but no diff content
+    ratio = SequenceMatcher(None, pred_lines, gold_lines).ratio()
+    return 0.05 + ratio * 0.85  # Maps to [0.05, 0.90]
+
 def _render_observation(config: dict, returncode: int, output: str) -> str:
     """Render the action_observation_template from swebench.yaml."""
     from jinja2 import Template
@@ -522,7 +552,19 @@ async def _generate_impl(args, sample: Sample, sampling_params: dict) -> Sample 
                 resolved = eval_result.get("resolved", False)
                 run_info["reward"] = int(resolved)
                 run_info["eval_result"] = eval_result
-                logger.info(f"[SWE-R] [{iid}] Step 4/5: resolved={resolved}")
+                # Similarity reward: only computed when env var is set and not resolved.
+                # Provides dense gradient signal [0, 0.9] for partially-correct patches.
+                if os.getenv("SWE_USE_SIMILARITY_REWARD", "0") == "1" and not resolved:
+                    golden_patch = instance.get("patch", "") or ""
+                    sim_score = _compute_patch_similarity(git_patch, golden_patch)
+                    run_info["similarity_reward"] = sim_score
+                    logger.info(
+                        f"[SWE-R] [{iid}] Step 4/5: resolved={resolved}, "
+                        f"similarity_reward={sim_score:.3f} (golden_len={len(golden_patch)})"
+                    )
+                else:
+                    run_info["similarity_reward"] = float(resolved)
+                    logger.info(f"[SWE-R] [{iid}] Step 4/5: resolved={resolved}")
             except Exception as e:
                 run_info["error"] = str(e)
                 logger.error(f"[SWE-R] [{iid}] Step 4/5: Eval error: {e}")
@@ -564,7 +606,13 @@ async def _generate_impl(args, sample: Sample, sampling_params: dict) -> Sample 
 
     use_dynamic_history = getattr(args, "dynamic_history", False) and managed_contexts and assistant_texts
 
-    outcome_reward = 1.0 if reward else -1.0
+    # Determine outcome_reward: similarity mode uses [0,1] scale; default binary uses {-1,+1}.
+    # Similarity mode: non-resolved rollouts get [0.0, 0.9] instead of -1.0, reducing zero-gradient
+    # batches from ~56.6% (v3) to near-zero. acc field always tracks binary resolve rate.
+    if os.getenv("SWE_USE_SIMILARITY_REWARD", "0") == "1":
+        outcome_reward = float(run_info.get("similarity_reward", float(reward)))
+    else:
+        outcome_reward = 1.0 if reward else -1.0
     prm_step_scores = run_info.get("prm_step_scores", [])
     prm_step_details = run_info.get("prm_step_details", [])
 
