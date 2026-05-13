@@ -140,7 +140,11 @@ class TerminalEnv:
                     logger=logger,
                 )
             else:
-                self._terminal.start(timeout=self._timeouts.reset_session)
+                import inspect
+                if "timeout" in inspect.signature(self._terminal.start).parameters:
+                    self._terminal.start(timeout=self._timeouts.reset_session)
+                else:
+                    self._terminal.start()
                 try:
                     from .docker_compose_utils import (
                         _DEFAULT_CONTAINER_MEMORY_LIMIT,

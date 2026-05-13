@@ -50,6 +50,6 @@ fi
 # Setup Python env
 uv venv .venv --python 3.12
 source .venv/bin/activate
-uv pip install terminal-bench
-uv pip install camel-ai
-uv pip install fastapi
+uv pip install terminal-bench --index-url https://pypi.tuna.tsinghua.edu.cn/simple 
+uv pip install camel-ai --index-url https://pypi.tuna.tsinghua.edu.cn/simple 
+uv pip install fastapi --index-url https://pypi.tuna.tsinghua.edu.cn/simple 
