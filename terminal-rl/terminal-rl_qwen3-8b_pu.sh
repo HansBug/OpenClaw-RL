@@ -50,12 +50,16 @@ sleep 2
 export PYTHONUNBUFFERED=1
 export PYTHONFAULTHANDLER=1
 
-# ── GPU allocation (single 4-GPU node) ───────────────────────────────
+# ── GPU allocation (auto-split: half actor, half rollout) ────────────
 DETECTED_GPUS=$(nvidia-smi -L 2>/dev/null | wc -l)
 NUM_GPUS="${NUM_GPUS:-${DETECTED_GPUS:-4}}"
-ACTOR_GPUS="${ACTOR_GPUS:-2}"
-ROLLOUT_GPUS="${ROLLOUT_GPUS:-2}"
-ROLLOUT_NUM_GPUS_PER_ENGINE="${ROLLOUT_NUM_GPUS_PER_ENGINE:-2}"
+HALF_GPUS=$(( NUM_GPUS / 2 ))
+# Default: each gets half of available GPUs (4-GPU node → 2/2, 8-GPU → 4/4).
+# Important: matching node size avoids SIGSEGV in NCCL getenv() observed when
+# only a subset of GPUs are used on multi-NUMA 8-GPU nodes.
+ACTOR_GPUS="${ACTOR_GPUS:-${HALF_GPUS}}"
+ROLLOUT_GPUS="${ROLLOUT_GPUS:-${HALF_GPUS}}"
+ROLLOUT_NUM_GPUS_PER_ENGINE="${ROLLOUT_NUM_GPUS_PER_ENGINE:-${HALF_GPUS}}"
 TP_SIZE="${TP_SIZE:-${ACTOR_GPUS}}"
 
 if (( ACTOR_GPUS + ROLLOUT_GPUS > NUM_GPUS )); then
@@ -94,6 +98,13 @@ fi
 LOG_BASE="${SCRIPT_DIR}/logs"
 RUN_LOG_DIR="${LOG_BASE}/${RUN_NAME}"
 mkdir -p "${RUN_LOG_DIR}"
+
+# Symlink the latest run log dir to a stable location for tooling/analysis.
+# Both the script-local one and the repo-level tmp_doc_latest are updated.
+ln -sfn "${RUN_LOG_DIR}" "${LOG_BASE}/latest"
+TMP_DOC_LATEST="${REPO_ROOT}/tmp_doc_latest"
+mkdir -p "${TMP_DOC_LATEST}" 2>/dev/null || true
+ln -sfn "${RUN_LOG_DIR}" "${TMP_DOC_LATEST}/run_logs" 2>/dev/null || true
 
 # Only create ckpt dir and set SAVE_CKPT when saving is enabled
 if (( MAX_CKPT_KEEP > 0 )); then
@@ -224,6 +235,24 @@ CHECK_WAIT_SECS="${CHECK_WAIT_SECS:-60}"
 export ROUTER_FORWARD_TIMEOUT="${ROUTER_FORWARD_TIMEOUT:-900}"
 export ROUTER_FORWARD_RETRIES="${ROUTER_FORWARD_RETRIES:-3}"
 export ROUTER_FORWARD_RETRY_BACKOFF="${ROUTER_FORWARD_RETRY_BACKOFF:-1.0}"
+
+# ── ClawSentry safety reward (L1-only, reward-only, linear-fusion baseline) ──
+# Gateway runs on the same host as router_server (CPU master). All decisions
+# are reward-shaping signals; agent actions are never blocked. Toggle via
+# SAFETY_REWARD_ENABLE=0 or SAFETY_REWARD_COEF=0 to ablate without code changes.
+export SAFETY_REWARD_ENABLE="${SAFETY_REWARD_ENABLE:-1}"
+export SAFETY_REWARD_COEF="${SAFETY_REWARD_COEF:-0.3}"
+export SAFETY_REWARD_SUMMARY_WEIGHT="${SAFETY_REWARD_SUMMARY_WEIGHT:-0.3}"
+export SAFETY_REWARD_TIMEOUT="${SAFETY_REWARD_TIMEOUT:-2.0}"
+export SAFETY_REWARD_ZERO_THRESHOLD="${SAFETY_REWARD_ZERO_THRESHOLD:-1.5}"
+export CS_GATEWAY_PORT="${CS_GATEWAY_PORT:-8090}"
+export CS_HTTP_HOST="${CS_HTTP_HOST:-127.0.0.1}"
+export CS_HTTP_URL="http://${CS_HTTP_HOST}:${CS_GATEWAY_PORT}"
+export CS_AUTH_TOKEN="${CS_AUTH_TOKEN:-}"
+export CS_TRAJECTORY_DB_PATH="${CS_TRAJECTORY_DB_PATH:-/tmp/clawsentry-train.db}"
+export CS_LLM_PROVIDER="${CS_LLM_PROVIDER:-}"
+export CS_L3_ENABLED="${CS_L3_ENABLED:-false}"
+export CS_EVOLVING_ENABLED="${CS_EVOLVING_ENABLED:-false}"
 
 # Proxy bypass: some environments inject http_proxy/HTTPS_PROXY via shell rc.
 # aiohttp + requests will then try to tunnel the internal router→worker traffic
@@ -364,12 +393,19 @@ else
   echo "WARN: custom config not found at ${CUSTOM_CONFIG_PATH}; skipping --custom-config-path"
 fi
 
+# NOTE: safety reward params are passed via env vars (RUNTIME_ENV_JSON below),
+# not CLI flags, because slime's argparse rejects unknown flags.
+
 # ── Start router ─────────────────────────────────────────────────────
 ROUTER_PID=""
+CS_GATEWAY_PID=""
 cleanup() {
   set +e
   if [[ -n "${ROUTER_PID}" ]] && kill -0 "${ROUTER_PID}" 2>/dev/null; then
     kill "${ROUTER_PID}" || true
+  fi
+  if [[ -n "${CS_GATEWAY_PID}" ]] && kill -0 "${CS_GATEWAY_PID}" 2>/dev/null; then
+    kill "${CS_GATEWAY_PID}" || true
   fi
 }
 trap cleanup EXIT INT TERM
@@ -398,6 +434,45 @@ for ((i=1; i<=CHECK_WAIT_SECS; i++)); do
 done
 curl -fsS "http://${CHECK_HOST}:${ROUTER_PORT}/status" || true
 echo
+
+# ── Start ClawSentry gateway (L1-only, reward-only) ──────────────────
+if [[ "${SAFETY_REWARD_ENABLE}" == "1" ]]; then
+  CS_GATEWAY_LOG="${RUN_LOG_DIR}/clawsentry_gateway.log"
+  log "Starting clawsentry-gateway on ${CS_HTTP_HOST}:${CS_GATEWAY_PORT} (L1-only, reward-only)"
+  if ! command -v clawsentry >/dev/null 2>&1; then
+    log "WARN: 'clawsentry' CLI not found in PATH; safety reward will fail-open to 0"
+  else
+    (
+      CS_HTTP_HOST="${CS_HTTP_HOST}" \
+      CS_HTTP_PORT="${CS_GATEWAY_PORT}" \
+      CS_AUTH_TOKEN="${CS_AUTH_TOKEN}" \
+      CS_TRAJECTORY_DB_PATH="${CS_TRAJECTORY_DB_PATH}" \
+      CS_LLM_PROVIDER="${CS_LLM_PROVIDER}" \
+      CS_L3_ENABLED="${CS_L3_ENABLED}" \
+      CS_EVOLVING_ENABLED="${CS_EVOLVING_ENABLED}" \
+      clawsentry gateway \
+        --gateway-host "${CS_HTTP_HOST}" \
+        --gateway-port "${CS_GATEWAY_PORT}" \
+        > "${CS_GATEWAY_LOG}" 2>&1 &
+      echo $! > "${RUN_LOG_DIR}/clawsentry_gateway.pid"
+    )
+    CS_GATEWAY_PID="$(cat "${RUN_LOG_DIR}/clawsentry_gateway.pid" 2>/dev/null || echo '')"
+    log "ClawSentry gateway PID=${CS_GATEWAY_PID}, log=${CS_GATEWAY_LOG}"
+
+    CS_OK=0
+    for ((i=1; i<=20; i++)); do
+      if curl -fsS --max-time 2 --noproxy '*' "${CS_HTTP_URL}/health" >/dev/null 2>&1; then
+        log "clawsentry-gateway ready (attempt ${i})"
+        CS_OK=1
+        break
+      fi
+      sleep 1
+    done
+    if [[ "${CS_OK}" != "1" ]]; then
+      log "WARN: clawsentry-gateway not healthy at ${CS_HTTP_URL}/health; safety reward will fail-open to 0"
+    fi
+  fi
+fi
 
 # Pre-flight: sanity check each pool worker before launching training
 # (issue #3 §1.X-E: early detection of worker transport flakes).
@@ -442,6 +517,14 @@ cat > "${RUN_LOG_DIR}/run_config.json" <<CFGEOF
   "max_tokens_per_gpu": ${MAX_TOKENS_PER_GPU},
   "worker_urls": "${WORKER_URLS}",
   "env_server_url": "${ENV_SERVER_URL}",
+  "safety_reward_enable": "${SAFETY_REWARD_ENABLE}",
+  "safety_reward_coef": "${SAFETY_REWARD_COEF}",
+  "safety_reward_summary_weight": "${SAFETY_REWARD_SUMMARY_WEIGHT}",
+  "safety_reward_zero_threshold": "${SAFETY_REWARD_ZERO_THRESHOLD}",
+  "clawsentry_url": "${CS_HTTP_URL}",
+  "clawsentry_llm_provider": "${CS_LLM_PROVIDER}",
+  "clawsentry_l3_enabled": "${CS_L3_ENABLED}",
+  "clawsentry_evolving_enabled": "${CS_EVOLVING_ENABLED}",
   "log_dir": "${RUN_LOG_DIR}"
 }
 CFGEOF
@@ -482,6 +565,15 @@ RUNTIME_ENV_JSON="{
     \"PYTORCH_CUDA_ALLOC_CONF\": \"${PYTORCH_CUDA_ALLOC_CONF}\",
     \"USE_REMOTE_ENV\": \"${USE_REMOTE_ENV}\",
     \"ENV_SERVER_URL\": \"${ENV_SERVER_URL}\",
+    \"NO_PROXY\": \"${NO_PROXY}\",
+    \"no_proxy\": \"${NO_PROXY}\",
+    \"CS_HTTP_URL\": \"${CS_HTTP_URL}\",
+    \"CS_AUTH_TOKEN\": \"${CS_AUTH_TOKEN}\",
+    \"SAFETY_REWARD_ENABLE\": \"${SAFETY_REWARD_ENABLE}\",
+    \"SAFETY_REWARD_COEF\": \"${SAFETY_REWARD_COEF}\",
+    \"SAFETY_REWARD_SUMMARY_WEIGHT\": \"${SAFETY_REWARD_SUMMARY_WEIGHT}\",
+    \"SAFETY_REWARD_TIMEOUT\": \"${SAFETY_REWARD_TIMEOUT}\",
+    \"SAFETY_REWARD_ZERO_THRESHOLD\": \"${SAFETY_REWARD_ZERO_THRESHOLD}\",
     \"WANDB_MODE\": \"${WANDB_MODE:-offline}\"
   }
 }"

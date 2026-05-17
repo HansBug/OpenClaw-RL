@@ -12,6 +12,7 @@ from slime.rollout.sglang_rollout import GenerateState
 from slime.utils.types import Sample
 
 from agent.prm_agent import TerminalPRMAgent
+from clawsentry_client import ClawSentryClient
 from custom_types import (
     Interaction,
     RunContext,
@@ -23,6 +24,12 @@ from custom_types import (
 from inference_client import SGLangTurnClient
 from agent_runner import create_agent_runner
 from env_client import TerminalEnvClient
+from safety_reward import (
+    DEFAULT_ZERO_THRESHOLD as _SAFETY_ZERO_THRESHOLD,
+    broadcast_to_turns as _safety_broadcast,
+    per_turn_score as _safety_per_turn_score,
+    trajectory_score as _safety_trajectory_score,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -57,6 +64,8 @@ def _build_samples(
     status: Sample.Status,
     prm_turn_scores: dict[int, float] | None = None,
     prm_coef: float = 1.0,
+    safety_turn_scores: dict[int, float] | None = None,
+    safety_coef: float = 0.0,
     discount: float = 1.0,
     encourage: bool = False,
 ) -> List[Sample]:
@@ -90,17 +99,25 @@ def _build_samples(
         steps_from_end = num_turns - 1 - turn_idx
         discounted_base = base_outcome * (discount**steps_from_end)
 
+        prm = 0.0
         if prm_turn_scores is not None:
             prm = prm_turn_scores.get(turn_idx, 0.0)
             final = discounted_base + prm_coef * prm
+        else:
+            final = discounted_base
+
+        safety_val = 0.0
+        if safety_turn_scores is not None:
+            safety_val = float(safety_turn_scores.get(turn_idx, 0.0))
+            final = final + safety_coef * safety_val
+
+        if prm_turn_scores is not None:
             s.metadata["step_wise"] = {
                 "step_scores": [prm],
                 "step_scores_with_outcome": [final],
                 "step_indices": [turn_idx],
                 "step_token_spans": [[0, s.response_length]],
             }
-        else:
-            final = discounted_base
 
         s.reward = {
             "accuracy": accuracy,
@@ -111,6 +128,9 @@ def _build_samples(
 
         if prm_turn_scores is not None:
             s.reward["prm_turn_score"] = prm
+        if safety_turn_scores is not None:
+            s.reward["safety_score"] = safety_val
+            s.reward["safety_coef"] = safety_coef
         samples.append(s)
 
     return samples
@@ -290,6 +310,27 @@ async def generate(
     prm_turn_scores: dict[int, float] = {}
     prm_turn_details: list[dict[str, Any]] = []
 
+    def _env_truthy(name: str, default: str = "0") -> bool:
+        return os.getenv(name, default).strip().lower() in {"1", "true", "yes", "on"}
+
+    def _env_float(name: str, default: float) -> float:
+        raw = os.getenv(name)
+        if raw is None or raw == "":
+            return default
+        try:
+            return float(raw)
+        except ValueError:
+            return default
+
+    safety_enable = _env_truthy("SAFETY_REWARD_ENABLE", "0") and (not evaluation)
+    safety_coef = _env_float("SAFETY_REWARD_COEF", 0.0)
+    safety_summary_weight = _env_float("SAFETY_REWARD_SUMMARY_WEIGHT", 0.3)
+    safety_zero_threshold = _env_float(
+        "SAFETY_REWARD_ZERO_THRESHOLD", _SAFETY_ZERO_THRESHOLD
+    )
+    cs_client: ClawSentryClient | None = None
+    cs_per_call: list[tuple[int, float]] = []
+
     _log_tag = f"[task={task_spec.task_name} uid={run_ctx.uid} group_idx={run_ctx.group_index} sample_idx={run_ctx.sample_index}]"
 
     try:
@@ -370,6 +411,29 @@ async def generate(
                 "%s PRM enabled: url=%s coef=%.3f", _log_tag, prm_sglang_url, prm_coef
             )
 
+        if safety_enable:
+            cs_base = os.getenv("CS_HTTP_URL", "http://127.0.0.1:8090")
+            cs_session_id = (
+                f"openclaw-rl:{task_spec.task_name}:{run_ctx.uid}"
+                f":g{run_ctx.group_index}:s{run_ctx.sample_index}"
+            )
+            cs_timeout = _env_float("SAFETY_REWARD_TIMEOUT", 2.0)
+            cs_client = ClawSentryClient(
+                base_url=cs_base,
+                session_id=cs_session_id,
+                agent_id="openclaw-rl-trainer",
+                auth_token=os.getenv("CS_AUTH_TOKEN") or None,
+                timeout=cs_timeout,
+                enabled=True,
+            )
+            logger.info(
+                "%s ClawSentry enabled: url=%s coef=%.3f sid=%s",
+                _log_tag,
+                cs_base,
+                safety_coef,
+                cs_session_id,
+            )
+
         agent_runner = create_agent_runner(
             agent_type=agent_type,
             sglang_client=sglang_client,
@@ -444,6 +508,19 @@ async def generate(
                 for tool_call_request in tool_call_requests:
                     assert env_client is not None and lease_id is not None
                     await env_client.heartbeat(lease_id)
+                    if cs_client is not None:
+                        cs_dec = await cs_client.pre_action(
+                            tool_call_request.tool_name,
+                            tool_call_request.args,
+                        )
+                        cs_per_call.append(
+                            (
+                                turn_idx,
+                                _safety_per_turn_score(
+                                    cs_dec, zero_threshold=safety_zero_threshold
+                                ),
+                            )
+                        )
                     raw_result = await env_client.exec_tool(
                         lease_id,
                         tool_call_request.tool_name,
@@ -596,6 +673,44 @@ async def generate(
                 "turn_details": prm_turn_details,
             }
 
+        safety_turn_scores: dict[int, float] | None = None
+        if cs_client is not None:
+            cs_summary = await cs_client.fetch_summary()
+            per_call_scores = [score for (_idx, score) in cs_per_call]
+            safety_traj = _safety_trajectory_score(
+                per_call_scores,
+                cs_summary,
+                summary_weight=safety_summary_weight,
+                zero_threshold=safety_zero_threshold,
+            )
+            turn_indices = [it.turn_idx for it in interactions]
+            safety_turn_scores = _safety_broadcast(safety_traj, turn_indices)
+            cs_stats = cs_client.stats()
+            sample.metadata["safety"] = {
+                "enabled": True,
+                "coef": safety_coef,
+                "summary_weight": safety_summary_weight,
+                "zero_threshold": safety_zero_threshold,
+                "trajectory_score": safety_traj,
+                "per_call_scores": cs_per_call,
+                "summary_composite_score": (
+                    cs_summary.composite_score if cs_summary is not None else None
+                ),
+                "summary_dimensions": (
+                    cs_summary.dimensions if cs_summary is not None else None
+                ),
+                "n_calls": cs_stats["calls"],
+                "n_errors": cs_stats["errors"],
+                "decisions": cs_stats["decisions"],
+            }
+            logger.info(
+                "%s ClawSentry trajectory_score=%.4f calls=%d errors=%d",
+                _log_tag,
+                safety_traj,
+                cs_stats["calls"],
+                cs_stats["errors"],
+            )
+
         # Build training samples
         samples = _build_samples(
             interactions=interactions,
@@ -604,6 +719,8 @@ async def generate(
             status=status,
             prm_turn_scores=(prm_turn_scores if prm_agent is not None else None),
             prm_coef=prm_coef,
+            safety_turn_scores=safety_turn_scores,
+            safety_coef=safety_coef,
             discount=1.0,
             encourage=False,
         )
@@ -645,6 +762,12 @@ async def generate(
         for _turn_idx, t in prm_pending:
             if not t.done():
                 t.cancel()
+
+        if cs_client is not None:
+            try:
+                await cs_client.aclose()
+            except Exception as exc:
+                logger.debug("ClawSentry aclose ignored: %s", exc)
 
         if env_client is not None and lease_id is not None:
             try:
