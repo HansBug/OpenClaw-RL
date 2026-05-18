@@ -254,6 +254,11 @@ export CS_LLM_PROVIDER="${CS_LLM_PROVIDER:-}"
 export CS_L3_ENABLED="${CS_L3_ENABLED:-false}"
 export CS_EVOLVING_ENABLED="${CS_EVOLVING_ENABLED:-false}"
 
+# ── Trajectory export (parallels swe-rl export/swe_rollouts) ─────────────────
+# Set to non-empty path to save per-rollout traj.json + meta.json.
+# Disabled by default (empty = no export). Enable for analysis runs.
+export TERMINAL_SAVE_TRAJ_DIR="${TERMINAL_SAVE_TRAJ_DIR:-}"
+
 # Proxy bypass: some environments inject http_proxy/HTTPS_PROXY via shell rc.
 # aiohttp + requests will then try to tunnel the internal router→worker traffic
 # through a proxy, causing spurious connection failures. Explicitly list all
@@ -574,6 +579,7 @@ RUNTIME_ENV_JSON="{
     \"SAFETY_REWARD_SUMMARY_WEIGHT\": \"${SAFETY_REWARD_SUMMARY_WEIGHT}\",
     \"SAFETY_REWARD_TIMEOUT\": \"${SAFETY_REWARD_TIMEOUT}\",
     \"SAFETY_REWARD_ZERO_THRESHOLD\": \"${SAFETY_REWARD_ZERO_THRESHOLD}\",
+    \"TERMINAL_SAVE_TRAJ_DIR\": \"${TERMINAL_SAVE_TRAJ_DIR}\",
     \"WANDB_MODE\": \"${WANDB_MODE:-offline}\"
   }
 }"
