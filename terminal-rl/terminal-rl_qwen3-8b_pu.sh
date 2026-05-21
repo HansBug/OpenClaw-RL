@@ -95,21 +95,36 @@ if [[ "${DEBUG_MODE}" == "1" ]]; then
 else
   RUN_NAME="terminal-rl_qwen3-8b_${NUM_GPUS}gpu_${RUN_TIMESTAMP}"
 fi
-LOG_BASE="${SCRIPT_DIR}/logs"
-RUN_LOG_DIR="${LOG_BASE}/${RUN_NAME}"
-mkdir -p "${RUN_LOG_DIR}"
 
-# Symlink the latest run log dir to a stable location for tooling/analysis.
-# Both the script-local one and the repo-level tmp_doc_latest are updated.
-ln -sfn "${RUN_LOG_DIR}" "${LOG_BASE}/latest"
-TMP_DOC_LATEST="${REPO_ROOT}/tmp_doc_latest"
-mkdir -p "${TMP_DOC_LATEST}" 2>/dev/null || true
-ln -sfn "${RUN_LOG_DIR}" "${TMP_DOC_LATEST}/run_logs" 2>/dev/null || true
+# ── Unified run directory (see STORAGE.md) ───────────────────────────────
+# All outputs for this run go under runs/{RUN_ID}/ with structured subdirs.
+RUNS_ROOT="${RUNS_ROOT:-${REPO_ROOT}/runs}"
+CKPT_ROOT="${CKPT_ROOT:-${EXPORT_ROOT}/ckpt}"
+RUN_ID="${RUN_ID:-${RUN_NAME}}"
+RUN_DIR="${RUNS_ROOT}/${RUN_ID}"
+
+# Create directory structure via run_paths.py
+MAX_CKPT_KEEP="${MAX_CKPT_KEEP}" python3 "${SCRIPT_DIR}/run_paths.py" init \
+  --runs-root "${RUNS_ROOT}" \
+  --ckpt-root "${CKPT_ROOT}" \
+  --run-id "${RUN_ID}" > /dev/null 2>&1
+
+# Derive all paths from RUN_DIR
+RUN_LOG_DIR="${RUN_DIR}/logs"
+TERMINAL_SAVE_TRAJ_DIR="${RUN_DIR}/trajectories"
+WANDB_DIR="${RUN_DIR}/metrics/wandb"
+
+# Symlinks for backward compatibility
+ln -sfn "${RUN_DIR}" "${RUNS_ROOT}/latest" 2>/dev/null || true
+ln -sfn "${RUN_DIR}" "${REPO_ROOT}/tmp_doc_latest" 2>/dev/null || true
+# Keep old logs/latest symlink for tools that expect it
+LOG_BASE="${SCRIPT_DIR}/logs"
+mkdir -p "${LOG_BASE}" 2>/dev/null || true
+ln -sfn "${RUN_LOG_DIR}" "${LOG_BASE}/latest" 2>/dev/null || true
 
 # Only create ckpt dir and set SAVE_CKPT when saving is enabled
 if (( MAX_CKPT_KEEP > 0 )); then
-  mkdir -p "${EXPORT_ROOT}/ckpt"
-  SAVE_CKPT="${SAVE_CKPT:-${EXPORT_ROOT}/ckpt/${RUN_NAME}}"
+  SAVE_CKPT="${SAVE_CKPT:-${CKPT_ROOT}/${RUN_ID}}"
 else
   SAVE_CKPT=""
 fi
@@ -157,16 +172,57 @@ echo "========================================"
 # ── Model args (source qwen3-8B.sh) ──────────────────────────────────
 source "${SLIME_DIR}/scripts/models/qwen3-8B.sh"
 
-# ── Dataset ──────────────────────────────────────────────────────────
-ROLLOUT_PROMPT_DATA="${ROLLOUT_PROMPT_DATA:-}"
+# ── Dataset & Reward Configuration ───────────────────────────────────
+# DATASET: which data to train on
+#   seta    = seta_env only (capability tasks, Docker-based evaluation)
+#   safety  = Agent-SafetyBench only (safety tasks, no Docker needed)
+#   mixed   = both combined
+#
+# SETA_SAFETY: safety reward mode for seta_env data
+#   none       = pure outcome reward (2*accuracy - 1), no safety signal
+#   clawsentry = outcome + ClawSentry L1 safety score (weighted by SAFETY_REWARD_COEF)
+#
+# SAFETY_BENCH_REWARD: reward mode for Agent-SafetyBench data
+#   rule       = fulfillable-based: refuse harmful=+1, comply harmful=-1
+#   clawsentry = use ClawSentry safety score (same mechanism as seta)
+DATASET="${DATASET:-seta}"
+SETA_SAFETY="${SETA_SAFETY:-clawsentry}"
+SAFETY_BENCH_REWARD="${SAFETY_BENCH_REWARD:-rule}"
+
+SETA_DATA="${SCRIPT_DIR}/dataset/seta_env_convert/train.jsonl"
+SAFETY_DATA="${SCRIPT_DIR}/dataset/agent_safetybench_convert/train.jsonl"
+
+case "${DATASET}" in
+  seta)
+    ROLLOUT_PROMPT_DATA="${ROLLOUT_PROMPT_DATA:-${SETA_DATA}}"
+    ;;
+  safety)
+    ROLLOUT_PROMPT_DATA="${ROLLOUT_PROMPT_DATA:-${SAFETY_DATA}}"
+    ;;
+  mixed)
+    MIXED_DATA="${SCRIPT_DIR}/dataset/mixed_seta_safety.jsonl"
+    if [[ ! -f "${MIXED_DATA}" ]] || [[ "${SETA_DATA}" -nt "${MIXED_DATA}" ]] || [[ "${SAFETY_DATA}" -nt "${MIXED_DATA}" ]]; then
+      cat "${SETA_DATA}" "${SAFETY_DATA}" > "${MIXED_DATA}"
+      echo "[dataset] merged seta($(wc -l < "${SETA_DATA}")) + safety($(wc -l < "${SAFETY_DATA}")) -> ${MIXED_DATA}"
+    fi
+    ROLLOUT_PROMPT_DATA="${ROLLOUT_PROMPT_DATA:-${MIXED_DATA}}"
+    ;;
+  *)
+    echo "[ERROR] Unknown DATASET=${DATASET}. Use: seta|safety|mixed"
+    exit 1
+    ;;
+esac
+
 if [[ -z "${ROLLOUT_PROMPT_DATA}" ]]; then
-  echo "[ERROR] ROLLOUT_PROMPT_DATA is unset. Point it to the seta_env train.jsonl."
+  echo "[ERROR] ROLLOUT_PROMPT_DATA is unset."
   exit 1
 fi
 if [[ ! -f "${ROLLOUT_PROMPT_DATA}" ]]; then
   echo "[ERROR] ROLLOUT_PROMPT_DATA=${ROLLOUT_PROMPT_DATA} not found"
   exit 1
 fi
+echo "[config] DATASET=${DATASET} SETA_SAFETY=${SETA_SAFETY} SAFETY_BENCH_REWARD=${SAFETY_BENCH_REWARD}"
+echo "[config] data=${ROLLOUT_PROMPT_DATA}"
 
 # Optional dataset blacklist (issue #3 §1.X / §2.x stuck offenders).
 # Default-ON; set USE_BLACKLIST=0 to keep the raw dataset.
@@ -238,9 +294,13 @@ export ROUTER_FORWARD_RETRY_BACKOFF="${ROUTER_FORWARD_RETRY_BACKOFF:-1.0}"
 
 # ── ClawSentry safety reward (L1-only, reward-only, linear-fusion baseline) ──
 # Gateway runs on the same host as router_server (CPU master). All decisions
-# are reward-shaping signals; agent actions are never blocked. Toggle via
-# SAFETY_REWARD_ENABLE=0 or SAFETY_REWARD_COEF=0 to ablate without code changes.
-export SAFETY_REWARD_ENABLE="${SAFETY_REWARD_ENABLE:-1}"
+# are reward-shaping signals; agent actions are never blocked.
+# ClawSentry is enabled when SETA_SAFETY=clawsentry or SAFETY_BENCH_REWARD=clawsentry.
+# SAFETY_REWARD_COEF controls the linear weight (default 0.3).
+CLAWSENTRY_NEEDED="0"
+if [[ "${SETA_SAFETY}" == "clawsentry" ]] || [[ "${SAFETY_BENCH_REWARD}" == "clawsentry" ]]; then
+  CLAWSENTRY_NEEDED="1"
+fi
 export SAFETY_REWARD_COEF="${SAFETY_REWARD_COEF:-0.3}"
 export SAFETY_REWARD_SUMMARY_WEIGHT="${SAFETY_REWARD_SUMMARY_WEIGHT:-0.3}"
 export SAFETY_REWARD_TIMEOUT="${SAFETY_REWARD_TIMEOUT:-2.0}"
@@ -255,9 +315,9 @@ export CS_L3_ENABLED="${CS_L3_ENABLED:-false}"
 export CS_EVOLVING_ENABLED="${CS_EVOLVING_ENABLED:-false}"
 
 # ── Trajectory export (parallels swe-rl export/swe_rollouts) ─────────────────
-# Set to non-empty path to save per-rollout traj.json + meta.json.
-# Disabled by default (empty = no export). Enable for analysis runs.
-export TERMINAL_SAVE_TRAJ_DIR="${TERMINAL_SAVE_TRAJ_DIR:-}"
+# Trajectory export is now ON by default (writes to runs/{run_id}/trajectories/).
+# Set TERMINAL_SAVE_TRAJ_DIR="" to disable.
+export TERMINAL_SAVE_TRAJ_DIR="${TERMINAL_SAVE_TRAJ_DIR}"
 
 # Proxy bypass: some environments inject http_proxy/HTTPS_PROXY via shell rc.
 # aiohttp + requests will then try to tunnel the internal router→worker traffic
@@ -368,6 +428,7 @@ if [[ -n "${WANDB_KEY:-}" ]]; then
     --wandb-project "${WANDB_PROJECT:-terminal_rl}"
     --wandb-group   "${WANDB_GROUP:-qwen3-8b_4gpu}"
     --wandb-key     "${WANDB_KEY}"
+    --wandb-dir     "${WANDB_DIR}"
   )
 else
   WANDB_ARGS=()
@@ -441,7 +502,7 @@ curl -fsS "http://${CHECK_HOST}:${ROUTER_PORT}/status" || true
 echo
 
 # ── Start ClawSentry gateway (L1-only, reward-only) ──────────────────
-if [[ "${SAFETY_REWARD_ENABLE}" == "1" ]]; then
+if [[ "${CLAWSENTRY_NEEDED}" == "1" ]]; then
   CS_GATEWAY_LOG="${RUN_LOG_DIR}/clawsentry_gateway.log"
   log "Starting clawsentry-gateway on ${CS_HTTP_HOST}:${CS_GATEWAY_PORT} (L1-only, reward-only)"
   if ! command -v clawsentry >/dev/null 2>&1; then
@@ -501,7 +562,7 @@ fi
 log "HAS_NVLINK=${HAS_NVLINK}"
 
 # ── Dump run config ──────────────────────────────────────────────────
-cat > "${RUN_LOG_DIR}/run_config.json" <<CFGEOF
+cat > "${RUN_DIR}/config/run_config.json" <<CFGEOF
 {
   "run_name": "${RUN_NAME}",
   "timestamp": "${RUN_TIMESTAMP}",
@@ -522,7 +583,9 @@ cat > "${RUN_LOG_DIR}/run_config.json" <<CFGEOF
   "max_tokens_per_gpu": ${MAX_TOKENS_PER_GPU},
   "worker_urls": "${WORKER_URLS}",
   "env_server_url": "${ENV_SERVER_URL}",
-  "safety_reward_enable": "${SAFETY_REWARD_ENABLE}",
+  "safety_reward_enable": "${CLAWSENTRY_NEEDED}",
+  "seta_safety": "${SETA_SAFETY}",
+  "safety_bench_reward": "${SAFETY_BENCH_REWARD}",
   "safety_reward_coef": "${SAFETY_REWARD_COEF}",
   "safety_reward_summary_weight": "${SAFETY_REWARD_SUMMARY_WEIGHT}",
   "safety_reward_zero_threshold": "${SAFETY_REWARD_ZERO_THRESHOLD}",
@@ -574,12 +637,15 @@ RUNTIME_ENV_JSON="{
     \"no_proxy\": \"${NO_PROXY}\",
     \"CS_HTTP_URL\": \"${CS_HTTP_URL}\",
     \"CS_AUTH_TOKEN\": \"${CS_AUTH_TOKEN}\",
-    \"SAFETY_REWARD_ENABLE\": \"${SAFETY_REWARD_ENABLE}\",
+    \"SETA_SAFETY\": \"${SETA_SAFETY}\",
+    \"SAFETY_BENCH_REWARD\": \"${SAFETY_BENCH_REWARD}\",
     \"SAFETY_REWARD_COEF\": \"${SAFETY_REWARD_COEF}\",
     \"SAFETY_REWARD_SUMMARY_WEIGHT\": \"${SAFETY_REWARD_SUMMARY_WEIGHT}\",
     \"SAFETY_REWARD_TIMEOUT\": \"${SAFETY_REWARD_TIMEOUT}\",
     \"SAFETY_REWARD_ZERO_THRESHOLD\": \"${SAFETY_REWARD_ZERO_THRESHOLD}\",
     \"TERMINAL_SAVE_TRAJ_DIR\": \"${TERMINAL_SAVE_TRAJ_DIR}\",
+    \"RUN_DIR\": \"${RUN_DIR}\",
+    \"DATASET\": \"${DATASET}\",
     \"WANDB_MODE\": \"${WANDB_MODE:-offline}\"
   }
 }"
