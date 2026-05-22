@@ -406,7 +406,7 @@ ROLLOUT_ARGS=(
   --n-samples-per-prompt "${N_SAMPLES}"
   --rollout-max-response-len 8192
   --rollout-max-context-len 16384
-  --rollout-temperature 1
+  --rollout-temperature "${ROLLOUT_TEMPERATURE:-1}"
   --num-steps-per-rollout 2
   --balance-data
 )
@@ -697,6 +697,7 @@ ray job submit --address="http://${MASTER_ADDR}:8265" \
   "${ROLLOUT_ARGS[@]}" \
   "${OPTIMIZER_ARGS[@]}" \
   "${GRPO_ARGS[@]}" \
+  ${EXTRA_GRPO_ARGS:-} \
   "${WANDB_ARGS[@]}" \
   "${PERF_ARGS[@]}" \
   "${EVAL_ARGS[@]}" \

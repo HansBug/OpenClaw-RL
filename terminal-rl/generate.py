@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
+import math
 import os
+import re
 import time
 import uuid
 from copy import deepcopy
@@ -35,6 +38,141 @@ from safety_reward import (
 )
 
 logger = logging.getLogger(__name__)
+
+# ── Exploration: count-based intrinsic reward (MERCI simplified) ──────────────
+_EXPLORE_INTRINSIC_ENABLED = os.getenv("EXPLORE_INTRINSIC_ENABLED", "0") == "1"
+_EXPLORE_INTRINSIC_COEF = float(os.getenv("EXPLORE_INTRINSIC_COEF", "0.1"))
+# Granularity for novelty hashing:
+#   "raw"        = full command string (default, matches v1)
+#   "signature"  = tool-call signature (cmd name + first 2 args), Agent57-style
+#                  sub-goal/skill granularity per the LaMer/Agent57 analysis.
+_EXPLORE_INTRINSIC_GRANULARITY = os.getenv("EXPLORE_INTRINSIC_GRANULARITY", "raw")
+_CMD_COUNTER: Dict[str, int] = {}  # process-level counter for command novelty
+
+# ── Exploration: LP-RND lifelong novelty (草案 C, zero-extra-param) ───────────
+# Reuses the rollout_log_probs already computed by slime (no extra forward pass).
+# Bonus is proportional to how surprised the *current* policy is by the trajectory:
+# higher mean negative-logprob → more novel → larger bonus, clipped to [0, L].
+# This is the LLM analog of RND: "how surprising is this trajectory under the
+# (frozen reference) base policy?" implemented without maintaining a separate net.
+_EXPLORE_LPRND_ENABLED = os.getenv("EXPLORE_LPRND_ENABLED", "0") == "1"
+_EXPLORE_LPRND_COEF = float(os.getenv("EXPLORE_LPRND_COEF", "0.05"))
+_EXPLORE_LPRND_CLIP = float(os.getenv("EXPLORE_LPRND_CLIP", "3.0"))
+# Running stats for normalization (process-level, updated online).
+_LPRND_STATS = {"n": 0, "mean": 0.0, "m2": 0.0}
+
+# ── Exploration: multi-attempt reflection (LaMer-style) ───────────────────────
+# When EXPLORE_RETRY_ATTEMPTS > 1, a failed rollout is annotated with a reflection
+# block + traj_gamma reward shaping. Note: actual env restart is handled inside
+# agent_runner; we surface the knobs here so the wrapper script and rollout_log
+# can pick them up. Defaults (1 / 1.0) preserve baseline behavior.
+_EXPLORE_RETRY_ATTEMPTS = int(os.getenv("EXPLORE_RETRY_ATTEMPTS", "1"))
+_EXPLORE_RETRY_TRAJ_GAMMA = float(os.getenv("EXPLORE_RETRY_TRAJ_GAMMA", "1.0"))
+
+# ── Exploration: safety pre-filter ────────────────────────────────────────────
+_EXPLORE_SAFETY_FILTER_ENABLED = os.getenv("EXPLORE_SAFETY_FILTER_ENABLED", "0") == "1"
+_EXPLORE_SAFETY_FILTER_COEF = float(os.getenv("EXPLORE_SAFETY_FILTER_COEF", "-0.5"))
+_DANGER_RE = re.compile(
+    r"rm\s+-[rfRF]+\s+/(?:\s|$)|"          # rm -rf /
+    r"(?:curl|wget)[^|;]+\|\s*(?:bash|sh)|"  # curl|bash, wget|sh
+    r"chmod\s+(?:0?7{2,3})\s+/|"             # chmod 777 /
+    r">\s*/etc/(?:passwd|shadow|sudoers)|"
+    r"cat\s+/etc/shadow|"
+    r":\(\)\s*\{\s*:\|:&\s*\}\s*;:",         # fork bomb
+    re.IGNORECASE,
+)
+
+
+def _cmd_signature(cmd: str) -> str:
+    """Skill-level signature of a command (cmd name + first 2 args) for novelty hashing.
+
+    'signature' granularity reduces hash-collision-by-paraphrase: e.g., `ls -la /tmp`
+    and `ls -al /tmp/` map to the same skill bucket, while `ls -la /etc` is distinct.
+    This is the sub-goal granularity proposed in the Agent57→Agentic-RL migration analysis.
+    """
+    import shlex
+    try:
+        parts = shlex.split(cmd)[:3]
+        return "|".join(parts)
+    except Exception:
+        return cmd[:80]
+
+
+def _explore_intrinsic_bonus(turn_records: List[Dict[str, Any]]) -> float:
+    """Sum of 1/sqrt(count) bonuses for unique commands (MERCI-style).
+
+    Granularity controlled by EXPLORE_INTRINSIC_GRANULARITY env var:
+      - "raw"       : full command text (default, v1 behavior)
+      - "signature" : cmd name + first 2 args (skill-level, Agent57-style)
+    """
+    if not _EXPLORE_INTRINSIC_ENABLED or not turn_records:
+        return 0.0
+    total = 0.0
+    for tr in turn_records:
+        cmd = str(tr.get("command", "") or "")
+        if not cmd:
+            continue
+        if _EXPLORE_INTRINSIC_GRANULARITY == "signature":
+            key_src = _cmd_signature(cmd)
+        else:
+            key_src = cmd.strip()
+        key = hashlib.md5(key_src.encode()).hexdigest()[:10]
+        _CMD_COUNTER[key] = _CMD_COUNTER.get(key, 0) + 1
+        total += 1.0 / math.sqrt(_CMD_COUNTER[key])
+    return total
+
+
+def _explore_safety_penalty(turn_records: List[Dict[str, Any]]) -> float:
+    """Negative penalty if any turn matched a danger pattern."""
+    if not _EXPLORE_SAFETY_FILTER_ENABLED or not turn_records:
+        return 0.0
+    pen = 0.0
+    for tr in turn_records:
+        cmd = str(tr.get("command", "") or "")
+        if cmd and _DANGER_RE.search(cmd):
+            pen += _EXPLORE_SAFETY_FILTER_COEF
+    return pen
+
+
+def _explore_lprnd_bonus(interactions) -> float:
+    """LP-RND lifelong novelty: reuse rollout_log_probs as the 'surprise' signal.
+
+    The intuition (from the Agent57→Agentic-RL analysis, 草案 C):
+      r_t^life = clip( (-mean_logprob - mu) / sigma, 1, L )
+
+    Higher negative-logprob = trajectory is more surprising under current policy =
+    indicates exploration into previously-low-density regions. Running stats keep
+    the bonus normalized so it doesn't dominate task reward as training progresses.
+
+    Zero extra parameters: relies entirely on log-probs already computed by slime.
+    Returns 0.0 when disabled or when stats aren't yet warm (n < 32 rollouts).
+    """
+    if not _EXPLORE_LPRND_ENABLED or not interactions:
+        return 0.0
+    # Average negative logprob across all generated tokens in this rollout.
+    total_logp, total_tok = 0.0, 0
+    for it in interactions:
+        lp = list(getattr(it, "output_token_logprobs", []) or [])
+        if not lp:
+            continue
+        total_logp += sum(lp)
+        total_tok += len(lp)
+    if total_tok == 0:
+        return 0.0
+    surprise = -(total_logp / total_tok)  # mean negative logprob, in nats
+
+    # Welford running stats.
+    s = _LPRND_STATS
+    s["n"] += 1
+    delta = surprise - s["mean"]
+    s["mean"] += delta / s["n"]
+    s["m2"] += delta * (surprise - s["mean"])
+    if s["n"] < 32:
+        return 0.0  # warmup
+    var = s["m2"] / max(1, s["n"] - 1)
+    std = max(math.sqrt(var), 1e-6)
+    z = (surprise - s["mean"]) / std
+    return max(0.0, min(_EXPLORE_LPRND_CLIP, z))
 
 
 # ─── Trajectory export (parallels swe-rl/generate_with_swe_remote.py:78-137) ───
@@ -936,6 +1074,19 @@ async def generate(
             discount=1.0,
             encourage=False,
         )
+
+        # ── Exploration: add intrinsic + safety + LP-RND bonuses (no-op when disabled) ────
+        if _EXPLORE_INTRINSIC_ENABLED or _EXPLORE_SAFETY_FILTER_ENABLED or _EXPLORE_LPRND_ENABLED:
+            _intr_bonus = _explore_intrinsic_bonus(turn_records)
+            _safe_penalty = _explore_safety_penalty(turn_records)
+            _lprnd_bonus = _explore_lprnd_bonus(interactions) * _EXPLORE_LPRND_COEF
+            for s in samples:
+                if isinstance(s.reward, dict) and "score" in s.reward:
+                    s.reward["score"] += _intr_bonus * _EXPLORE_INTRINSIC_COEF + _safe_penalty + _lprnd_bonus
+                    s.reward["explore_intrinsic"] = _intr_bonus
+                    s.reward["explore_safety_penalty"] = _safe_penalty
+                    s.reward["explore_lprnd"] = _lprnd_bonus
+
         for s in samples:
             s.metadata["model_turn_count"] = agent_runner.model_turn_count
             s.metadata["parse_error_count"] = agent_runner.parse_error_count
