@@ -114,6 +114,37 @@ RUN_LOG_DIR="${RUN_DIR}/logs"
 TERMINAL_SAVE_TRAJ_DIR="${RUN_DIR}/trajectories"
 WANDB_DIR="${RUN_DIR}/metrics/wandb"
 
+# ── Rollout knobs (env-configurable, baked into per-run yaml below) ──────
+# MAX_TURN: max model turns per rollout (terminal_max_iterations in generate.py).
+#   Empirical guidance based on 05-21 trajectory analysis (1743 trajectories):
+#     - 30.0% trajectories hit max_iteration=15 (TRUNCATED) → most tasks need fewer turns
+#     - Pass cases averaged 5-9 turns; tasks taking 10+ turns rarely passed
+#     - Lowering to 10 trims tail-latency rollouts ≈ 33%, saving ~3 hours / 78 rollouts at 14h
+#     - For exploratory runs needing more turns, override with MAX_TURN=15 or higher.
+MAX_TURN="${MAX_TURN:-10}"
+
+# Generate a per-run yaml that overlays MAX_TURN onto the base CUSTOM_CONFIG_PATH.
+# This is cleaner than mutating the base yaml — different concurrent runs can pick
+# different MAX_TURN without stepping on each other.
+BASE_CUSTOM_CONFIG_PATH="${CUSTOM_CONFIG_PATH}"
+RUN_CUSTOM_CONFIG_PATH="${RUN_DIR}/config/rollout_config.yaml"
+mkdir -p "$(dirname "${RUN_CUSTOM_CONFIG_PATH}")"
+if [[ -f "${BASE_CUSTOM_CONFIG_PATH}" ]]; then
+  python3 - "$BASE_CUSTOM_CONFIG_PATH" "$RUN_CUSTOM_CONFIG_PATH" "$MAX_TURN" <<'PY'
+import sys, yaml
+src, dst, max_turn = sys.argv[1], sys.argv[2], int(sys.argv[3])
+with open(src) as f:
+    cfg = yaml.safe_load(f) or {}
+cfg["max_iteration"] = max_turn
+with open(dst, "w") as f:
+    yaml.safe_dump(cfg, f, sort_keys=True)
+PY
+  CUSTOM_CONFIG_PATH="${RUN_CUSTOM_CONFIG_PATH}"
+  echo "[config] rollout yaml -> ${RUN_CUSTOM_CONFIG_PATH} (max_iteration=${MAX_TURN})"
+else
+  echo "[config] base yaml ${BASE_CUSTOM_CONFIG_PATH} not found; MAX_TURN=${MAX_TURN} will not take effect"
+fi
+
 # Symlinks for backward compatibility
 ln -sfn "${RUN_DIR}" "${RUNS_ROOT}/latest" 2>/dev/null || true
 ln -sfn "${RUN_DIR}" "${REPO_ROOT}/tmp_doc_latest" 2>/dev/null || true
