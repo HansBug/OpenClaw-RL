@@ -129,17 +129,48 @@ if [ "$DOCKER_ROOT" != "/var/lib/docker" ]; then
   sudo tee "$DAEMON_JSON" > /dev/null <<EOF
 {
 "registry-mirrors":[
-"https://docker.1ms.run"
+"https://docker.1ms.run",
+"https://docker.m.daocloud.io",
+"https://dockerproxy.com",
+"https://mirror.ccs.tencentyun.com"
 ],
 "insecure-registries": [
 "registry.h.pjlab.org.cn"
 ],
-  "data-root": "$DOCKER_ROOT",
+  "data-root": "/data",
+  "storage-driver": "overlay2",
+  "live-restore": true,
+  "max-concurrent-downloads": 6,
+  "max-concurrent-uploads": 6,
+  "log-driver": "json-file",
+  "log-opts": {
+    "max-size": "50m",
+    "max-file": "3"
+  },
   "default-address-pools": [
     {"base": "10.200.0.0/16", "size": 24}
-  ]
+  ],
+  "default-ulimits": {
+    "nproc": {
+      "Name": "nproc",
+      "Hard": 4096,
+      "Soft": 2048
+    },
+    "nofile": {
+      "Name": "nofile",
+      "Hard": 65536,
+      "Soft": 65536
+    },
+    "core": {
+      "Name": "core",
+      "Hard": 0,
+      "Soft": 0
+    }
+  },
+  "default-shm-size": "64M"
 
 }
+
 EOF
   echo "  [OK] Docker data-root set to $DOCKER_ROOT"
 else
@@ -234,7 +265,7 @@ echo ""
 echo " To start pool_server:"
 echo "   cd $REPO_ROOT"
 echo "   source .venv/bin/activate"
-echo "   bash terminal-rl/remote/run_pool_server_pu.sh"
+echo "   bash terminal-rl/remote/run_pool_server_pu_2.sh"
 echo ""
 echo " Then on GPU worker, set:"
 echo "   export WORKER_URLS=\"http://${MY_IP}:18081\""

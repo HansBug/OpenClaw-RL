@@ -10,7 +10,7 @@
 #
 # Prerequisites (remote 4-GPU worker):
 #   1. Pool server(s) running on reachable host(s), default port 18081:
-#        bash terminal-rl/remote/run_pool_server.sh
+#        bash terminal-rl/remote/run_pool_server_pu_v2.sh
 #   2. WORKER_URLS exported, e.g.
 #        export WORKER_URLS="http://<worker-ip>:18081"
 #   3. ROLLOUT_PROMPT_DATA pointing to a converted seta_env train.jsonl
