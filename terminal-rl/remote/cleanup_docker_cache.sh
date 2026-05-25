@@ -4,8 +4,16 @@
 # 安全: 不会删除正在运行的容器，不会删除有 tag 的 image
 
 set -uo pipefail
+DOCKER_DATA_ROOT="${DOCKER_DATA_ROOT:-${DOCKER_ROOT:-/data}}"
 echo "[$(date '+%F %T')] Docker cleanup starting on $(hostname)"
+echo "Docker data root: ${DOCKER_DATA_ROOT}"
 echo
+
+if ! timeout 10 docker info >/dev/null 2>&1; then
+    echo "[ERROR] docker daemon is not responding. Run:"
+    echo "        sudo bash terminal-rl/remote/fix_dockerd_and_proxy.sh"
+    exit 1
+fi
 
 # ── 1. 停止的容器清理 ──────────────────────────────────────────────────
 echo "=== Step 1: Remove stopped containers ==="
@@ -48,6 +56,6 @@ docker system df 2>&1
 echo
 docker info 2>&1 | grep -E "Containers:|Running:|Stopped:|Images:"
 echo
-df -h /data 2>&1
+df -h "${DOCKER_DATA_ROOT}" 2>&1 || true
 echo
 echo "[$(date '+%F %T')] Cleanup done."

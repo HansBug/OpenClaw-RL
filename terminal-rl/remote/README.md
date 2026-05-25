@@ -12,8 +12,8 @@ For from-zero setup, hardening, watchdog, and recovery procedures, see the **ope
 
 | Script | When to use |
 |---|---|
-| `setup_new_worker.sh` | First-time setup on a brand-new machine: installs docker, compose v2, configures daemon, pre-pulls base images |
-| `fix_dockerd_and_proxy.sh` | One-shot all-layer proxy fix (watchdog-aware). Run after `setup_new_worker.sh` or whenever build fails with proxy/timeout errors. Internally calls `prebuild_proxied_base_images.sh`. |
+| `setup_new_worker.sh` | Scenario A entry: first-time setup on a brand-new machine. Installs Docker/Compose, writes daemon config, hardens proxy/base images, installs watchdog, and verifies a build. |
+| `fix_dockerd_and_proxy.sh` | Scenario B entry: one-shot recovery when Docker/proxy/build path is broken. Watchdog-aware; internally calls `prebuild_proxied_base_images.sh`. |
 | `prebuild_proxied_base_images.sh` | Wraps the top base images with `apt.conf.d` proxy injection — mandatory in proxied environments because Ubuntu apt does not honor `HTTP_PROXY` env var |
 | `restart_docker_force.sh` | Manual force-restart of dockerd (bypasses systemctl, used by watchdog and as escape hatch) |
 
@@ -48,11 +48,7 @@ For from-zero setup, hardening, watchdog, and recovery procedures, see the **ope
 From the repo root:
 
 ```bash
-# 1) Source the proxy env (written by fix_dockerd_and_proxy.sh)
-set -a; . /etc/seta_build_proxy.env; set +a
-
-# 2) Activate venv and start pool server
-source .venv/bin/activate
+# The launcher auto-sources /etc/seta_build_proxy.env when present.
 bash terminal-rl/remote/run_pool_server_pu_v2.sh
 ```
 
@@ -63,7 +59,7 @@ export WORKER_URLS="http://<this-cpu-worker-ip>:18081"
 bash terminal-rl/terminal-rl_qwen3-8b_pu.sh
 ```
 
-For first-time setup, follow the **从零配置 CPU worker** section in [`../docs/cpu_worker_docker_ops.md`](../docs/cpu_worker_docker_ops.md).
+For first-time setup and recovery, follow [`../docs/cpu_worker_docker_ops.md`](../docs/cpu_worker_docker_ops.md).
 
 ---
 

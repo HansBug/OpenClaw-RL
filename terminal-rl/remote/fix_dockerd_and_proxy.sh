@@ -28,7 +28,7 @@
 # Env vars (all optional):
 #   PROXY_URL         default: http://httpproxy-headless.kubebrain.svc.pjlab.local:3128
 #   NO_PROXY_LIST     default: localhost,127.0.0.1,10.0.0.0/8,100.96.0.0/12,.pjlab.org.cn,.pjlab.local,.svc
-#   DOCKER_DATA_ROOT  default: /data
+#   DOCKER_DATA_ROOT  default: /data. DOCKER_ROOT is accepted as legacy alias.
 #   START_WATCHDOG    1=auto-start watchdog at end (default), 0=leave stopped
 #   SKIP_VERIFY       1=skip seta_env/0 build test (default 0)
 #   SETA              path to seta_env/0/ (default: in this repo)
@@ -37,7 +37,7 @@ set -uo pipefail
 
 PROXY_URL="${PROXY_URL:-http://httpproxy-headless.kubebrain.svc.pjlab.local:3128}"
 NO_PROXY_LIST="${NO_PROXY_LIST:-localhost,127.0.0.1,10.0.0.0/8,100.96.0.0/12,.pjlab.org.cn,.pjlab.local,.svc}"
-DOCKER_DATA_ROOT="${DOCKER_DATA_ROOT:-/data}"
+DOCKER_DATA_ROOT="${DOCKER_DATA_ROOT:-${DOCKER_ROOT:-/data}}"
 START_WATCHDOG="${START_WATCHDOG:-1}"
 SKIP_VERIFY="${SKIP_VERIFY:-0}"
 SETA="${SETA:-/mnt/shared-storage-user/puyuan/code/OpenClaw-RL/terminal-rl/dataset/seta_env/0}"
@@ -90,6 +90,10 @@ fi
 
 # ─── Phase 2: force-restart dockerd ──────────────────────────────────
 log "Phase 2: force-restart dockerd (skip systemctl, clean stale state)"
+if [ ! -d "${DOCKER_DATA_ROOT}" ]; then
+  log "  creating DOCKER_DATA_ROOT=${DOCKER_DATA_ROOT}"
+  mkdir -p "${DOCKER_DATA_ROOT}"
+fi
 
 # 2a. Tell systemd not to fight us
 timeout 5 systemctl reset-failed docker.service docker.socket 2>/dev/null || true
@@ -344,6 +348,9 @@ if [ "${WATCHDOG_PRESENT}" = "1" ] && [ "${START_WATCHDOG}" = "1" ]; then
   fi
 elif [ "${START_WATCHDOG}" = "0" ]; then
   log "  [SKIP] START_WATCHDOG=0; start manually with: sudo systemctl start docker-watchdog"
+elif [ "${WATCHDOG_PRESENT}" != "1" ]; then
+  log "  [SKIP] docker-watchdog.service is not installed"
+  log "         install with: sudo cp $(dirname "$0")/docker-watchdog.service /etc/systemd/system/ && sudo systemctl daemon-reload && sudo systemctl enable --now docker-watchdog"
 fi
 
 hr

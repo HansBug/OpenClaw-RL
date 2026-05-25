@@ -41,7 +41,8 @@ MAX_CONSECUTIVE_HEALTH_FAILS="${MAX_CONSECUTIVE_HEALTH_FAILS:-3}"
 LOG_FILE="${LOG_FILE:-/tmp/docker_watchdog.log}"
 LOG_MAX_BYTES="${LOG_MAX_BYTES:-209715200}"            # 200 MiB
 DOCKER_SOCK="${DOCKER_SOCK:-/var/run/docker.sock}"
-DOCKER_DATA_ROOT="${DOCKER_DATA_ROOT:-/data}"
+DOCKER_DATA_ROOT="${DOCKER_DATA_ROOT:-${DOCKER_ROOT:-/data}}"
+PROXY_ENV_FILE="${PROXY_ENV_FILE:-/etc/seta_build_proxy.env}"
 
 POOL_HOST="${POOL_HOST:-127.0.0.1}"
 POOL_PORT="${POOL_PORT:-18081}"
@@ -403,6 +404,11 @@ restart_docker() {
     fi
 
     # 4) 启动 dockerd（直接 nohup，不走 systemd）
+    if [ -f "${PROXY_ENV_FILE}" ]; then
+        # shellcheck disable=SC1090
+        set -a; . "${PROXY_ENV_FILE}"; set +a
+        log "Loaded proxy env from ${PROXY_ENV_FILE} before dockerd restart"
+    fi
     nohup dockerd --containerd=/run/containerd/containerd.sock \
         > /tmp/dockerd_watchdog_restart.log 2>&1 &
     local pid=$!
@@ -436,6 +442,7 @@ log "  PIDs warn=${PIDS_WARN_PCT}% emerg=${PIDS_EMERGENCY_PCT}%"
 log "  Mem  warn=${MEM_WARN_PCT}% emerg=${MEM_EMERGENCY_PCT}%"
 log "  pool=${POOL_HOST}:${POOL_PORT}  pool_server_regex=${POOL_SERVER_NAME_REGEX}"
 log "  task_container_regex=${TASK_CONTAINER_REGEX}"
+log "  docker_data_root=${DOCKER_DATA_ROOT}  proxy_env_file=${PROXY_ENV_FILE}"
 log "  log_file=${LOG_FILE}  log_max=${LOG_MAX_BYTES}"
 
 detect_pid_namespace

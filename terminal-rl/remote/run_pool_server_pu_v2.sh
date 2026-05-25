@@ -20,6 +20,8 @@
 #   WORKER_MAX_CONCURRENT_CLOSES (default 32)  — pool_server --max-concurrent-closes
 #   ENV_SERVER_PORT             (default 18081)
 #   SKIP_PREFLIGHT_CLEANUP      (default 0)    — set 1 to skip orphan cleanup
+#   PROXY_ENV_FILE              (default /etc/seta_build_proxy.env)
+#   SKIP_PROXY_ENV              (default 0)    — set 1 to avoid sourcing proxy env
 #   CLAWSENTRY_NEEDED           (default 0)    — set 1 to also check CS gateway
 #   CS_GATEWAY_PORT             (default 8090) — ClawSentry gateway port
 #
@@ -44,6 +46,8 @@ WORKER_MAX_RUNS_PER_TASK="${WORKER_MAX_RUNS_PER_TASK:-16}"
 WORKER_MAX_CONCURRENT_CLOSES="${WORKER_MAX_CONCURRENT_CLOSES:-32}"
 ENV_SERVER_PORT="${ENV_SERVER_PORT:-18081}"
 SKIP_PREFLIGHT_CLEANUP="${SKIP_PREFLIGHT_CLEANUP:-0}"
+PROXY_ENV_FILE="${PROXY_ENV_FILE:-/etc/seta_build_proxy.env}"
+SKIP_PROXY_ENV="${SKIP_PROXY_ENV:-0}"
 CLAWSENTRY_NEEDED="${CLAWSENTRY_NEEDED:-0}"
 CS_GATEWAY_PORT="${CS_GATEWAY_PORT:-8090}"
 
@@ -52,6 +56,14 @@ log "  max_tasks=${WORKER_MAX_TASKS}  max_runs_per_task=${WORKER_MAX_RUNS_PER_TA
 log "  max_concurrent_closes=${WORKER_MAX_CONCURRENT_CLOSES}"
 log "  port=${ENV_SERVER_PORT}  skip_cleanup=${SKIP_PREFLIGHT_CLEANUP}"
 log "  total_capacity=$((WORKER_MAX_TASKS * WORKER_MAX_RUNS_PER_TASK)) slots"
+
+if [[ "${SKIP_PROXY_ENV}" != "1" && -f "${PROXY_ENV_FILE}" ]]; then
+    # shellcheck disable=SC1090
+    set -a; . "${PROXY_ENV_FILE}"; set +a
+    log "  loaded proxy env: ${PROXY_ENV_FILE}"
+elif [[ "${SKIP_PROXY_ENV}" != "1" ]]; then
+    log "  proxy env not found at ${PROXY_ENV_FILE}; continuing without it"
+fi
 
 # ── Log paths ─────────────────────────────────────────────────────────────────
 TMP_DOC_LATEST="${REPO_ROOT}/tmp_doc_latest"
@@ -66,10 +78,17 @@ log "  err log:  ${CPU_ERR_LOG}"
 log "Pre-flight [1/5]: Docker daemon health check"
 if ! timeout 10 docker info >/dev/null 2>&1; then
     log "  ❌ Docker daemon not responding!"
-    log "  Run: bash terminal-rl/remote/restart_docker_force.sh"
+    log "  Run repair: sudo bash terminal-rl/remote/fix_dockerd_and_proxy.sh"
+    log "  Or force restart only: sudo bash terminal-rl/remote/restart_docker_force.sh"
     exit 1
 fi
 log "  ✅ Docker daemon OK"
+
+if command -v ss >/dev/null 2>&1 && ss -tln "( sport = :${ENV_SERVER_PORT} )" | grep -q ":${ENV_SERVER_PORT}"; then
+    log "  ❌ Port ${ENV_SERVER_PORT} is already in use"
+    log "     Inspect: ss -tlnp '( sport = :${ENV_SERVER_PORT} )'"
+    exit 1
+fi
 
 # ── Pre-flight: nofile ulimit check (坑4) ────────────────────────────────────
 log "Pre-flight [2/5]: nofile ulimit check (need ≥65536)"

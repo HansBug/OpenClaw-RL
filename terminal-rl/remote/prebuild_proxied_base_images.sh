@@ -32,13 +32,13 @@
 #
 # Env:
 #   PROXY_URL       default: pjlab proxy
-#   NO_PROXY_LIST   default: localhost,127.0.0.1
+#   NO_PROXY_LIST   default: internal loopback / pjlab network bypass list
 #   BASE_IMAGES     space-separated override (default: top 4 from seta_env scan)
 
 set -uo pipefail
 
 PROXY_URL="${PROXY_URL:-http://httpproxy-headless.kubebrain.svc.pjlab.local:3128}"
-NO_PROXY_LIST="${NO_PROXY_LIST:-localhost,127.0.0.1}"
+NO_PROXY_LIST="${NO_PROXY_LIST:-localhost,127.0.0.1,10.0.0.0/8,100.96.0.0/12,.pjlab.org.cn,.pjlab.local,.svc}"
 
 # Frequencies measured in seta_env/*/Dockerfile (1377 total):
 #   1317  ghcr.io/laude-institute/t-bench/ubuntu-24-04:20250624

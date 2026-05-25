@@ -219,6 +219,7 @@ source "${SLIME_DIR}/scripts/models/qwen3-8B.sh"
 DATASET="${DATASET:-seta}"
 SETA_SAFETY="${SETA_SAFETY:-clawsentry}"
 SAFETY_BENCH_REWARD="${SAFETY_BENCH_REWARD:-rule}"
+AGENT_SAFETYBENCH_REMOTE_ENV="${AGENT_SAFETYBENCH_REMOTE_ENV:-0}"
 AGENT_SAFETYBENCH_ROOT="${AGENT_SAFETYBENCH_ROOT:-/mnt/shared-storage-user/puyuan/code/Agent-SafetyBench}"
 
 SETA_DATA="${SCRIPT_DIR}/dataset/seta_env_convert/train.jsonl"
@@ -272,6 +273,12 @@ fi
 echo "[config] DATASET=${DATASET} SETA_SAFETY=${SETA_SAFETY} SAFETY_BENCH_REWARD=${SAFETY_BENCH_REWARD}"
 echo "[config] data=${ROLLOUT_PROMPT_DATA}"
 
+NEEDS_ENV_ROUTER="1"
+if [[ "${DATASET}" == "safety" && "${AGENT_SAFETYBENCH_REMOTE_ENV}" != "1" ]]; then
+  NEEDS_ENV_ROUTER="0"
+fi
+echo "[config] needs_env_router=${NEEDS_ENV_ROUTER} AGENT_SAFETYBENCH_REMOTE_ENV=${AGENT_SAFETYBENCH_REMOTE_ENV}"
+
 # Optional dataset blacklist (issue #3 §1.X / §2.x stuck offenders).
 # Default-ON; set USE_BLACKLIST=0 to keep the raw dataset.
 USE_BLACKLIST="${USE_BLACKLIST:-1}"
@@ -306,7 +313,7 @@ fi
 
 # ── Router / worker URLs ─────────────────────────────────────────────
 WORKER_URLS="${WORKER_URLS:-}"
-if [[ -z "${WORKER_URLS}" ]]; then
+if [[ "${NEEDS_ENV_ROUTER}" == "1" && -z "${WORKER_URLS}" ]]; then
   echo "[ERROR] WORKER_URLS is unset. Example:"
   echo "        export WORKER_URLS=http://<worker-ip>:18081"
   exit 1
@@ -316,13 +323,14 @@ export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-max_split_size_mb:204
 export MASTER_ADDR="${MASTER_ADDR:-$(hostname -I | awk '{print $1}')}"
 NODE_IP="${MASTER_ADDR}"
 
-export USE_REMOTE_ENV="${USE_REMOTE_ENV:-1}"
+export USE_REMOTE_ENV="${USE_REMOTE_ENV:-${NEEDS_ENV_ROUTER}}"
 export PROVIDER_NAME="${PROVIDER_NAME:-build}"
 export ENV_SERVER_BIND_HOST="${ENV_SERVER_BIND_HOST:-0.0.0.0}"
 export ENV_SERVER_PORT="${ENV_SERVER_PORT:-18080}"
 export ENV_SERVER_HOST="${ENV_SERVER_HOST:-${MASTER_ADDR}}"
 export ENV_SERVER_URL="${ENV_SERVER_URL:-http://${ENV_SERVER_HOST}:${ENV_SERVER_PORT}}"
-export START_ENV_POOL_SERVER="${START_ENV_POOL_SERVER:-1}"
+export START_ENV_POOL_SERVER="${START_ENV_POOL_SERVER:-${NEEDS_ENV_ROUTER}}"
+export AGENT_SAFETYBENCH_REMOTE_ENV
 
 ROUTER_HOST="${ROUTER_HOST:-0.0.0.0}"
 ROUTER_PORT="${ROUTER_PORT:-${ENV_SERVER_PORT}}"
@@ -343,12 +351,22 @@ export ROUTER_FORWARD_RETRY_BACKOFF="${ROUTER_FORWARD_RETRY_BACKOFF:-1.0}"
 # ── ClawSentry safety reward (L1-only, reward-only, linear-fusion baseline) ──
 # Gateway runs on the same host as router_server (CPU master). All decisions
 # are reward-shaping signals; agent actions are never blocked.
-# ClawSentry is enabled when SETA_SAFETY=clawsentry or SAFETY_BENCH_REWARD=clawsentry.
+# ClawSentry is enabled only for the active dataset family.
 # SAFETY_REWARD_COEF controls the linear weight (default 0.3).
 CLAWSENTRY_NEEDED="0"
-if [[ "${SETA_SAFETY}" == "clawsentry" ]] || [[ "${SAFETY_BENCH_REWARD}" == "clawsentry" ]]; then
-  CLAWSENTRY_NEEDED="1"
-fi
+case "${DATASET}" in
+  seta)
+    [[ "${SETA_SAFETY}" == "clawsentry" ]] && CLAWSENTRY_NEEDED="1"
+    ;;
+  safety)
+    [[ "${SAFETY_BENCH_REWARD}" == "clawsentry" ]] && CLAWSENTRY_NEEDED="1"
+    ;;
+  mixed)
+    if [[ "${SETA_SAFETY}" == "clawsentry" ]] || [[ "${SAFETY_BENCH_REWARD}" == "clawsentry" ]]; then
+      CLAWSENTRY_NEEDED="1"
+    fi
+    ;;
+esac
 export SAFETY_REWARD_COEF="${SAFETY_REWARD_COEF:-0.3}"
 export SAFETY_REWARD_SUMMARY_WEIGHT="${SAFETY_REWARD_SUMMARY_WEIGHT:-0.3}"
 export SAFETY_REWARD_TIMEOUT="${SAFETY_REWARD_TIMEOUT:-2.0}"
@@ -371,9 +389,12 @@ export TERMINAL_SAVE_TRAJ_DIR="${TERMINAL_SAVE_TRAJ_DIR}"
 # aiohttp + requests will then try to tunnel the internal router→worker traffic
 # through a proxy, causing spurious connection failures. Explicitly list all
 # hosts on the rollout datapath as NO_PROXY (matches swe-rl v1/v4 pattern).
-ALL_WORKER_HOSTS="$(echo "${WORKER_URLS}" | tr ',' '\n' \
-  | sed -E 's#https?://([^:/]+).*#\1#' | tr '\n' ',' | sed 's/,$//')"
-export NO_PROXY="${NO_PROXY:-localhost,127.0.0.1,${MASTER_ADDR},${ALL_WORKER_HOSTS}}"
+ALL_WORKER_HOSTS=""
+if [[ -n "${WORKER_URLS}" ]]; then
+  ALL_WORKER_HOSTS="$(echo "${WORKER_URLS}" | tr ',' '\n' \
+    | sed -E 's#https?://([^:/]+).*#\1#' | tr '\n' ',' | sed 's/,$//')"
+fi
+export NO_PROXY="${NO_PROXY:-localhost,127.0.0.1,${MASTER_ADDR}${ALL_WORKER_HOSTS:+,${ALL_WORKER_HOSTS}}}"
 export no_proxy="${NO_PROXY}"
 
 # Router uses `python3` which, after the PATH export above, resolves to
@@ -525,29 +546,33 @@ cleanup() {
 trap cleanup EXIT INT TERM
 
 ROUTER_LOG="${RUN_LOG_DIR}/router.log"
-log "Starting router on ${ROUTER_HOST}:${ROUTER_PORT} -> ${WORKER_URLS} (python=${ROUTER_PYTHON})"
-log "  forward_timeout=${ROUTER_FORWARD_TIMEOUT}s retries=${ROUTER_FORWARD_RETRIES} backoff=${ROUTER_FORWARD_RETRY_BACKOFF}s no_proxy=${NO_PROXY}"
-(
-  cd "${REPO_ROOT}"
-  "${ROUTER_PYTHON}" -m terminal-rl.router_server \
-    --host "${ROUTER_HOST}" --port "${ROUTER_PORT}" --workers "${WORKER_URLS}" \
-    > "${ROUTER_LOG}" 2>&1 &
-  echo $! > "${RUN_LOG_DIR}/router.pid"
-)
-ROUTER_PID="$(cat "${RUN_LOG_DIR}/router.pid")"
-log "Router PID=${ROUTER_PID}, log=${ROUTER_LOG}"
-
-# Wait for router healthz
 require_cmd curl
-for ((i=1; i<=CHECK_WAIT_SECS; i++)); do
-  if curl -fsS "http://${CHECK_HOST}:${ROUTER_PORT}/healthz" >/dev/null 2>&1; then
-    log "router ready (attempt ${i})"
-    break
-  fi
-  sleep 1
-done
-curl -fsS "http://${CHECK_HOST}:${ROUTER_PORT}/status" || true
-echo
+if [[ "${NEEDS_ENV_ROUTER}" == "1" ]]; then
+  log "Starting router on ${ROUTER_HOST}:${ROUTER_PORT} -> ${WORKER_URLS} (python=${ROUTER_PYTHON})"
+  log "  forward_timeout=${ROUTER_FORWARD_TIMEOUT}s retries=${ROUTER_FORWARD_RETRIES} backoff=${ROUTER_FORWARD_RETRY_BACKOFF}s no_proxy=${NO_PROXY}"
+  (
+    cd "${REPO_ROOT}"
+    "${ROUTER_PYTHON}" -m terminal-rl.router_server \
+      --host "${ROUTER_HOST}" --port "${ROUTER_PORT}" --workers "${WORKER_URLS}" \
+      > "${ROUTER_LOG}" 2>&1 &
+    echo $! > "${RUN_LOG_DIR}/router.pid"
+  )
+  ROUTER_PID="$(cat "${RUN_LOG_DIR}/router.pid")"
+  log "Router PID=${ROUTER_PID}, log=${ROUTER_LOG}"
+
+  # Wait for router healthz
+  for ((i=1; i<=CHECK_WAIT_SECS; i++)); do
+    if curl -fsS "http://${CHECK_HOST}:${ROUTER_PORT}/healthz" >/dev/null 2>&1; then
+      log "router ready (attempt ${i})"
+      break
+    fi
+    sleep 1
+  done
+  curl -fsS "http://${CHECK_HOST}:${ROUTER_PORT}/status" || true
+  echo
+else
+  log "Skipping terminal env router; Agent-SafetyBench uses local env backend"
+fi
 
 # ── Start ClawSentry gateway (L1-only, reward-only) ──────────────────
 if [[ "${CLAWSENTRY_NEEDED}" == "1" ]]; then
@@ -590,15 +615,17 @@ fi
 
 # Pre-flight: sanity check each pool worker before launching training
 # (issue #3 §1.X-E: early detection of worker transport flakes).
-log "Probing worker endpoints..."
-IFS=',' read -r -a _WORKERS <<< "${WORKER_URLS}"
-for _w in "${_WORKERS[@]}"; do
-  if curl -fsS --max-time 5 --noproxy '*' "${_w}/healthz" >/dev/null 2>&1; then
-    log "  [OK] ${_w}/healthz"
-  else
-    log "  [WARN] ${_w}/healthz unreachable — router will retry on forward"
-  fi
-done
+if [[ "${NEEDS_ENV_ROUTER}" == "1" ]]; then
+  log "Probing worker endpoints..."
+  IFS=',' read -r -a _WORKERS <<< "${WORKER_URLS}"
+  for _w in "${_WORKERS[@]}"; do
+    if curl -fsS --max-time 5 --noproxy '*' "${_w}/healthz" >/dev/null 2>&1; then
+      log "  [OK] ${_w}/healthz"
+    else
+      log "  [WARN] ${_w}/healthz unreachable — router will retry on forward"
+    fi
+  done
+fi
 
 # ── NVLink detection ─────────────────────────────────────────────────
 NVLINK_COUNT=$(nvidia-smi topo -m 2>/dev/null | grep -o 'NV[0-9][0-9]*' | wc -l || true)
@@ -631,6 +658,8 @@ cat > "${RUN_DIR}/config/run_config.json" <<CFGEOF
   "max_tokens_per_gpu": ${MAX_TOKENS_PER_GPU},
   "worker_urls": "${WORKER_URLS}",
   "env_server_url": "${ENV_SERVER_URL}",
+  "needs_env_router": "${NEEDS_ENV_ROUTER}",
+  "agent_safetybench_remote_env": "${AGENT_SAFETYBENCH_REMOTE_ENV}",
   "safety_reward_enable": "${CLAWSENTRY_NEEDED}",
   "seta_safety": "${SETA_SAFETY}",
   "safety_bench_reward": "${SAFETY_BENCH_REWARD}",
@@ -681,6 +710,7 @@ RUNTIME_ENV_JSON="{
     \"PYTORCH_CUDA_ALLOC_CONF\": \"${PYTORCH_CUDA_ALLOC_CONF}\",
     \"USE_REMOTE_ENV\": \"${USE_REMOTE_ENV}\",
     \"ENV_SERVER_URL\": \"${ENV_SERVER_URL}\",
+    \"AGENT_SAFETYBENCH_REMOTE_ENV\": \"${AGENT_SAFETYBENCH_REMOTE_ENV}\",
     \"NO_PROXY\": \"${NO_PROXY}\",
     \"no_proxy\": \"${NO_PROXY}\",
     \"CS_HTTP_URL\": \"${CS_HTTP_URL}\",

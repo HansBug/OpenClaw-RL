@@ -555,10 +555,70 @@ def _normalize_tool_schemas(raw_tools: List[Any]) -> List[Dict[str, Any]]:
     return schemas
 
 
+class _LocalAgentSafetyBenchClient:
+    def __init__(self) -> None:
+        from remote.agent_safetybench_env import AgentSafetyBenchEnv
+
+        self._env = AgentSafetyBenchEnv()
+
+    async def reset(
+        self,
+        lease_id: str,
+        task_meta: dict[str, Any],
+        run_ctx: dict[str, Any],
+        task_timeouts: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        _ = (lease_id, task_timeouts)
+        local_run_ctx = RunContext(
+            uid=str(run_ctx.get("uid", "local")),
+            group_index=int(run_ctx.get("group_index", 0) or 0),
+            sample_index=int(run_ctx.get("sample_index", 0) or 0),
+            log_dir=Path(str(run_ctx.get("log_dir", "build_outputs"))),
+        )
+        user_msg, tool_schemas = await self._env.reset(
+            task_meta=task_meta,
+            task_spec=_make_task_spec(task_meta),
+            run_ctx=local_run_ctx,
+        )
+        return {"user_msg": user_msg, "tool_schemas": tool_schemas}
+
+    async def heartbeat(self, lease_id: str) -> None:
+        _ = lease_id
+
+    async def exec_tool(
+        self, lease_id: str, tool_name: str, arguments: dict[str, Any]
+    ) -> str:
+        _ = lease_id
+        return await self._env.exec_tool(tool_name, arguments)
+
+    async def evaluate(
+        self, lease_id: str, trajectory: dict[str, Any] | None = None
+    ) -> float:
+        _ = lease_id
+        return await self._env.evaluate(trajectory)
+
+    async def close(self, lease_id: str) -> None:
+        _ = lease_id
+        await self._env.close()
+
+
 async def _create_env_client(
     task_spec: TaskSpec,
     run_ctx: RunContext,
-) -> tuple[TerminalEnvClient, str]:
+    task_meta: Dict[str, Any] | None = None,
+) -> tuple[Any, str]:
+    if (
+        isinstance(task_meta, dict)
+        and task_meta.get("data_source") == "agent_safetybench"
+        and os.getenv("AGENT_SAFETYBENCH_REMOTE_ENV", "0") != "1"
+    ):
+        logger.info(
+            "Using local Agent-SafetyBench env backend for task=%s path=%s",
+            task_spec.task_name,
+            task_spec.task_path,
+        )
+        return _LocalAgentSafetyBenchClient(), "local-agent-safetybench"
+
     env_server_url = os.getenv("ENV_SERVER_URL", "")
     if not env_server_url:
         raise RuntimeError("ENV_SERVER_URL is empty.")
@@ -726,7 +786,9 @@ async def generate(
     _log_tag = f"[task={task_spec.task_name} uid={run_ctx.uid} group_idx={run_ctx.group_index} sample_idx={run_ctx.sample_index}]"
 
     try:
-        env_client, lease_id = await _create_env_client(task_spec, run_ctx)
+        env_client, lease_id = await _create_env_client(
+            task_spec, run_ctx, task_meta=task_meta
+        )
         reset_payload = await env_client.reset(
             lease_id=lease_id,
             task_meta=task_meta,
