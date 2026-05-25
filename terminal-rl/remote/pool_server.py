@@ -291,11 +291,13 @@ class WorkerPool:
             run_slot.last_used_ts = time.time()
             return str(observation)
 
-    async def evaluate(self, run_lease_id: str) -> float:
+    async def evaluate(
+        self, run_lease_id: str, trajectory: dict[str, Any] | None = None
+    ) -> float:
         async with self._lock:
             run_slot = self._get_run_slot(run_lease_id)
         async with run_slot.lock:
-            score = await run_slot.env.evaluate()
+            score = await run_slot.env.evaluate(trajectory)
             run_slot.last_used_ts = time.time()
             return float(score)
 
@@ -530,6 +532,7 @@ async def evaluate(request: Request) -> JSONResponse:
 
     data = await json_payload(request)
     lease_id = data.get("lease_id")
+    trajectory = data.get("trajectory")
 
     if not lease_id:
         return JSONResponse(
@@ -537,7 +540,9 @@ async def evaluate(request: Request) -> JSONResponse:
         )
 
     try:
-        score = await POOL.evaluate(str(lease_id))
+        score = await POOL.evaluate(
+            str(lease_id), trajectory if isinstance(trajectory, dict) else None
+        )
         return JSONResponse({"ok": True, "score": score})
     except Exception as exc:
         return JSONResponse({"ok": False, "error": str(exc)}, status_code=500)

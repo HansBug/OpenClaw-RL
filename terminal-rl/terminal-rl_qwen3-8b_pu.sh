@@ -219,6 +219,7 @@ source "${SLIME_DIR}/scripts/models/qwen3-8B.sh"
 DATASET="${DATASET:-seta}"
 SETA_SAFETY="${SETA_SAFETY:-clawsentry}"
 SAFETY_BENCH_REWARD="${SAFETY_BENCH_REWARD:-rule}"
+AGENT_SAFETYBENCH_ROOT="${AGENT_SAFETYBENCH_ROOT:-/mnt/shared-storage-user/puyuan/code/Agent-SafetyBench}"
 
 SETA_DATA="${SCRIPT_DIR}/dataset/seta_env_convert/train.jsonl"
 SAFETY_DATA="${SCRIPT_DIR}/dataset/agent_safetybench_convert/train.jsonl"
@@ -233,8 +234,24 @@ case "${DATASET}" in
   mixed)
     MIXED_DATA="${SCRIPT_DIR}/dataset/mixed_seta_safety.jsonl"
     if [[ ! -f "${MIXED_DATA}" ]] || [[ "${SETA_DATA}" -nt "${MIXED_DATA}" ]] || [[ "${SAFETY_DATA}" -nt "${MIXED_DATA}" ]]; then
-      cat "${SETA_DATA}" "${SAFETY_DATA}" > "${MIXED_DATA}"
-      echo "[dataset] merged seta($(wc -l < "${SETA_DATA}")) + safety($(wc -l < "${SAFETY_DATA}")) -> ${MIXED_DATA}"
+      if [[ -n "${MIX_SETA_RATIO:-}" ]] || [[ -n "${MIX_SAFETY_RATIO:-}" ]]; then
+        MIX_ARGS=(
+          --source "${SETA_DATA}:${MIX_SETA_RATIO:-1}"
+          --source "${SAFETY_DATA}:${MIX_SAFETY_RATIO:-1}"
+          --output "${MIXED_DATA}"
+          --seed "${MIX_SEED:-42}"
+        )
+        if [[ -n "${MIX_TOTAL:-}" ]]; then
+          MIX_ARGS+=(--total "${MIX_TOTAL}")
+        fi
+        if [[ -n "${MIX_OVERSAMPLE:-}" ]]; then
+          MIX_ARGS+=(--oversample)
+        fi
+        python "${SCRIPT_DIR}/data_utils/mix_jsonl_datasets.py" "${MIX_ARGS[@]}"
+      else
+        cat "${SETA_DATA}" "${SAFETY_DATA}" > "${MIXED_DATA}"
+        echo "[dataset] merged seta($(wc -l < "${SETA_DATA}")) + safety($(wc -l < "${SAFETY_DATA}")) -> ${MIXED_DATA}"
+      fi
     fi
     ROLLOUT_PROMPT_DATA="${ROLLOUT_PROMPT_DATA:-${MIXED_DATA}}"
     ;;
@@ -670,6 +687,7 @@ RUNTIME_ENV_JSON="{
     \"CS_AUTH_TOKEN\": \"${CS_AUTH_TOKEN}\",
     \"SETA_SAFETY\": \"${SETA_SAFETY}\",
     \"SAFETY_BENCH_REWARD\": \"${SAFETY_BENCH_REWARD}\",
+    \"AGENT_SAFETYBENCH_ROOT\": \"${AGENT_SAFETYBENCH_ROOT}\",
     \"SAFETY_REWARD_COEF\": \"${SAFETY_REWARD_COEF}\",
     \"SAFETY_REWARD_SUMMARY_WEIGHT\": \"${SAFETY_REWARD_SUMMARY_WEIGHT}\",
     \"SAFETY_REWARD_TIMEOUT\": \"${SAFETY_REWARD_TIMEOUT}\",

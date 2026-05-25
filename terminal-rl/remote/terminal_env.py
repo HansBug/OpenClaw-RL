@@ -18,6 +18,7 @@ from terminal_bench.terminal.terminal import Terminal
 
 from ..custom_types import RunContext, TaskSpec, TaskTimeouts
 
+from .agent_safetybench_env import AgentSafetyBenchEnv
 from .docker_compose_utils import compose_up_no_build, prepare_task_docker_image
 
 logger = logging.getLogger(__name__)
@@ -81,6 +82,7 @@ class TerminalEnv:
         self._parser = None
         self._terminal_toolkit: TerminalToolkit | None = None
         self._tools: dict[str, Any] = {}
+        self._agent_safetybench_env: AgentSafetyBenchEnv | None = None
 
     async def reset(
         self,
@@ -96,6 +98,14 @@ class TerminalEnv:
         self._task_spec = task_spec
         self._run_ctx = run_ctx
         self._timeouts = timeouts
+
+        if task_meta.get("data_source") == "agent_safetybench":
+            self._agent_safetybench_env = AgentSafetyBenchEnv()
+            return await self._agent_safetybench_env.reset(
+                task_meta=task_meta,
+                task_spec=task_spec,
+                run_ctx=run_ctx,
+            )
 
         image_prep = await asyncio.to_thread(
             prepare_task_docker_image,
@@ -188,6 +198,9 @@ class TerminalEnv:
         return await asyncio.to_thread(_sync_reset)
 
     async def exec_tool(self, name: str, arguments: dict[str, Any]) -> str:
+        if self._agent_safetybench_env is not None:
+            return await self._agent_safetybench_env.exec_tool(name, arguments)
+
         if not self._tools:
             raise RuntimeError("env is not initialized; call reset first")
 
@@ -210,7 +223,10 @@ class TerminalEnv:
             return result
         return json.dumps(result, ensure_ascii=False)
 
-    async def evaluate(self) -> float:
+    async def evaluate(self, trajectory: dict[str, Any] | None = None) -> float:
+        if self._agent_safetybench_env is not None:
+            return await self._agent_safetybench_env.evaluate(trajectory)
+
         if (
             self._trial_handler is None
             or self._terminal is None
@@ -307,6 +323,7 @@ class TerminalEnv:
         terminal = self._terminal
         timeouts = self._timeouts
         toolkit = self._terminal_toolkit
+        agent_safetybench_env = self._agent_safetybench_env
 
         self._tools = {}
         self._terminal = None
@@ -316,6 +333,15 @@ class TerminalEnv:
         self._task_spec = None
         self._run_ctx = None
         self._timeouts = None
+        self._agent_safetybench_env = None
+
+        if agent_safetybench_env is not None:
+            try:
+                await agent_safetybench_env.close()
+            except Exception:
+                logger.exception(
+                    "Failed to cleanup Agent-SafetyBench env for %s", trial_name
+                )
 
         if toolkit is not None:
             try:

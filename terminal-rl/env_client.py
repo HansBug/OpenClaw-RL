@@ -78,10 +78,15 @@ class TerminalEnvClient:
             raise RuntimeError(f"exec_tool failed: {out}")
         return str(out.get("observation", ""))
 
-    async def evaluate(self, lease_id: str) -> float:
+    async def evaluate(
+        self, lease_id: str, trajectory: dict[str, Any] | None = None
+    ) -> float:
+        payload: dict[str, Any] = {"lease_id": lease_id}
+        if trajectory is not None:
+            payload["trajectory"] = trajectory
         out = await post(
             f"{self.base_url}/evaluate",
-            {"lease_id": lease_id},
+            payload,
             max_retries=self.evaluate_max_retries,
         )
         if not out.get("ok", False):
