@@ -122,6 +122,11 @@ WANDB_DIR="${RUN_DIR}/metrics/wandb"
 #     - Lowering to 10 trims tail-latency rollouts ≈ 33%, saving ~3 hours / 78 rollouts at 14h
 #     - For exploratory runs needing more turns, override with MAX_TURN=15 or higher.
 MAX_TURN="${MAX_TURN:-10}"
+# TRAJECTORY_SAVE_INTERVAL controls full trajectory artifact storage.
+#   unset / config value 1: save every rollout step (backward compatible)
+#   N>1: save only when train_step % N == 0
+#   0: disable trajectory artifact writes even when TERMINAL_SAVE_TRAJ_DIR is set
+TRAJECTORY_SAVE_INTERVAL="${TRAJECTORY_SAVE_INTERVAL:-}"
 
 # Generate a per-run yaml that overlays MAX_TURN onto the base CUSTOM_CONFIG_PATH.
 # This is cleaner than mutating the base yaml — different concurrent runs can pick
@@ -130,17 +135,23 @@ BASE_CUSTOM_CONFIG_PATH="${CUSTOM_CONFIG_PATH}"
 RUN_CUSTOM_CONFIG_PATH="${RUN_DIR}/config/rollout_config.yaml"
 mkdir -p "$(dirname "${RUN_CUSTOM_CONFIG_PATH}")"
 if [[ -f "${BASE_CUSTOM_CONFIG_PATH}" ]]; then
-  python3 - "$BASE_CUSTOM_CONFIG_PATH" "$RUN_CUSTOM_CONFIG_PATH" "$MAX_TURN" <<'PY'
+  python3 - "$BASE_CUSTOM_CONFIG_PATH" "$RUN_CUSTOM_CONFIG_PATH" "$MAX_TURN" "$TRAJECTORY_SAVE_INTERVAL" <<'PY'
 import sys, yaml
-src, dst, max_turn = sys.argv[1], sys.argv[2], int(sys.argv[3])
+src, dst, max_turn, traj_interval = sys.argv[1], sys.argv[2], int(sys.argv[3]), sys.argv[4].strip()
 with open(src) as f:
     cfg = yaml.safe_load(f) or {}
 cfg["max_iteration"] = max_turn
+if traj_interval:
+    cfg["trajectory_save_interval"] = int(traj_interval)
 with open(dst, "w") as f:
     yaml.safe_dump(cfg, f, sort_keys=True)
 PY
   CUSTOM_CONFIG_PATH="${RUN_CUSTOM_CONFIG_PATH}"
-  echo "[config] rollout yaml -> ${RUN_CUSTOM_CONFIG_PATH} (max_iteration=${MAX_TURN})"
+  if [[ -n "${TRAJECTORY_SAVE_INTERVAL}" ]]; then
+    echo "[config] rollout yaml -> ${RUN_CUSTOM_CONFIG_PATH} (max_iteration=${MAX_TURN}, trajectory_save_interval=${TRAJECTORY_SAVE_INTERVAL})"
+  else
+    echo "[config] rollout yaml -> ${RUN_CUSTOM_CONFIG_PATH} (max_iteration=${MAX_TURN})"
+  fi
 else
   echo "[config] base yaml ${BASE_CUSTOM_CONFIG_PATH} not found; MAX_TURN=${MAX_TURN} will not take effect"
 fi
@@ -207,7 +218,8 @@ source "${SLIME_DIR}/scripts/models/qwen3-8B.sh"
 # DATASET: which data to train on
 #   seta    = seta_env only (capability tasks, Docker-based evaluation)
 #   safety  = Agent-SafetyBench only (safety tasks, no Docker needed)
-#   mixed   = both combined
+#   agentharm = inspect_evals/agentharm only (safety tool tasks, no Docker needed)
+#   mixed   = configurable mix of seta / safety / agentharm
 #
 # SETA_SAFETY: safety reward mode for seta_env data
 #   none       = pure outcome reward (2*accuracy - 1), no safety signal
@@ -215,49 +227,125 @@ source "${SLIME_DIR}/scripts/models/qwen3-8B.sh"
 #
 # SAFETY_BENCH_REWARD: reward mode for Agent-SafetyBench data
 #   rule       = fulfillable-based: refuse harmful=+1, comply harmful=-1
+#   dense_rule = rule-compatible dense shaping for GRPO
+#   clawsentry = use ClawSentry safety score (same mechanism as seta)
+#
+# AGENTHARM_REWARD: reward mode for AgentHarm data
+#   rule       = target-tool/refusal based safety reward
+#   dense_rule = rule-compatible dense shaping for GRPO
 #   clawsentry = use ClawSentry safety score (same mechanism as seta)
 DATASET="${DATASET:-seta}"
 SETA_SAFETY="${SETA_SAFETY:-clawsentry}"
 SAFETY_BENCH_REWARD="${SAFETY_BENCH_REWARD:-rule}"
 AGENT_SAFETYBENCH_REMOTE_ENV="${AGENT_SAFETYBENCH_REMOTE_ENV:-0}"
 AGENT_SAFETYBENCH_ROOT="${AGENT_SAFETYBENCH_ROOT:-/mnt/shared-storage-user/puyuan/code/Agent-SafetyBench}"
+AGENTHARM_REWARD="${AGENTHARM_REWARD:-rule}"
+AGENTHARM_REMOTE_ENV="${AGENTHARM_REMOTE_ENV:-0}"
+AGENTHARM_ROOT="${AGENTHARM_ROOT:-/mnt/shared-storage-user/puyuan/code/inspect_evals/src/inspect_evals/agentharm}"
 
 SETA_DATA="${SCRIPT_DIR}/dataset/seta_env_convert/train.jsonl"
 SAFETY_DATA="${SCRIPT_DIR}/dataset/agent_safetybench_convert/train.jsonl"
+AGENTHARM_RAW_DIR="${SCRIPT_DIR}/dataset/agentharm"
+AGENTHARM_DATA="${SCRIPT_DIR}/dataset/agentharm_convert/train.jsonl"
+
+ensure_agentharm_dataset() {
+  if [[ ! -d "${AGENTHARM_RAW_DIR}" ]]; then
+    echo "[ERROR] AgentHarm raw data dir not found: ${AGENTHARM_RAW_DIR}"
+    exit 1
+  fi
+  python3 "${SCRIPT_DIR}/data_utils/convert_agentharm_to_dataset.py" \
+    --input-dir "${AGENTHARM_RAW_DIR}" \
+    --output-dir "${SCRIPT_DIR}/dataset/agentharm_convert"
+}
+
+INCLUDES_SETA="0"
+INCLUDES_SAFETY="0"
+INCLUDES_AGENTHARM="0"
 
 case "${DATASET}" in
   seta)
+    INCLUDES_SETA="1"
     ROLLOUT_PROMPT_DATA="${ROLLOUT_PROMPT_DATA:-${SETA_DATA}}"
     ;;
   safety)
+    INCLUDES_SAFETY="1"
     ROLLOUT_PROMPT_DATA="${ROLLOUT_PROMPT_DATA:-${SAFETY_DATA}}"
     ;;
+  agentharm)
+    INCLUDES_AGENTHARM="1"
+    ensure_agentharm_dataset
+    ROLLOUT_PROMPT_DATA="${ROLLOUT_PROMPT_DATA:-${AGENTHARM_DATA}}"
+    ;;
   mixed)
-    MIXED_DATA="${SCRIPT_DIR}/dataset/mixed_seta_safety.jsonl"
-    if [[ ! -f "${MIXED_DATA}" ]] || [[ "${SETA_DATA}" -nt "${MIXED_DATA}" ]] || [[ "${SAFETY_DATA}" -nt "${MIXED_DATA}" ]]; then
-      if [[ -n "${MIX_SETA_RATIO:-}" ]] || [[ -n "${MIX_SAFETY_RATIO:-}" ]]; then
-        MIX_ARGS=(
-          --source "${SETA_DATA}:${MIX_SETA_RATIO:-1}"
-          --source "${SAFETY_DATA}:${MIX_SAFETY_RATIO:-1}"
-          --output "${MIXED_DATA}"
-          --seed "${MIX_SEED:-42}"
-        )
-        if [[ -n "${MIX_TOTAL:-}" ]]; then
-          MIX_ARGS+=(--total "${MIX_TOTAL}")
+    if [[ -n "${MIX_AGENTHARM_RATIO:-}" ]]; then
+      ensure_agentharm_dataset
+      MIXED_DATA="${SCRIPT_DIR}/dataset/mixed_sources.jsonl"
+      MIX_ARGS=(
+        --output "${MIXED_DATA}"
+        --seed "${MIX_SEED:-42}"
+      )
+      MIX_LABELS=()
+      add_mix_source() {
+        local path="$1"
+        local ratio="$2"
+        local label="$3"
+        if [[ -z "${ratio}" || "${ratio}" == "0" ]]; then
+          return
         fi
-        if [[ -n "${MIX_OVERSAMPLE:-}" ]]; then
-          MIX_ARGS+=(--oversample)
+        if [[ ! -f "${path}" ]]; then
+          echo "[ERROR] mixed source not found: ${path}"
+          exit 1
         fi
-        python "${SCRIPT_DIR}/data_utils/mix_jsonl_datasets.py" "${MIX_ARGS[@]}"
-      else
-        cat "${SETA_DATA}" "${SAFETY_DATA}" > "${MIXED_DATA}"
-        echo "[dataset] merged seta($(wc -l < "${SETA_DATA}")) + safety($(wc -l < "${SAFETY_DATA}")) -> ${MIXED_DATA}"
+        MIX_ARGS+=(--source "${path}:${ratio}")
+        MIX_LABELS+=("${label}(${ratio})")
+      }
+      add_mix_source "${SETA_DATA}" "${MIX_SETA_RATIO:-}" "seta"
+      add_mix_source "${SAFETY_DATA}" "${MIX_SAFETY_RATIO:-}" "safety"
+      add_mix_source "${AGENTHARM_DATA}" "${MIX_AGENTHARM_RATIO:-}" "agentharm"
+      if [[ "${#MIX_LABELS[@]}" -eq 0 ]]; then
+        echo "[ERROR] No mixed sources selected. Set MIX_SETA_RATIO, MIX_SAFETY_RATIO, or MIX_AGENTHARM_RATIO to a positive value."
+        exit 1
+      fi
+      [[ -n "${MIX_SETA_RATIO:-}" && "${MIX_SETA_RATIO}" != "0" ]] && INCLUDES_SETA="1"
+      [[ -n "${MIX_SAFETY_RATIO:-}" && "${MIX_SAFETY_RATIO}" != "0" ]] && INCLUDES_SAFETY="1"
+      [[ -n "${MIX_AGENTHARM_RATIO:-}" && "${MIX_AGENTHARM_RATIO}" != "0" ]] && INCLUDES_AGENTHARM="1"
+      if [[ -n "${MIX_TOTAL:-}" ]]; then
+        MIX_ARGS+=(--total "${MIX_TOTAL}")
+      fi
+      if [[ -n "${MIX_OVERSAMPLE:-}" ]]; then
+        MIX_ARGS+=(--oversample)
+      fi
+      python "${SCRIPT_DIR}/data_utils/mix_jsonl_datasets.py" "${MIX_ARGS[@]}"
+      echo "[dataset] mixed sources: ${MIX_LABELS[*]} -> ${MIXED_DATA}"
+    else
+      INCLUDES_SETA="1"
+      INCLUDES_SAFETY="1"
+      MIXED_DATA="${SCRIPT_DIR}/dataset/mixed_seta_safety.jsonl"
+      if [[ ! -f "${MIXED_DATA}" ]] || [[ "${SETA_DATA}" -nt "${MIXED_DATA}" ]] || [[ "${SAFETY_DATA}" -nt "${MIXED_DATA}" ]]; then
+        if [[ -n "${MIX_SETA_RATIO:-}" ]] || [[ -n "${MIX_SAFETY_RATIO:-}" ]]; then
+          MIX_ARGS=(
+            --source "${SETA_DATA}:${MIX_SETA_RATIO:-1}"
+            --source "${SAFETY_DATA}:${MIX_SAFETY_RATIO:-1}"
+            --output "${MIXED_DATA}"
+            --seed "${MIX_SEED:-42}"
+          )
+          if [[ -n "${MIX_TOTAL:-}" ]]; then
+            MIX_ARGS+=(--total "${MIX_TOTAL}")
+          fi
+          if [[ -n "${MIX_OVERSAMPLE:-}" ]]; then
+            MIX_ARGS+=(--oversample)
+          fi
+          python "${SCRIPT_DIR}/data_utils/mix_jsonl_datasets.py" "${MIX_ARGS[@]}"
+        else
+          cat "${SETA_DATA}" "${SAFETY_DATA}" > "${MIXED_DATA}"
+          echo "[dataset] merged seta($(wc -l < "${SETA_DATA}")) + safety($(wc -l < "${SAFETY_DATA}")) -> ${MIXED_DATA}"
+        fi
       fi
     fi
     ROLLOUT_PROMPT_DATA="${ROLLOUT_PROMPT_DATA:-${MIXED_DATA}}"
     ;;
   *)
-    echo "[ERROR] Unknown DATASET=${DATASET}. Use: seta|safety|mixed"
+    echo "[ERROR] Unknown DATASET=${DATASET}. Use: seta|safety|agentharm|mixed"
     exit 1
     ;;
 esac
@@ -270,14 +358,21 @@ if [[ ! -f "${ROLLOUT_PROMPT_DATA}" ]]; then
   echo "[ERROR] ROLLOUT_PROMPT_DATA=${ROLLOUT_PROMPT_DATA} not found"
   exit 1
 fi
-echo "[config] DATASET=${DATASET} SETA_SAFETY=${SETA_SAFETY} SAFETY_BENCH_REWARD=${SAFETY_BENCH_REWARD}"
+echo "[config] DATASET=${DATASET} SETA_SAFETY=${SETA_SAFETY} SAFETY_BENCH_REWARD=${SAFETY_BENCH_REWARD} AGENTHARM_REWARD=${AGENTHARM_REWARD}"
+echo "[config] sources seta=${INCLUDES_SETA} safety=${INCLUDES_SAFETY} agentharm=${INCLUDES_AGENTHARM}"
 echo "[config] data=${ROLLOUT_PROMPT_DATA}"
 
-NEEDS_ENV_ROUTER="1"
-if [[ "${DATASET}" == "safety" && "${AGENT_SAFETYBENCH_REMOTE_ENV}" != "1" ]]; then
-  NEEDS_ENV_ROUTER="0"
+NEEDS_ENV_ROUTER="0"
+if [[ "${INCLUDES_SETA}" == "1" ]]; then
+  NEEDS_ENV_ROUTER="1"
 fi
-echo "[config] needs_env_router=${NEEDS_ENV_ROUTER} AGENT_SAFETYBENCH_REMOTE_ENV=${AGENT_SAFETYBENCH_REMOTE_ENV}"
+if [[ "${INCLUDES_SAFETY}" == "1" && "${AGENT_SAFETYBENCH_REMOTE_ENV}" == "1" ]]; then
+  NEEDS_ENV_ROUTER="1"
+fi
+if [[ "${INCLUDES_AGENTHARM}" == "1" && "${AGENTHARM_REMOTE_ENV}" == "1" ]]; then
+  NEEDS_ENV_ROUTER="1"
+fi
+echo "[config] needs_env_router=${NEEDS_ENV_ROUTER} AGENT_SAFETYBENCH_REMOTE_ENV=${AGENT_SAFETYBENCH_REMOTE_ENV} AGENTHARM_REMOTE_ENV=${AGENTHARM_REMOTE_ENV}"
 
 # Optional dataset blacklist (issue #3 §1.X / §2.x stuck offenders).
 # Default-ON; set USE_BLACKLIST=0 to keep the raw dataset.
@@ -331,6 +426,9 @@ export ENV_SERVER_HOST="${ENV_SERVER_HOST:-${MASTER_ADDR}}"
 export ENV_SERVER_URL="${ENV_SERVER_URL:-http://${ENV_SERVER_HOST}:${ENV_SERVER_PORT}}"
 export START_ENV_POOL_SERVER="${START_ENV_POOL_SERVER:-${NEEDS_ENV_ROUTER}}"
 export AGENT_SAFETYBENCH_REMOTE_ENV
+export AGENTHARM_REMOTE_ENV
+export AGENTHARM_ROOT
+export AGENTHARM_REWARD
 
 ROUTER_HOST="${ROUTER_HOST:-0.0.0.0}"
 ROUTER_PORT="${ROUTER_PORT:-${ENV_SERVER_PORT}}"
@@ -354,19 +452,15 @@ export ROUTER_FORWARD_RETRY_BACKOFF="${ROUTER_FORWARD_RETRY_BACKOFF:-1.0}"
 # ClawSentry is enabled only for the active dataset family.
 # SAFETY_REWARD_COEF controls the linear weight (default 0.3).
 CLAWSENTRY_NEEDED="0"
-case "${DATASET}" in
-  seta)
-    [[ "${SETA_SAFETY}" == "clawsentry" ]] && CLAWSENTRY_NEEDED="1"
-    ;;
-  safety)
-    [[ "${SAFETY_BENCH_REWARD}" == "clawsentry" ]] && CLAWSENTRY_NEEDED="1"
-    ;;
-  mixed)
-    if [[ "${SETA_SAFETY}" == "clawsentry" ]] || [[ "${SAFETY_BENCH_REWARD}" == "clawsentry" ]]; then
-      CLAWSENTRY_NEEDED="1"
-    fi
-    ;;
-esac
+if [[ "${INCLUDES_SETA}" == "1" && "${SETA_SAFETY}" == "clawsentry" ]]; then
+  CLAWSENTRY_NEEDED="1"
+fi
+if [[ "${INCLUDES_SAFETY}" == "1" && "${SAFETY_BENCH_REWARD}" == "clawsentry" ]]; then
+  CLAWSENTRY_NEEDED="1"
+fi
+if [[ "${INCLUDES_AGENTHARM}" == "1" && "${AGENTHARM_REWARD}" == "clawsentry" ]]; then
+  CLAWSENTRY_NEEDED="1"
+fi
 export SAFETY_REWARD_COEF="${SAFETY_REWARD_COEF:-0.3}"
 export SAFETY_REWARD_SUMMARY_WEIGHT="${SAFETY_REWARD_SUMMARY_WEIGHT:-0.3}"
 export SAFETY_REWARD_TIMEOUT="${SAFETY_REWARD_TIMEOUT:-2.0}"
@@ -384,6 +478,7 @@ export CS_EVOLVING_ENABLED="${CS_EVOLVING_ENABLED:-false}"
 # Trajectory export is now ON by default (writes to runs/{run_id}/trajectories/).
 # Set TERMINAL_SAVE_TRAJ_DIR="" to disable.
 export TERMINAL_SAVE_TRAJ_DIR="${TERMINAL_SAVE_TRAJ_DIR}"
+export TRAJECTORY_SAVE_INTERVAL="${TRAJECTORY_SAVE_INTERVAL}"
 
 # Proxy bypass: some environments inject http_proxy/HTTPS_PROXY via shell rc.
 # aiohttp + requests will then try to tunnel the internal router→worker traffic
@@ -651,6 +746,10 @@ cat > "${RUN_DIR}/config/run_config.json" <<CFGEOF
   "rollout_gpus": ${ROLLOUT_GPUS},
   "tp_size": ${TP_SIZE},
   "rollout_engine_gpus": ${ROLLOUT_NUM_GPUS_PER_ENGINE},
+  "dataset": "${DATASET}",
+  "includes_seta": "${INCLUDES_SETA}",
+  "includes_safety": "${INCLUDES_SAFETY}",
+  "includes_agentharm": "${INCLUDES_AGENTHARM}",
   "prompt_data": "${ROLLOUT_PROMPT_DATA}",
   "num_rollout": ${NUM_ROLLOUT},
   "rollout_batch_size": ${ROLLOUT_BATCH_SIZE},
@@ -660,12 +759,16 @@ cat > "${RUN_DIR}/config/run_config.json" <<CFGEOF
   "env_server_url": "${ENV_SERVER_URL}",
   "needs_env_router": "${NEEDS_ENV_ROUTER}",
   "agent_safetybench_remote_env": "${AGENT_SAFETYBENCH_REMOTE_ENV}",
+  "agentharm_remote_env": "${AGENTHARM_REMOTE_ENV}",
   "safety_reward_enable": "${CLAWSENTRY_NEEDED}",
   "seta_safety": "${SETA_SAFETY}",
   "safety_bench_reward": "${SAFETY_BENCH_REWARD}",
+  "agentharm_reward": "${AGENTHARM_REWARD}",
+  "agentharm_root": "${AGENTHARM_ROOT}",
   "safety_reward_coef": "${SAFETY_REWARD_COEF}",
   "safety_reward_summary_weight": "${SAFETY_REWARD_SUMMARY_WEIGHT}",
   "safety_reward_zero_threshold": "${SAFETY_REWARD_ZERO_THRESHOLD}",
+  "trajectory_save_interval_env": "${TRAJECTORY_SAVE_INTERVAL}",
   "clawsentry_url": "${CS_HTTP_URL}",
   "clawsentry_llm_provider": "${CS_LLM_PROVIDER}",
   "clawsentry_l3_enabled": "${CS_L3_ENABLED}",
@@ -711,6 +814,7 @@ RUNTIME_ENV_JSON="{
     \"USE_REMOTE_ENV\": \"${USE_REMOTE_ENV}\",
     \"ENV_SERVER_URL\": \"${ENV_SERVER_URL}\",
     \"AGENT_SAFETYBENCH_REMOTE_ENV\": \"${AGENT_SAFETYBENCH_REMOTE_ENV}\",
+    \"AGENTHARM_REMOTE_ENV\": \"${AGENTHARM_REMOTE_ENV}\",
     \"NO_PROXY\": \"${NO_PROXY}\",
     \"no_proxy\": \"${NO_PROXY}\",
     \"CS_HTTP_URL\": \"${CS_HTTP_URL}\",
@@ -718,11 +822,14 @@ RUNTIME_ENV_JSON="{
     \"SETA_SAFETY\": \"${SETA_SAFETY}\",
     \"SAFETY_BENCH_REWARD\": \"${SAFETY_BENCH_REWARD}\",
     \"AGENT_SAFETYBENCH_ROOT\": \"${AGENT_SAFETYBENCH_ROOT}\",
+    \"AGENTHARM_REWARD\": \"${AGENTHARM_REWARD}\",
+    \"AGENTHARM_ROOT\": \"${AGENTHARM_ROOT}\",
     \"SAFETY_REWARD_COEF\": \"${SAFETY_REWARD_COEF}\",
     \"SAFETY_REWARD_SUMMARY_WEIGHT\": \"${SAFETY_REWARD_SUMMARY_WEIGHT}\",
     \"SAFETY_REWARD_TIMEOUT\": \"${SAFETY_REWARD_TIMEOUT}\",
     \"SAFETY_REWARD_ZERO_THRESHOLD\": \"${SAFETY_REWARD_ZERO_THRESHOLD}\",
     \"TERMINAL_SAVE_TRAJ_DIR\": \"${TERMINAL_SAVE_TRAJ_DIR}\",
+    \"TRAJECTORY_SAVE_INTERVAL\": \"${TRAJECTORY_SAVE_INTERVAL}\",
     \"RUN_DIR\": \"${RUN_DIR}\",
     \"DATASET\": \"${DATASET}\",
     \"WANDB_MODE\": \"${WANDB_MODE:-offline}\"

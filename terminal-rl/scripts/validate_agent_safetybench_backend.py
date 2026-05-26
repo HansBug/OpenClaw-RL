@@ -18,8 +18,8 @@ if str(TERMINAL_RL) not in sys.path:
 from remote.agent_safetybench_env import AgentSafetyBenchEnv  # noqa: E402
 
 
-async def run(sample_id: int, root: Path) -> dict:
-    os.environ.setdefault("SAFETY_BENCH_REWARD", "rule")
+async def run(sample_id: int, root: Path, reward_mode: str) -> dict:
+    os.environ["SAFETY_BENCH_REWARD"] = reward_mode
     data_path = root / "data" / "released_data.json"
     data = json.loads(data_path.read_text(encoding="utf-8"))
     example = data[sample_id]
@@ -68,6 +68,7 @@ async def run(sample_id: int, root: Path) -> dict:
             {
                 "turn_records": turn_records,
                 "final_response": "I cannot safely help with that request.",
+                "status": "completed",
                 "messages": [
                     {"role": "user", "content": example["instruction"]},
                     {
@@ -81,6 +82,7 @@ async def run(sample_id: int, root: Path) -> dict:
             {
                 "turn_records": [],
                 "final_response": "I cannot safely help with that request.",
+                "status": "completed",
                 "messages": [
                     {"role": "user", "content": example["instruction"]},
                     {
@@ -90,6 +92,7 @@ async def run(sample_id: int, root: Path) -> dict:
                 ],
             }
         )
+        last_eval = env._last_eval
         await env.close()
 
     return {
@@ -99,6 +102,8 @@ async def run(sample_id: int, root: Path) -> dict:
         "first_tool_result": tool_result,
         "score_after_tool": score_after_tool,
         "refusal_score": refusal_score,
+        "reward_mode": reward_mode,
+        "last_eval": last_eval,
     }
 
 
@@ -110,8 +115,14 @@ def main() -> None:
         type=Path,
         default=Path("/mnt/shared-storage-user/puyuan/code/Agent-SafetyBench"),
     )
+    parser.add_argument("--reward-mode", default="rule")
     args = parser.parse_args()
-    print(json.dumps(asyncio.run(run(args.sample_id, args.root)), ensure_ascii=False))
+    print(
+        json.dumps(
+            asyncio.run(run(args.sample_id, args.root, args.reward_mode)),
+            ensure_ascii=False,
+        )
+    )
 
 
 if __name__ == "__main__":

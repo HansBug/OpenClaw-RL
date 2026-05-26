@@ -39,6 +39,8 @@ from safety_reward import (
 
 logger = logging.getLogger(__name__)
 
+_DIRECT_SCORE_DATA_SOURCES = {"agent_safetybench", "agentharm"}
+
 # ── Exploration: count-based intrinsic reward (MERCI simplified) ──────────────
 _EXPLORE_INTRINSIC_ENABLED = os.getenv("EXPLORE_INTRINSIC_ENABLED", "0") == "1"
 _EXPLORE_INTRINSIC_COEF = float(os.getenv("EXPLORE_INTRINSIC_COEF", "0.1"))
@@ -177,8 +179,8 @@ def _explore_lprnd_bonus(interactions) -> float:
 
 # ─── Trajectory export (parallels swe-rl/generate_with_swe_remote.py:78-137) ───
 # Toggle via env var TERMINAL_SAVE_TRAJ_DIR (empty=disabled).
-# Output layout (one dir per rollout):
-#   {save_dir}/{task_name}__g{group}__i{sample}__{ts_ns}/
+# Output layout (one dir per rollout sample):
+#   {save_dir}/t{task}_r{rollout_id}_st{train_step}_g{group}_s{sample}_{uid}_{ts}/
 #       meta.json       # task spec + sampling params + reward breakdown
 #       traj.json       # per-turn dialogue + tool calls + ClawSentry decisions
 
@@ -197,6 +199,48 @@ def _get_terminal_save_dir() -> Path | None:
         logger.warning("TERMINAL_SAVE_TRAJ_DIR=%s mkdir failed: %s", save_dir, exc)
         return None
     return path
+
+
+def _optional_int(value: Any) -> int | None:
+    if value is None or value == "":
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _sample_or_env_int(sample: Sample, key: str, env_name: str) -> int | None:
+    metadata = sample.metadata if isinstance(sample.metadata, dict) else {}
+    value = metadata.get(key)
+    if value is None:
+        value = os.getenv(env_name)
+    return _optional_int(value)
+
+
+def _trajectory_save_interval(args) -> int:
+    raw = getattr(args, "trajectory_save_interval", None)
+    if raw is None or raw == "":
+        raw = os.getenv("TRAJECTORY_SAVE_INTERVAL", "1")
+    value = _optional_int(raw)
+    if value is None:
+        logger.warning("Invalid trajectory_save_interval=%r; falling back to 1", raw)
+        return 1
+    return value
+
+
+def _should_save_trajectory(run_ctx: RunContext, interval: int) -> bool:
+    if interval <= 0:
+        return False
+    if interval == 1:
+        return True
+    step = run_ctx.train_step
+    if step is None:
+        step = run_ctx.rollout_id
+    if step is None:
+        # No rollout metadata is available, so preserve old save-all behavior.
+        return True
+    return int(step) % interval == 0
 
 
 def _jsonable(obj: Any) -> Any:
@@ -226,6 +270,7 @@ def _save_rollout_artifacts(
     prm_meta: Dict[str, Any] | None,
     safety_coef: float,
     prm_coef: float,
+    trajectory_save_interval: int = 1,
 ) -> None:
     """Persist a full rollout (dialogue + tool calls + ClawSentry + reward) to disk.
 
@@ -236,6 +281,8 @@ def _save_rollout_artifacts(
         save_dir = _get_terminal_save_dir()
         if save_dir is None:
             return
+        if not _should_save_trajectory(run_ctx, trajectory_save_interval):
+            return
 
         # Only save trajectories worth analyzing:
         # - Skip if no turns recorded (reset failed, no model output)
@@ -245,10 +292,11 @@ def _save_rollout_artifacts(
         if str(status) == "Status.FAILED" and raw_score == 0.0 and len(turn_records) <= 1:
             return
         ts = time.strftime("%Y%m%d_%H%M%S")
-        # rollout_id from slime (= which rollout batch this sample belongs to)
-        rollout_id = os.getenv("_CURRENT_ROLLOUT_ID", "")
+        ts_ns = time.time_ns()
         stem = (
             f"t{_sanitize_filename(task_spec.task_name)}"
+            f"_r{run_ctx.rollout_id if run_ctx.rollout_id is not None else 'na'}"
+            f"_st{run_ctx.train_step if run_ctx.train_step is not None else 'na'}"
             f"_g{run_ctx.group_index if run_ctx.group_index is not None else 'na'}"
             f"_s{run_ctx.sample_index if run_ctx.sample_index is not None else 'na'}"
             f"_{run_ctx.uid[:8]}"
@@ -284,6 +332,9 @@ def _save_rollout_artifacts(
                 "uid": run_ctx.uid,
                 "group_index": run_ctx.group_index,
                 "sample_index": run_ctx.sample_index,
+                "rollout_id": run_ctx.rollout_id,
+                "train_step": run_ctx.train_step,
+                "rollout_step": run_ctx.rollout_step,
                 "status": str(status),
                 "num_turns": len(turn_records),
                 "eval_error": eval_error,
@@ -306,6 +357,9 @@ def _save_rollout_artifacts(
             "uid": run_ctx.uid,
             "group_index": run_ctx.group_index,
             "sample_index": run_ctx.sample_index,
+            "rollout_id": run_ctx.rollout_id,
+            "train_step": run_ctx.train_step,
+            "rollout_step": run_ctx.rollout_step,
             "sampling_params": _jsonable(sampling_params),
             "sample_metadata": _jsonable(sample.metadata or {}),
             "sample_prompt": _jsonable(sample.prompt),
@@ -458,6 +512,8 @@ def _build_agent_safetybench_eval_payload(
     turn_records: List[Dict[str, Any]],
     final_response: Any,
     interactions: List[Interaction],
+    status: Sample.Status | str | None = None,
+    parse_error_count: int = 0,
 ) -> Dict[str, Any]:
     messages: list[dict[str, Any]] = []
     if not isinstance(task_meta.get("dialog"), list):
@@ -517,10 +573,17 @@ def _build_agent_safetybench_eval_payload(
             if final_text:
                 break
 
+    if isinstance(status, Sample.Status):
+        status_value = status.value
+    else:
+        status_value = str(status or "")
+
     return {
         "messages": messages,
         "turn_records": turn_records,
         "final_response": final_text,
+        "status": status_value,
+        "parse_error_count": int(parse_error_count or 0),
         "n_output_tokens": sum(
             len(it.output_token_ids or []) for it in interactions
         ),
@@ -602,6 +665,53 @@ class _LocalAgentSafetyBenchClient:
         await self._env.close()
 
 
+class _LocalAgentHarmClient:
+    def __init__(self) -> None:
+        from remote.agentharm_env import AgentHarmEnv
+
+        self._env = AgentHarmEnv()
+
+    async def reset(
+        self,
+        lease_id: str,
+        task_meta: dict[str, Any],
+        run_ctx: dict[str, Any],
+        task_timeouts: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        _ = (lease_id, task_timeouts)
+        local_run_ctx = RunContext(
+            uid=str(run_ctx.get("uid", "local")),
+            group_index=int(run_ctx.get("group_index", 0) or 0),
+            sample_index=int(run_ctx.get("sample_index", 0) or 0),
+            log_dir=Path(str(run_ctx.get("log_dir", "build_outputs"))),
+        )
+        user_msg, tool_schemas = await self._env.reset(
+            task_meta=task_meta,
+            task_spec=_make_task_spec(task_meta),
+            run_ctx=local_run_ctx,
+        )
+        return {"user_msg": user_msg, "tool_schemas": tool_schemas}
+
+    async def heartbeat(self, lease_id: str) -> None:
+        _ = lease_id
+
+    async def exec_tool(
+        self, lease_id: str, tool_name: str, arguments: dict[str, Any]
+    ) -> str:
+        _ = lease_id
+        return await self._env.exec_tool(tool_name, arguments)
+
+    async def evaluate(
+        self, lease_id: str, trajectory: dict[str, Any] | None = None
+    ) -> float:
+        _ = lease_id
+        return await self._env.evaluate(trajectory)
+
+    async def close(self, lease_id: str) -> None:
+        _ = lease_id
+        await self._env.close()
+
+
 async def _create_env_client(
     task_spec: TaskSpec,
     run_ctx: RunContext,
@@ -618,6 +728,18 @@ async def _create_env_client(
             task_spec.task_path,
         )
         return _LocalAgentSafetyBenchClient(), "local-agent-safetybench"
+
+    if (
+        isinstance(task_meta, dict)
+        and task_meta.get("data_source") == "agentharm"
+        and os.getenv("AGENTHARM_REMOTE_ENV", "0") != "1"
+    ):
+        logger.info(
+            "Using local AgentHarm env backend for task=%s path=%s",
+            task_spec.task_name,
+            task_spec.task_path,
+        )
+        return _LocalAgentHarmClient(), "local-agentharm"
 
     env_server_url = os.getenv("ENV_SERVER_URL", "")
     if not env_server_url:
@@ -723,12 +845,18 @@ async def generate(
     state = GenerateState(args)
 
     task_meta = _extract_task_meta(sample)
+    if not isinstance(sample.metadata, dict):
+        sample.metadata = {}
     data_source = str(task_meta.get("data_source", ""))
     seta_safety_mode = os.getenv("SETA_SAFETY", "clawsentry")
     safety_bench_reward_mode = os.getenv("SAFETY_BENCH_REWARD", "rule")
+    agentharm_reward_mode = os.getenv("AGENTHARM_REWARD", "rule")
     uid = (sample.metadata or {}).get("uid") or uuid.uuid4().hex[:8]
     group_index = int(sample.group_index) if sample.group_index is not None else -1
     sample_index = int(sample.index) if sample.index is not None else -1
+    rollout_id = _sample_or_env_int(sample, "rollout_id", "_CURRENT_ROLLOUT_ID")
+    train_step = _sample_or_env_int(sample, "train_step", "_CURRENT_TRAIN_STEP")
+    rollout_step = _sample_or_env_int(sample, "rollout_step", "_CURRENT_ROLLOUT_STEP")
     task_spec = _make_task_spec(task_meta)
     run_ctx = RunContext(
         uid=uid,
@@ -736,6 +864,9 @@ async def generate(
         sample_index=sample_index,
         log_dir=Path(getattr(args, "tbench_output_root", "build_outputs"))
         / "AgentRunner_Output",
+        rollout_id=rollout_id,
+        train_step=train_step,
+        rollout_step=rollout_step,
     )
     run_ctx_payload = run_ctx.to_payload()
     timeouts = TaskTimeouts(
@@ -770,10 +901,13 @@ async def generate(
 
     if data_source == "agent_safetybench":
         safety_enable = safety_bench_reward_mode == "clawsentry"
+    elif data_source == "agentharm":
+        safety_enable = agentharm_reward_mode == "clawsentry"
     else:
         safety_enable = seta_safety_mode == "clawsentry"
     safety_enable = safety_enable and (not evaluation)
     safety_coef = _env_float("SAFETY_REWARD_COEF", 0.0)
+    traj_save_interval = _trajectory_save_interval(args)
     safety_summary_weight = _env_float("SAFETY_REWARD_SUMMARY_WEIGHT", 0.3)
     safety_zero_threshold = _env_float(
         "SAFETY_REWARD_ZERO_THRESHOLD", _SAFETY_ZERO_THRESHOLD
@@ -1095,12 +1229,14 @@ async def generate(
                 assert env_client is not None and lease_id is not None
                 await env_client.heartbeat(lease_id)
                 eval_payload = None
-                if data_source == "agent_safetybench":
+                if data_source in _DIRECT_SCORE_DATA_SOURCES:
                     eval_payload = _build_agent_safetybench_eval_payload(
                         task_meta=task_meta,
                         turn_records=turn_records,
                         final_response=final_response,
                         interactions=interactions,
+                        status=status,
+                        parse_error_count=agent_runner.parse_error_count,
                     )
                 raw_score = await env_client.evaluate(lease_id, trajectory=eval_payload)
                 reward = float(raw_score)
@@ -1211,8 +1347,8 @@ async def generate(
             safety_coef=safety_coef,
             discount=1.0,
             encourage=False,
-            outcome_is_score=(data_source == "agent_safetybench"),
-            penalize_short_response=(data_source != "agent_safetybench"),
+            outcome_is_score=(data_source in _DIRECT_SCORE_DATA_SOURCES),
+            penalize_short_response=(data_source not in _DIRECT_SCORE_DATA_SOURCES),
         )
 
         # ── Exploration: add intrinsic + safety + LP-RND bonuses (no-op when disabled) ────
@@ -1249,6 +1385,7 @@ async def generate(
             prm_meta=sample.metadata.get("prm") if sample.metadata else None,
             safety_coef=safety_coef,
             prm_coef=prm_coef,
+            trajectory_save_interval=traj_save_interval,
         )
 
         return samples
