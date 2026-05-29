@@ -14,6 +14,7 @@ For from-zero setup, hardening, watchdog, and recovery procedures, see the **ope
 |---|---|
 | `setup_new_worker.sh` | Scenario A entry: first-time setup on a brand-new machine. Installs Docker/Compose, writes daemon config, hardens proxy/base images, installs watchdog, and verifies a build. |
 | `fix_dockerd_and_proxy.sh` | Scenario B entry: one-shot recovery when Docker/proxy/build path is broken. Watchdog-aware; internally calls `prebuild_proxied_base_images.sh`. |
+| `docker_worker_doctor.sh` | Log-aware diagnosis and repair wrapper. Use `diagnose` to analyze GPU train logs plus CPU worker Docker state; use `soft-repair` / `full-repair` for recovery. |
 | `prebuild_proxied_base_images.sh` | Wraps the top base images with `apt.conf.d` proxy injection — mandatory in proxied environments because Ubuntu apt does not honor `HTTP_PROXY` env var |
 | `restart_docker_force.sh` | Manual force-restart of dockerd (bypasses systemctl, used by watchdog and as escape hatch) |
 
@@ -60,6 +61,13 @@ bash terminal-rl/terminal-rl_qwen3-8b_pu.sh
 ```
 
 For first-time setup and recovery, follow [`../docs/cpu_worker_docker_ops.md`](../docs/cpu_worker_docker_ops.md).
+
+For a failed training run, start with a log-aware diagnosis:
+
+```bash
+bash terminal-rl/remote/docker_worker_doctor.sh diagnose \
+  --train-log /mnt/shared-storage-user/puyuan/code/OpenClaw-RL/runs/<run>/logs/train.log
+```
 
 ---
 

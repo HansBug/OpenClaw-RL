@@ -21,6 +21,7 @@ CPU worker 负责运行 `pool_server`，由它管理 Docker 容器并执行 seta
 |---|---|
 | `terminal-rl/remote/setup_new_worker.sh` | 场景 A 入口：安装 Docker/Compose，写 daemon 配置，代理加固，安装 watchdog，验证构建 |
 | `terminal-rl/remote/fix_dockerd_and_proxy.sh` | 场景 B 入口：修复 Docker 挂掉、代理丢失、base image apt 代理缺失 |
+| `terminal-rl/remote/docker_worker_doctor.sh` | 训练日志感知的诊断/修复入口：统计 `/reset`、`/evaluate`、Docker exit code、`Errno 11`，并采集 CPU worker Docker 状态 |
 | `terminal-rl/remote/restart_docker_force.sh` | 低层强制重启 dockerd，绕过卡住的 `systemctl restart docker` |
 | `terminal-rl/remote/run_pool_server_pu_v2.sh` | 启动 pool_server，自动加载 `/etc/seta_build_proxy.env` |
 | `terminal-rl/remote/docker_watchdog_v2.sh` | watchdog 主循环，监控 dockerd、pool_server、容器/网络压力 |
@@ -161,6 +162,21 @@ bash /mnt/shared-storage-user/puyuan/code/OpenClaw-RL/terminal-rl/terminal-rl_qw
 
 ### B1. 诊断
 
+推荐优先使用 `docker_worker_doctor.sh`。它会同时读取 GPU 侧 `train.log` 和 CPU worker 本机 Docker / pool_server 状态，输出 `SUMMARY.md` 和打包后的诊断归档：
+
+```bash
+cd /mnt/shared-storage-user/puyuan/code/OpenClaw-RL
+
+bash terminal-rl/remote/docker_worker_doctor.sh diagnose \
+  --train-log /mnt/shared-storage-user/puyuan/code/OpenClaw-RL/runs/<run>/logs/train.log
+```
+
+如果 GPU 日志不在 CPU worker 本机，可以先只做本机诊断：
+
+```bash
+bash terminal-rl/remote/docker_worker_doctor.sh diagnose
+```
+
 先跑轻量诊断，不会做 build 探针，训练中也可以运行：
 
 ```bash
@@ -182,6 +198,24 @@ ss -tlnp | grep ':18081 '
 ```
 
 ### B2. 一键修复
+
+如果 `docker_worker_doctor.sh diagnose` 的摘要里出现大量 `/reset 500`、`exit status 125`、`exit status 17/2` 或 `Errno 11`，推荐直接走完整恢复：
+
+```bash
+cd /mnt/shared-storage-user/puyuan/code/OpenClaw-RL
+
+sudo env DOCKER_DATA_ROOT=/data \
+  PROXY_URL=http://httpproxy-headless.kubebrain.svc.pjlab.local:3128 \
+  bash terminal-rl/remote/docker_worker_doctor.sh full-repair \
+  --train-log /mnt/shared-storage-user/puyuan/code/OpenClaw-RL/runs/<run>/logs/train.log
+```
+
+如果只是轻微堆积、Docker API 仍响应，可以先做保守恢复：
+
+```bash
+sudo env DOCKER_DATA_ROOT=/data \
+  bash terminal-rl/remote/docker_worker_doctor.sh soft-repair
+```
 
 推荐优先使用完整恢复入口：
 
@@ -215,6 +249,27 @@ sudo env DOCKER_DATA_ROOT=/data bash terminal-rl/remote/restart_docker_force.sh
 
 ```bash
 bash terminal-rl/remote/cleanup_docker_cache.sh
+```
+
+如果日志里明确出现 `/data/overlay2/... no space left on device`：
+
+```bash
+cd /mnt/shared-storage-user/puyuan/code/OpenClaw-RL
+
+# 默认保守清理：stopped container、unused network、旧 build cache、dangling image
+bash terminal-rl/remote/fix_docker_overlay2_no_space.sh
+
+# 空间仍不足时：删除所有未被容器引用的 image，后续可能需要重新 build/pull
+AGGRESSIVE=1 bash terminal-rl/remote/fix_docker_overlay2_no_space.sh
+
+# dockerd 已经不响应时
+sudo RESTART_DOCKER=1 AGGRESSIVE=1 bash terminal-rl/remote/fix_docker_overlay2_no_space.sh
+```
+
+注意：`docker system df` 在镜像、layer、BuildKit cache 很多或 dockerd 元数据锁竞争时可能卡很久。上述 overlay2 修复脚本和新版 `cleanup_docker_cache.sh` 默认不会执行重型 `docker system df`；如确实需要统计，可显式设置：
+
+```bash
+RUN_HEAVY_DF=1 bash terminal-rl/remote/fix_docker_overlay2_no_space.sh
 ```
 
 ### B3. 修复后验证
@@ -320,6 +375,54 @@ docker ps -a | head
 docker network ls | wc -l
 bash terminal-rl/remote/cleanup_docker_cache.sh
 ```
+
+### 6.1 `/data/overlay2` no space left on device
+
+**症状**：pool_server `/reset` 返回 500，日志中 `docker compose build` 失败，包含：
+
+```text
+mkdir /data/overlay2/<id>: no space left on device
+```
+
+**原因**：Docker data root 所在分区满了，通常由 on-demand build 产生的 BuildKit cache、task image、stopped container、dangling network/volume 累积导致。镜像太多是可能原因之一，但不是唯一原因；BuildKit cache 和 overlay2 layer 元数据同样常见。
+
+**处理**：
+
+```bash
+cd /mnt/shared-storage-user/puyuan/code/OpenClaw-RL
+AGGRESSIVE=1 bash terminal-rl/remote/fix_docker_overlay2_no_space.sh
+```
+
+如果脚本输出停在 `Docker system df`，说明用的是旧脚本或手动执行了重型统计。新版脚本默认跳过该步骤；也可以直接 Ctrl-C 后重新运行上面的命令。
+
+**预防**：新版 `docker_watchdog_v2.sh` 已加入 Docker data-root 磁盘压力监控，不调用 `docker system df`，只用 `df` 快速判断容量并渐进清理。常用阈值：
+
+```bash
+DISK_WARN_PCT=80
+DISK_EMERGENCY_PCT=92
+DISK_MIN_FREE_GB=20
+DISK_INODE_WARN_PCT=80
+DISK_INODE_EMERGENCY_PCT=90
+DISK_BUILD_CACHE_UNTIL=12h
+WATCHDOG_AGGRESSIVE_IMAGE_PRUNE=0
+POOL_STOP_ON_DISK_EMERGENCY=1
+```
+
+如果 worker 磁盘较小且允许自动删除未使用 image，可在 watchdog 环境中设置：
+
+```bash
+WATCHDOG_AGGRESSIVE_IMAGE_PRUNE=1
+```
+
+新版 `pool_server` 也会在 `/allocate` 和 `/reset` 前做 Docker data-root admission check。默认阈值：
+
+```bash
+WORKER_MIN_DOCKER_FREE_GB=50
+WORKER_MAX_DOCKER_USED_PCT=85
+WORKER_MAX_DOCKER_INODE_PCT=80
+```
+
+超过阈值时，`/healthz` 返回 503，`/allocate`/`/reset` 返回 `WORKER_DOCKER_DISK_PRESSURE`，避免继续 build 写爆 `/data`。
 
 ### 7. watchdog 没有启动
 

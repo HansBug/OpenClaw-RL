@@ -37,22 +37,34 @@ require_cmd() { command -v "$1" >/dev/null 2>&1 || { echo "[ERROR] missing cmd: 
 # had this dir on PATH; we make that explicit here so the script is self-contained.
 LIGHTRFT_PY312_BIN="${LIGHTRFT_PY312_BIN:-/mnt/shared-storage-user/puyuan/conda_envs/lightrft_py312/bin}"
 export PATH="${LIGHTRFT_PY312_BIN}:${PATH}"
+DRY_RUN="${DRY_RUN:-0}"
 
 # ── Cleanup previous processes ───────────────────────────────────────
-pkill -9 sglang || true
-sleep 2
-ray stop --force || true
-pkill -9 ray || true
-pkill -9 -f "terminal-rl.router_server" || true
-pkill -9 python || true
-sleep 2
+if [[ "${DRY_RUN}" == "1" ]]; then
+  log "DRY_RUN=1: skipping process cleanup and Ray startup"
+else
+  pkill -9 sglang || true
+  sleep 2
+  ray stop --force || true
+  pkill -9 ray || true
+  pkill -9 -f "terminal-rl.router_server" || true
+  pkill -9 python || true
+  sleep 2
+fi
 
 export PYTHONUNBUFFERED=1
 export PYTHONFAULTHANDLER=1
 
 # ── GPU allocation (auto-split: half actor, half rollout) ────────────
-DETECTED_GPUS=$(nvidia-smi -L 2>/dev/null | wc -l)
-NUM_GPUS="${NUM_GPUS:-${DETECTED_GPUS:-4}}"
+if command -v nvidia-smi >/dev/null 2>&1; then
+  DETECTED_GPUS=$(nvidia-smi -L 2>/dev/null | wc -l || echo 0)
+else
+  DETECTED_GPUS=0
+fi
+if [[ "${DETECTED_GPUS}" -le 0 ]]; then
+  DETECTED_GPUS=4
+fi
+NUM_GPUS="${NUM_GPUS:-${DETECTED_GPUS}}"
 HALF_GPUS=$(( NUM_GPUS / 2 ))
 # Default: each gets half of available GPUs (4-GPU node → 2/2, 8-GPU → 4/4).
 # Important: matching node size avoids SIGSEGV in NCCL getenv() observed when
@@ -84,16 +96,141 @@ REF_LOAD="${REF_LOAD:-/mnt/shared-storage-user/puyuan/code/slime/Qwen3-8B_torch_
 EXPORT_ROOT="${EXPORT_ROOT:-/mnt/shared-storage-user/narmodel/agenticrl}"
 RUN_TIMESTAMP="${RUN_TIMESTAMP:-$(date +%F_%H%M%S)}"
 DEBUG_MODE="${DEBUG_MODE:-0}"
+# Defaults needed early so the run directory name carries the key experiment
+# identity. Dataset construction and full validation still happen below.
+ALGO="${ALGO:-grpo}"
+case "${ALGO}" in
+  grpo|dapo) ;;
+  *)
+    echo "[ERROR] Unknown ALGO=${ALGO}. Use: grpo|dapo"
+    exit 1
+    ;;
+esac
+export ALGO
+DATASET="${DATASET:-seta}"
+case "${DATASET}" in
+  seta|safety|agentharm|mixed) ;;
+  *)
+    echo "[ERROR] Unknown DATASET=${DATASET}. Use: seta|safety|agentharm|mixed"
+    exit 1
+    ;;
+esac
+SETA_SAFETY="${SETA_SAFETY:-clawsentry}"
+SAFETY_BENCH_REWARD="${SAFETY_BENCH_REWARD:-rule}"
+AGENTHARM_REWARD="${AGENTHARM_REWARD:-rule}"
+SAFETY_REWARD_COEF="${SAFETY_REWARD_COEF:-0.3}"
+MAX_TURN="${MAX_TURN:-10}"
+DAPO_EPS_CLIP_HIGH="${DAPO_EPS_CLIP_HIGH:-0.28}"
+DAPO_CALCULATE_PER_TOKEN_LOSS="${DAPO_CALCULATE_PER_TOKEN_LOSS:-1}"
+DAPO_DYNAMIC_SAMPLING="${DAPO_DYNAMIC_SAMPLING:-1}"
+
+# Exploration defaults are defined in the main script as well as the wrapper so
+# direct invocations remain stable under `set -u`, and Ray runtime_env can always
+# receive explicit values. Bug fix: previously the exploration wrapper exported
+# EXPLORE_* in the parent shell, but ray job submit workers only received the
+# hand-built RUNTIME_ENV_JSON below, so generate.py often saw all exploration
+# switches as disabled.
+EXPLORATION_PROFILE="${EXPLORATION_PROFILE:-${EXPLORE_PROFILE:-off}}"
+EXPLORE_ENTROPY_COEF="${EXPLORE_ENTROPY_COEF:-0.0}"
+EXPLORE_THINK_MODE="${EXPLORE_THINK_MODE:-0}"
+EXPLORE_TEMP_HIGH="${EXPLORE_TEMP_HIGH:-}"
+EXPLORE_INTRINSIC="${EXPLORE_INTRINSIC:-0}"
+EXPLORE_INTRINSIC_ENABLED="${EXPLORE_INTRINSIC_ENABLED:-${EXPLORE_INTRINSIC}}"
+EXPLORE_INTRINSIC_COEF="${EXPLORE_INTRINSIC_COEF:-0.1}"
+EXPLORE_INTRINSIC_SCHEDULE="${EXPLORE_INTRINSIC_SCHEDULE:-constant}"
+EXPLORE_INTRINSIC_DECAY_STEPS="${EXPLORE_INTRINSIC_DECAY_STEPS:-0}"
+EXPLORE_INTRINSIC_GRANULARITY="${EXPLORE_INTRINSIC_GRANULARITY:-raw}"
+EXPLORE_INTRINSIC_SCOPE="${EXPLORE_INTRINSIC_SCOPE:-process}"
+EXPLORE_SAFETY_FILTER="${EXPLORE_SAFETY_FILTER:-0}"
+EXPLORE_SAFETY_FILTER_ENABLED="${EXPLORE_SAFETY_FILTER_ENABLED:-${EXPLORE_SAFETY_FILTER}}"
+EXPLORE_SAFETY_FILTER_COEF="${EXPLORE_SAFETY_FILTER_COEF:--0.5}"
+EXPLORE_LPRND="${EXPLORE_LPRND:-0}"
+EXPLORE_LPRND_ENABLED="${EXPLORE_LPRND_ENABLED:-${EXPLORE_LPRND}}"
+EXPLORE_LPRND_COEF="${EXPLORE_LPRND_COEF:-0.05}"
+EXPLORE_LPRND_SCHEDULE="${EXPLORE_LPRND_SCHEDULE:-constant}"
+EXPLORE_LPRND_DECAY_STEPS="${EXPLORE_LPRND_DECAY_STEPS:-0}"
+EXPLORE_LPRND_CLIP="${EXPLORE_LPRND_CLIP:-3.0}"
+EXPLORE_LPRND_WARMUP="${EXPLORE_LPRND_WARMUP:-32}"
+EXPLORE_ADVANTAGE_BONUS="${EXPLORE_ADVANTAGE_BONUS:-0}"
+EXPLORE_ADVANTAGE_BONUS_ENABLED="${EXPLORE_ADVANTAGE_BONUS_ENABLED:-${EXPLORE_ADVANTAGE_BONUS}}"
+EXPLORE_ADVANTAGE_BONUS_COMPONENTS="${EXPLORE_ADVANTAGE_BONUS_COMPONENTS:-explore_intrinsic_scaled}"
+EXPLORE_ADVANTAGE_BONUS_COEF="${EXPLORE_ADVANTAGE_BONUS_COEF:-1.0}"
+EXPLORE_ADVANTAGE_BONUS_CLIP="${EXPLORE_ADVANTAGE_BONUS_CLIP:-0.25}"
+EXPLORE_CDE_ACTOR="${EXPLORE_CDE_ACTOR:-0}"
+EXPLORE_CDE_ACTOR_ENABLED="${EXPLORE_CDE_ACTOR_ENABLED:-${EXPLORE_CDE_ACTOR}}"
+EXPLORE_CDE_ACTOR_OMEGA="${EXPLORE_CDE_ACTOR_OMEGA:-0.05}"
+EXPLORE_CDE_ACTOR_KAPPA="${EXPLORE_CDE_ACTOR_KAPPA:-2.0}"
+EXPLORE_CDE_ACTOR_ALPHA="${EXPLORE_CDE_ACTOR_ALPHA:-0.1}"
+EXPLORE_CDE_ACTOR_DECAY_STEPS="${EXPLORE_CDE_ACTOR_DECAY_STEPS:-0}"
+EXPLORE_CDE_ACTOR_REWARD_GATE="${EXPLORE_CDE_ACTOR_REWARD_GATE:-nonzero}"
+EXPLORE_RETRY_ATTEMPTS="${EXPLORE_RETRY_ATTEMPTS:-1}"
+EXPLORE_RETRY_TRAJ_GAMMA="${EXPLORE_RETRY_TRAJ_GAMMA:-1.0}"
+
+short_mode() {
+  case "$1" in
+    clawsentry) echo "cs" ;;
+    dense_rule) echo "dense" ;;
+    *) echo "$1" ;;
+  esac
+}
+
+sanitize_run_part() {
+  printf '%s' "$1" | tr -c 'A-Za-z0-9_.-' '-' | sed 's/-\\{1,\\}/-/g; s/^-//; s/-$//'
+}
+
+build_dataset_tag() {
+  case "${DATASET}" in
+    seta)
+      echo "seta-$(short_mode "${SETA_SAFETY}")-c${SAFETY_REWARD_COEF}"
+      ;;
+    safety)
+      echo "asb-$(short_mode "${SAFETY_BENCH_REWARD}")"
+      ;;
+    agentharm)
+      echo "agentharm-$(short_mode "${AGENTHARM_REWARD}")"
+      ;;
+    mixed)
+      local seta_ratio safety_ratio agentharm_ratio
+      if [[ -n "${MIX_AGENTHARM_RATIO:-}" ]]; then
+        seta_ratio="${MIX_SETA_RATIO:-0}"
+        safety_ratio="${MIX_SAFETY_RATIO:-0}"
+        agentharm_ratio="${MIX_AGENTHARM_RATIO:-0}"
+      else
+        seta_ratio="${MIX_SETA_RATIO:-1}"
+        safety_ratio="${MIX_SAFETY_RATIO:-1}"
+        agentharm_ratio="0"
+      fi
+      echo "mixed-s${seta_ratio}_asb${safety_ratio}_ah${agentharm_ratio}-rw$(short_mode "${SETA_SAFETY}")_$(short_mode "${SAFETY_BENCH_REWARD}")_$(short_mode "${AGENTHARM_REWARD}")-c${SAFETY_REWARD_COEF}"
+      ;;
+    *)
+      echo "${DATASET}"
+      ;;
+  esac
+}
+
+build_algo_tag() {
+  case "${ALGO}" in
+    dapo)
+      echo "dapo-ch${DAPO_EPS_CLIP_HIGH}-tok${DAPO_CALCULATE_PER_TOKEN_LOSS}-dyn${DAPO_DYNAMIC_SAMPLING}"
+      ;;
+    *)
+      echo "${ALGO}"
+      ;;
+  esac
+}
+
+RUN_DATASET_TAG="$(sanitize_run_part "$(build_dataset_tag)")"
+RUN_ALGO_TAG="$(sanitize_run_part "$(build_algo_tag)")"
 # Checkpoint saving is OFF by default. Set MAX_CKPT_KEEP=N (N>0) to enable.
 # When enabled, only the latest N checkpoints are kept; older ones are auto-deleted.
 MAX_CKPT_KEEP="${MAX_CKPT_KEEP:-0}"
 SAVE_INTERVAL="${SAVE_INTERVAL:-8}"
 if [[ "${DEBUG_MODE}" == "1" ]]; then
-  RUN_NAME="terminal-rl_qwen3-8b_${NUM_GPUS}gpu_debug_${RUN_TIMESTAMP}"
+  RUN_NAME="${RUN_NAME:-terminal-rl_qwen3-8b_${NUM_GPUS}gpu_debug_${RUN_DATASET_TAG}_${RUN_ALGO_TAG}_mt${MAX_TURN}_${RUN_TIMESTAMP}}"
   # Debug mode: never save checkpoints regardless of MAX_CKPT_KEEP
   MAX_CKPT_KEEP=0
 else
-  RUN_NAME="terminal-rl_qwen3-8b_${NUM_GPUS}gpu_${RUN_TIMESTAMP}"
+  RUN_NAME="${RUN_NAME:-terminal-rl_qwen3-8b_${NUM_GPUS}gpu_${RUN_DATASET_TAG}_${RUN_ALGO_TAG}_mt${MAX_TURN}_${RUN_TIMESTAMP}}"
 fi
 
 # ── Unified run directory (see STORAGE.md) ───────────────────────────────
@@ -156,13 +293,15 @@ else
   echo "[config] base yaml ${BASE_CUSTOM_CONFIG_PATH} not found; MAX_TURN=${MAX_TURN} will not take effect"
 fi
 
-# Symlinks for backward compatibility
-ln -sfn "${RUN_DIR}" "${RUNS_ROOT}/latest" 2>/dev/null || true
-ln -sfn "${RUN_DIR}" "${REPO_ROOT}/tmp_doc_latest" 2>/dev/null || true
-# Keep old logs/latest symlink for tools that expect it
-LOG_BASE="${SCRIPT_DIR}/logs"
-mkdir -p "${LOG_BASE}" 2>/dev/null || true
-ln -sfn "${RUN_LOG_DIR}" "${LOG_BASE}/latest" 2>/dev/null || true
+# Symlinks for backward compatibility. Dry-run avoids touching stable repo links.
+if [[ "${DRY_RUN}" != "1" ]]; then
+  ln -sfn "${RUN_DIR}" "${RUNS_ROOT}/latest" 2>/dev/null || true
+  ln -sfn "${RUN_DIR}" "${REPO_ROOT}/tmp_doc_latest" 2>/dev/null || true
+  # Keep old logs/latest symlink for tools that expect it
+  LOG_BASE="${SCRIPT_DIR}/logs"
+  mkdir -p "${LOG_BASE}" 2>/dev/null || true
+  ln -sfn "${RUN_LOG_DIR}" "${LOG_BASE}/latest" 2>/dev/null || true
+fi
 
 # Only create ckpt dir and set SAVE_CKPT when saving is enabled
 if (( MAX_CKPT_KEEP > 0 )); then
@@ -191,10 +330,16 @@ RUN_LOG="${RUN_LOG_DIR}/train.log"
 #   tmp_doc_<ts>/     → per-run snapshot (kept for history)
 # Both live under the repo root so they're on shared storage (visible from
 # CPU worker too, useful if you want to grep both sides at once).
-TMP_DOC_ROOT="${REPO_ROOT}/tmp_doc_${RUN_TIMESTAMP}"
-TMP_DOC_LATEST="${REPO_ROOT}/tmp_doc_latest"
-mkdir -p "${TMP_DOC_ROOT}"
-ln -sfn "${TMP_DOC_ROOT}" "${TMP_DOC_LATEST}"
+if [[ "${DRY_RUN}" == "1" ]]; then
+  TMP_DOC_ROOT="${RUN_DIR}/tmp_doc_${RUN_TIMESTAMP}"
+  TMP_DOC_LATEST="${TMP_DOC_ROOT}"
+  mkdir -p "${TMP_DOC_ROOT}"
+else
+  TMP_DOC_ROOT="${REPO_ROOT}/tmp_doc_${RUN_TIMESTAMP}"
+  TMP_DOC_LATEST="${REPO_ROOT}/tmp_doc_latest"
+  mkdir -p "${TMP_DOC_ROOT}"
+  ln -sfn "${TMP_DOC_ROOT}" "${TMP_DOC_LATEST}"
+fi
 
 GPU_RUN_LOG="${TMP_DOC_ROOT}/gpu_run.log"      # full stdout/stderr
 GPU_ERR_LOG="${TMP_DOC_ROOT}/gpu_err.log"      # filtered errors (populated on failure)
@@ -234,6 +379,21 @@ source "${SLIME_DIR}/scripts/models/qwen3-8B.sh"
 #   rule       = target-tool/refusal based safety reward
 #   dense_rule = rule-compatible dense shaping for GRPO
 #   clawsentry = use ClawSentry safety score (same mechanism as seta)
+#
+# ALGO:
+#   grpo = existing baseline path (default, unchanged)
+#   dapo = verl DAPO recipe knobs on top of GRPO estimator:
+#          clip-higher, token-level loss, dynamic sampling, overlong shaping
+ALGO="${ALGO:-grpo}"
+case "${ALGO}" in
+  grpo|dapo) ;;
+  *)
+    echo "[ERROR] Unknown ALGO=${ALGO}. Use: grpo|dapo"
+    exit 1
+    ;;
+esac
+export ALGO
+
 DATASET="${DATASET:-seta}"
 SETA_SAFETY="${SETA_SAFETY:-clawsentry}"
 SAFETY_BENCH_REWARD="${SAFETY_BENCH_REWARD:-rule}"
@@ -358,7 +518,7 @@ if [[ ! -f "${ROLLOUT_PROMPT_DATA}" ]]; then
   echo "[ERROR] ROLLOUT_PROMPT_DATA=${ROLLOUT_PROMPT_DATA} not found"
   exit 1
 fi
-echo "[config] DATASET=${DATASET} SETA_SAFETY=${SETA_SAFETY} SAFETY_BENCH_REWARD=${SAFETY_BENCH_REWARD} AGENTHARM_REWARD=${AGENTHARM_REWARD}"
+echo "[config] ALGO=${ALGO} DATASET=${DATASET} SETA_SAFETY=${SETA_SAFETY} SAFETY_BENCH_REWARD=${SAFETY_BENCH_REWARD} AGENTHARM_REWARD=${AGENTHARM_REWARD}"
 echo "[config] sources seta=${INCLUDES_SETA} safety=${INCLUDES_SAFETY} agentharm=${INCLUDES_AGENTHARM}"
 echo "[config] data=${ROLLOUT_PROMPT_DATA}"
 
@@ -379,7 +539,11 @@ echo "[config] needs_env_router=${NEEDS_ENV_ROUTER} AGENT_SAFETYBENCH_REMOTE_ENV
 USE_BLACKLIST="${USE_BLACKLIST:-1}"
 DATASET_BLACKLIST="${DATASET_BLACKLIST:-786,96,90,456,856,210,999,305,25,684,345,553,962,916,1264,282,324,768,46,996}"
 if [[ "${USE_BLACKLIST}" == "1" && -n "${DATASET_BLACKLIST}" ]]; then
-  FILTERED_DATA="${ROLLOUT_PROMPT_DATA%.jsonl}.filtered.jsonl"
+  if [[ "${DRY_RUN}" == "1" ]]; then
+    FILTERED_DATA="${RUN_DIR}/config/$(basename "${ROLLOUT_PROMPT_DATA%.jsonl}").filtered.jsonl"
+  else
+    FILTERED_DATA="${ROLLOUT_PROMPT_DATA%.jsonl}.filtered.jsonl"
+  fi
   python3 - "$ROLLOUT_PROMPT_DATA" "$FILTERED_DATA" "$DATASET_BLACKLIST" <<'PY'
 import json, sys
 src, dst, blk = sys.argv[1], sys.argv[2], set(sys.argv[3].split(","))
@@ -415,7 +579,11 @@ if [[ "${NEEDS_ENV_ROUTER}" == "1" && -z "${WORKER_URLS}" ]]; then
 fi
 
 export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-max_split_size_mb:2048,expandable_segments:True}"
-export MASTER_ADDR="${MASTER_ADDR:-$(hostname -I | awk '{print $1}')}"
+if [[ -z "${MASTER_ADDR:-}" ]]; then
+  MASTER_ADDR="$(hostname -I 2>/dev/null | awk '{print $1}' || true)"
+  MASTER_ADDR="${MASTER_ADDR:-127.0.0.1}"
+fi
+export MASTER_ADDR
 NODE_IP="${MASTER_ADDR}"
 
 export USE_REMOTE_ENV="${USE_REMOTE_ENV:-${NEEDS_ENV_ROUTER}}"
@@ -528,6 +696,8 @@ else
   N_SAMPLES="${N_SAMPLES:-4}"
   MAX_TOKENS_PER_GPU="${MAX_TOKENS_PER_GPU:-16384}"
 fi
+ROLLOUT_MAX_RESPONSE_LEN="${ROLLOUT_MAX_RESPONSE_LEN:-8192}"
+ROLLOUT_MAX_CONTEXT_LEN="${ROLLOUT_MAX_CONTEXT_LEN:-16384}"
 
 ROLLOUT_ARGS=(
   --prompt-data "${ROLLOUT_PROMPT_DATA}"
@@ -537,8 +707,8 @@ ROLLOUT_ARGS=(
   --num-rollout "${NUM_ROLLOUT}"
   --rollout-batch-size "${ROLLOUT_BATCH_SIZE}"
   --n-samples-per-prompt "${N_SAMPLES}"
-  --rollout-max-response-len 8192
-  --rollout-max-context-len 16384
+  --rollout-max-response-len "${ROLLOUT_MAX_RESPONSE_LEN}"
+  --rollout-max-context-len "${ROLLOUT_MAX_CONTEXT_LEN}"
   --rollout-temperature "${ROLLOUT_TEMPERATURE:-1}"
   --num-steps-per-rollout 2
   --balance-data
@@ -572,6 +742,68 @@ GRPO_ARGS=(
   --kl-loss-coef 0.01
   --kl-loss-type k3
 )
+
+DAPO_EPS_CLIP_LOW="${DAPO_EPS_CLIP_LOW:-0.2}"
+DAPO_EPS_CLIP_HIGH="${DAPO_EPS_CLIP_HIGH:-0.28}"
+DAPO_USE_KL_LOSS="${DAPO_USE_KL_LOSS:-0}"
+DAPO_KL_LOSS_COEF="${DAPO_KL_LOSS_COEF:-0.0}"
+DAPO_KL_LOSS_TYPE="${DAPO_KL_LOSS_TYPE:-k3}"
+DAPO_CALCULATE_PER_TOKEN_LOSS="${DAPO_CALCULATE_PER_TOKEN_LOSS:-1}"
+DAPO_DYNAMIC_SAMPLING="${DAPO_DYNAMIC_SAMPLING:-1}"
+DAPO_DYNAMIC_FILTER_PATH="${DAPO_DYNAMIC_FILTER_PATH:-slime.rollout.filter_hub.dynamic_sampling_filters.check_reward_nonzero_std}"
+DAPO_OVER_SAMPLING_BATCH_SIZE="${DAPO_OVER_SAMPLING_BATCH_SIZE:-${ROLLOUT_BATCH_SIZE}}"
+DAPO_GRPO_STD_NORMALIZATION="${DAPO_GRPO_STD_NORMALIZATION:-1}"
+DAPO_OVERLONG_BUFFER_ENABLE="${DAPO_OVERLONG_BUFFER_ENABLE:-1}"
+DAPO_OVERLONG_BUFFER_LEN="${DAPO_OVERLONG_BUFFER_LEN:-4096}"
+DAPO_OVERLONG_PENALTY_FACTOR="${DAPO_OVERLONG_PENALTY_FACTOR:-1.0}"
+
+DAPO_ARGS=(
+  --advantage-estimator grpo
+  --dynamic_history
+  --eps-clip "${DAPO_EPS_CLIP_LOW}"
+  --eps-clip-high "${DAPO_EPS_CLIP_HIGH}"
+)
+
+if [[ "${DAPO_CALCULATE_PER_TOKEN_LOSS}" == "1" ]]; then
+  DAPO_ARGS+=(--calculate-per-token-loss)
+fi
+if [[ "${DAPO_USE_KL_LOSS}" == "1" ]]; then
+  DAPO_ARGS+=(--use-kl-loss --kl-loss-coef "${DAPO_KL_LOSS_COEF}" --kl-loss-type "${DAPO_KL_LOSS_TYPE}")
+fi
+if [[ "${DAPO_DYNAMIC_SAMPLING}" == "1" ]]; then
+  if (( DAPO_OVER_SAMPLING_BATCH_SIZE < ROLLOUT_BATCH_SIZE )); then
+    echo "[ERROR] DAPO_OVER_SAMPLING_BATCH_SIZE(${DAPO_OVER_SAMPLING_BATCH_SIZE}) must be >= ROLLOUT_BATCH_SIZE(${ROLLOUT_BATCH_SIZE})"
+    exit 1
+  fi
+  DAPO_ARGS+=(
+    --dynamic-sampling-filter-path "${DAPO_DYNAMIC_FILTER_PATH}"
+    --over-sampling-batch-size "${DAPO_OVER_SAMPLING_BATCH_SIZE}"
+  )
+fi
+if [[ "${DAPO_GRPO_STD_NORMALIZATION}" == "0" ]]; then
+  DAPO_ARGS+=(--disable-grpo-std-normalization)
+fi
+
+case "${ALGO}" in
+  grpo)
+    ALGO_ARGS=("${GRPO_ARGS[@]}")
+    ALGO_EXTRA_ARGS="${EXTRA_GRPO_ARGS:-} ${EXTRA_ALGO_ARGS:-}"
+    ;;
+  dapo)
+    ALGO_ARGS=("${DAPO_ARGS[@]}")
+    ALGO_EXTRA_ARGS="${EXTRA_DAPO_ARGS:-} ${EXTRA_ALGO_ARGS:-}"
+    ;;
+esac
+ALGO_EXTRA_ARGS_ARRAY=()
+if [[ -n "${ALGO_EXTRA_ARGS// }" ]]; then
+  # Preserve the existing unquoted EXTRA_GRPO_ARGS behavior for compatibility.
+  ALGO_EXTRA_ARGS_ARRAY=(${ALGO_EXTRA_ARGS})
+fi
+log "Algorithm config: ALGO=${ALGO} args=${ALGO_ARGS[*]} extra=${ALGO_EXTRA_ARGS_ARRAY[*]:-<none>}"
+log "Exploration config: profile=${EXPLORATION_PROFILE} entropy=${EXPLORE_ENTROPY_COEF} intrinsic=${EXPLORE_INTRINSIC_ENABLED}/${EXPLORE_INTRINSIC} coef=${EXPLORE_INTRINSIC_COEF} schedule=${EXPLORE_INTRINSIC_SCHEDULE}/${EXPLORE_INTRINSIC_DECAY_STEPS} granularity=${EXPLORE_INTRINSIC_GRANULARITY} scope=${EXPLORE_INTRINSIC_SCOPE} safety_filter=${EXPLORE_SAFETY_FILTER_ENABLED}/${EXPLORE_SAFETY_FILTER} lprnd=${EXPLORE_LPRND_ENABLED}/${EXPLORE_LPRND} coef=${EXPLORE_LPRND_COEF} schedule=${EXPLORE_LPRND_SCHEDULE}/${EXPLORE_LPRND_DECAY_STEPS} cde_actor=${EXPLORE_CDE_ACTOR_ENABLED}/${EXPLORE_CDE_ACTOR} omega=${EXPLORE_CDE_ACTOR_OMEGA} alpha=${EXPLORE_CDE_ACTOR_ALPHA} kappa=${EXPLORE_CDE_ACTOR_KAPPA} gate=${EXPLORE_CDE_ACTOR_REWARD_GATE} decay_steps=${EXPLORE_CDE_ACTOR_DECAY_STEPS} post_norm_bonus=${EXPLORE_ADVANTAGE_BONUS_ENABLED}/${EXPLORE_ADVANTAGE_BONUS} components=${EXPLORE_ADVANTAGE_BONUS_COMPONENTS} coef=${EXPLORE_ADVANTAGE_BONUS_COEF} clip=${EXPLORE_ADVANTAGE_BONUS_CLIP}"
+if [[ "${ALGO}" == "dapo" ]]; then
+  log "DAPO knobs: clip_low=${DAPO_EPS_CLIP_LOW} clip_high=${DAPO_EPS_CLIP_HIGH} token_loss=${DAPO_CALCULATE_PER_TOKEN_LOSS} dynamic_sampling=${DAPO_DYNAMIC_SAMPLING} overlong=${DAPO_OVERLONG_BUFFER_ENABLE}/${DAPO_OVERLONG_BUFFER_LEN}/${DAPO_OVERLONG_PENALTY_FACTOR}"
+fi
 
 OPTIMIZER_ARGS=(
   --optimizer adam
@@ -616,11 +848,40 @@ CUSTOM_ARGS=(
   --custom-generate-function-path generate.generate
   --custom-rollout-log-function-path rollout_log.rollout_log
 )
+if [[ "${EXPLORE_ADVANTAGE_BONUS_ENABLED}" == "1" ]]; then
+  CUSTOM_ARGS+=(--custom-reward-post-process-path reward_postprocess.post_process_rewards)
+fi
 # --custom-config-path is optional in slime; only attach it if the yaml exists.
 if [[ -f "${CUSTOM_CONFIG_PATH}" ]]; then
   CUSTOM_ARGS+=(--custom-config-path "${CUSTOM_CONFIG_PATH}")
 else
   echo "WARN: custom config not found at ${CUSTOM_CONFIG_PATH}; skipping --custom-config-path"
+fi
+
+TRAIN_ARGS=(
+  --actor-num-nodes 1
+  --actor-num-gpus-per-node "${ACTOR_GPUS}"
+  --rollout-num-gpus "${ROLLOUT_GPUS}"
+  "${MODEL_ARGS[@]}"
+  "${CKPT_ARGS[@]}"
+  "${ROLLOUT_ARGS[@]}"
+  "${OPTIMIZER_ARGS[@]}"
+  "${ALGO_ARGS[@]}"
+  "${ALGO_EXTRA_ARGS_ARRAY[@]}"
+  "${WANDB_ARGS[@]}"
+  "${PERF_ARGS[@]}"
+  "${EVAL_ARGS[@]}"
+  "${SGLANG_ARGS[@]}"
+  "${MISC_ARGS[@]}"
+  "${CUSTOM_ARGS[@]}"
+)
+
+if [[ "${DRY_RUN}" == "1" ]]; then
+  log "DRY_RUN=1: final train_async command only; router/Ray/training will not start"
+  printf '[dry-run] '
+  printf '%q ' python3 -u "${SLIME_DIR}/train_async.py" "${TRAIN_ARGS[@]}"
+  printf '\n'
+  exit 0
 fi
 
 # NOTE: safety reward params are passed via env vars (RUNTIME_ENV_JSON below),
@@ -736,7 +997,11 @@ cat > "${RUN_DIR}/config/run_config.json" <<CFGEOF
 {
   "run_name": "${RUN_NAME}",
   "timestamp": "${RUN_TIMESTAMP}",
+  "run_dataset_tag": "${RUN_DATASET_TAG}",
+  "run_algo_tag": "${RUN_ALGO_TAG}",
   "debug_mode": ${DEBUG_MODE},
+  "dry_run": "${DRY_RUN}",
+  "algo": "${ALGO}",
   "model": "Qwen3-8B",
   "hf_ckpt": "${HF_CKPT}",
   "ref_load": "${REF_LOAD}",
@@ -754,6 +1019,8 @@ cat > "${RUN_DIR}/config/run_config.json" <<CFGEOF
   "num_rollout": ${NUM_ROLLOUT},
   "rollout_batch_size": ${ROLLOUT_BATCH_SIZE},
   "n_samples": ${N_SAMPLES},
+  "rollout_max_response_len": ${ROLLOUT_MAX_RESPONSE_LEN},
+  "rollout_max_context_len": ${ROLLOUT_MAX_CONTEXT_LEN},
   "max_tokens_per_gpu": ${MAX_TOKENS_PER_GPU},
   "worker_urls": "${WORKER_URLS}",
   "env_server_url": "${ENV_SERVER_URL}",
@@ -765,10 +1032,57 @@ cat > "${RUN_DIR}/config/run_config.json" <<CFGEOF
   "safety_bench_reward": "${SAFETY_BENCH_REWARD}",
   "agentharm_reward": "${AGENTHARM_REWARD}",
   "agentharm_root": "${AGENTHARM_ROOT}",
+  "dapo_eps_clip_low": "${DAPO_EPS_CLIP_LOW}",
+  "dapo_eps_clip_high": "${DAPO_EPS_CLIP_HIGH}",
+  "dapo_calculate_per_token_loss": "${DAPO_CALCULATE_PER_TOKEN_LOSS}",
+  "dapo_dynamic_sampling": "${DAPO_DYNAMIC_SAMPLING}",
+  "dapo_dynamic_filter_path": "${DAPO_DYNAMIC_FILTER_PATH}",
+  "dapo_over_sampling_batch_size": "${DAPO_OVER_SAMPLING_BATCH_SIZE}",
+  "dapo_grpo_std_normalization": "${DAPO_GRPO_STD_NORMALIZATION}",
+  "dapo_use_kl_loss": "${DAPO_USE_KL_LOSS}",
+  "dapo_kl_loss_coef": "${DAPO_KL_LOSS_COEF}",
+  "dapo_overlong_buffer_enable": "${DAPO_OVERLONG_BUFFER_ENABLE}",
+  "dapo_overlong_buffer_len": "${DAPO_OVERLONG_BUFFER_LEN}",
+  "dapo_overlong_penalty_factor": "${DAPO_OVERLONG_PENALTY_FACTOR}",
   "safety_reward_coef": "${SAFETY_REWARD_COEF}",
   "safety_reward_summary_weight": "${SAFETY_REWARD_SUMMARY_WEIGHT}",
   "safety_reward_zero_threshold": "${SAFETY_REWARD_ZERO_THRESHOLD}",
   "trajectory_save_interval_env": "${TRAJECTORY_SAVE_INTERVAL}",
+  "exploration_profile": "${EXPLORATION_PROFILE}",
+  "explore_entropy_coef": "${EXPLORE_ENTROPY_COEF}",
+  "explore_think_mode": "${EXPLORE_THINK_MODE}",
+  "explore_temp_high": "${EXPLORE_TEMP_HIGH}",
+  "explore_intrinsic": "${EXPLORE_INTRINSIC}",
+  "explore_intrinsic_enabled": "${EXPLORE_INTRINSIC_ENABLED}",
+  "explore_intrinsic_coef": "${EXPLORE_INTRINSIC_COEF}",
+  "explore_intrinsic_schedule": "${EXPLORE_INTRINSIC_SCHEDULE}",
+  "explore_intrinsic_decay_steps": "${EXPLORE_INTRINSIC_DECAY_STEPS}",
+  "explore_intrinsic_granularity": "${EXPLORE_INTRINSIC_GRANULARITY}",
+  "explore_intrinsic_scope": "${EXPLORE_INTRINSIC_SCOPE}",
+  "explore_safety_filter": "${EXPLORE_SAFETY_FILTER}",
+  "explore_safety_filter_enabled": "${EXPLORE_SAFETY_FILTER_ENABLED}",
+  "explore_safety_filter_coef": "${EXPLORE_SAFETY_FILTER_COEF}",
+  "explore_lprnd": "${EXPLORE_LPRND}",
+  "explore_lprnd_enabled": "${EXPLORE_LPRND_ENABLED}",
+  "explore_lprnd_coef": "${EXPLORE_LPRND_COEF}",
+  "explore_lprnd_schedule": "${EXPLORE_LPRND_SCHEDULE}",
+  "explore_lprnd_decay_steps": "${EXPLORE_LPRND_DECAY_STEPS}",
+  "explore_lprnd_clip": "${EXPLORE_LPRND_CLIP}",
+  "explore_lprnd_warmup": "${EXPLORE_LPRND_WARMUP}",
+  "explore_advantage_bonus": "${EXPLORE_ADVANTAGE_BONUS}",
+  "explore_advantage_bonus_enabled": "${EXPLORE_ADVANTAGE_BONUS_ENABLED}",
+  "explore_advantage_bonus_components": "${EXPLORE_ADVANTAGE_BONUS_COMPONENTS}",
+  "explore_advantage_bonus_coef": "${EXPLORE_ADVANTAGE_BONUS_COEF}",
+  "explore_advantage_bonus_clip": "${EXPLORE_ADVANTAGE_BONUS_CLIP}",
+  "explore_cde_actor": "${EXPLORE_CDE_ACTOR}",
+  "explore_cde_actor_enabled": "${EXPLORE_CDE_ACTOR_ENABLED}",
+  "explore_cde_actor_omega": "${EXPLORE_CDE_ACTOR_OMEGA}",
+  "explore_cde_actor_kappa": "${EXPLORE_CDE_ACTOR_KAPPA}",
+  "explore_cde_actor_alpha": "${EXPLORE_CDE_ACTOR_ALPHA}",
+  "explore_cde_actor_reward_gate": "${EXPLORE_CDE_ACTOR_REWARD_GATE}",
+  "explore_cde_actor_decay_steps": "${EXPLORE_CDE_ACTOR_DECAY_STEPS}",
+  "explore_retry_attempts": "${EXPLORE_RETRY_ATTEMPTS}",
+  "explore_retry_traj_gamma": "${EXPLORE_RETRY_TRAJ_GAMMA}",
   "clawsentry_url": "${CS_HTTP_URL}",
   "clawsentry_llm_provider": "${CS_LLM_PROVIDER}",
   "clawsentry_l3_enabled": "${CS_L3_ENABLED}",
@@ -832,6 +1146,46 @@ RUNTIME_ENV_JSON="{
     \"TRAJECTORY_SAVE_INTERVAL\": \"${TRAJECTORY_SAVE_INTERVAL}\",
     \"RUN_DIR\": \"${RUN_DIR}\",
     \"DATASET\": \"${DATASET}\",
+    \"ALGO\": \"${ALGO}\",
+    \"DAPO_OVERLONG_BUFFER_ENABLE\": \"${DAPO_OVERLONG_BUFFER_ENABLE}\",
+    \"DAPO_OVERLONG_BUFFER_LEN\": \"${DAPO_OVERLONG_BUFFER_LEN}\",
+    \"DAPO_OVERLONG_PENALTY_FACTOR\": \"${DAPO_OVERLONG_PENALTY_FACTOR}\",
+    \"DAPO_MAX_RESPONSE_LEN\": \"${ROLLOUT_MAX_RESPONSE_LEN}\",
+    \"EXPLORATION_PROFILE\": \"${EXPLORATION_PROFILE}\",
+    \"EXPLORE_ENTROPY_COEF\": \"${EXPLORE_ENTROPY_COEF}\",
+    \"EXPLORE_THINK_MODE\": \"${EXPLORE_THINK_MODE}\",
+    \"EXPLORE_TEMP_HIGH\": \"${EXPLORE_TEMP_HIGH}\",
+    \"EXPLORE_INTRINSIC\": \"${EXPLORE_INTRINSIC}\",
+    \"EXPLORE_INTRINSIC_ENABLED\": \"${EXPLORE_INTRINSIC_ENABLED}\",
+    \"EXPLORE_INTRINSIC_COEF\": \"${EXPLORE_INTRINSIC_COEF}\",
+    \"EXPLORE_INTRINSIC_SCHEDULE\": \"${EXPLORE_INTRINSIC_SCHEDULE}\",
+    \"EXPLORE_INTRINSIC_DECAY_STEPS\": \"${EXPLORE_INTRINSIC_DECAY_STEPS}\",
+    \"EXPLORE_INTRINSIC_GRANULARITY\": \"${EXPLORE_INTRINSIC_GRANULARITY}\",
+    \"EXPLORE_INTRINSIC_SCOPE\": \"${EXPLORE_INTRINSIC_SCOPE}\",
+    \"EXPLORE_SAFETY_FILTER\": \"${EXPLORE_SAFETY_FILTER}\",
+    \"EXPLORE_SAFETY_FILTER_ENABLED\": \"${EXPLORE_SAFETY_FILTER_ENABLED}\",
+    \"EXPLORE_SAFETY_FILTER_COEF\": \"${EXPLORE_SAFETY_FILTER_COEF}\",
+    \"EXPLORE_LPRND\": \"${EXPLORE_LPRND}\",
+    \"EXPLORE_LPRND_ENABLED\": \"${EXPLORE_LPRND_ENABLED}\",
+    \"EXPLORE_LPRND_COEF\": \"${EXPLORE_LPRND_COEF}\",
+    \"EXPLORE_LPRND_SCHEDULE\": \"${EXPLORE_LPRND_SCHEDULE}\",
+    \"EXPLORE_LPRND_DECAY_STEPS\": \"${EXPLORE_LPRND_DECAY_STEPS}\",
+    \"EXPLORE_LPRND_CLIP\": \"${EXPLORE_LPRND_CLIP}\",
+    \"EXPLORE_LPRND_WARMUP\": \"${EXPLORE_LPRND_WARMUP}\",
+    \"EXPLORE_ADVANTAGE_BONUS\": \"${EXPLORE_ADVANTAGE_BONUS}\",
+    \"EXPLORE_ADVANTAGE_BONUS_ENABLED\": \"${EXPLORE_ADVANTAGE_BONUS_ENABLED}\",
+    \"EXPLORE_ADVANTAGE_BONUS_COMPONENTS\": \"${EXPLORE_ADVANTAGE_BONUS_COMPONENTS}\",
+    \"EXPLORE_ADVANTAGE_BONUS_COEF\": \"${EXPLORE_ADVANTAGE_BONUS_COEF}\",
+    \"EXPLORE_ADVANTAGE_BONUS_CLIP\": \"${EXPLORE_ADVANTAGE_BONUS_CLIP}\",
+    \"EXPLORE_CDE_ACTOR\": \"${EXPLORE_CDE_ACTOR}\",
+    \"EXPLORE_CDE_ACTOR_ENABLED\": \"${EXPLORE_CDE_ACTOR_ENABLED}\",
+    \"EXPLORE_CDE_ACTOR_OMEGA\": \"${EXPLORE_CDE_ACTOR_OMEGA}\",
+    \"EXPLORE_CDE_ACTOR_KAPPA\": \"${EXPLORE_CDE_ACTOR_KAPPA}\",
+    \"EXPLORE_CDE_ACTOR_ALPHA\": \"${EXPLORE_CDE_ACTOR_ALPHA}\",
+    \"EXPLORE_CDE_ACTOR_REWARD_GATE\": \"${EXPLORE_CDE_ACTOR_REWARD_GATE}\",
+    \"EXPLORE_CDE_ACTOR_DECAY_STEPS\": \"${EXPLORE_CDE_ACTOR_DECAY_STEPS}\",
+    \"EXPLORE_RETRY_ATTEMPTS\": \"${EXPLORE_RETRY_ATTEMPTS}\",
+    \"EXPLORE_RETRY_TRAJ_GAMMA\": \"${EXPLORE_RETRY_TRAJ_GAMMA}\",
     \"WANDB_MODE\": \"${WANDB_MODE:-offline}\"
   }
 }"
@@ -844,21 +1198,7 @@ ray job submit --address="http://${MASTER_ADDR}:8265" \
   --no-wait \
   --runtime-env-json="${RUNTIME_ENV_JSON}" \
   -- python3 -u "${SLIME_DIR}/train_async.py" \
-  --actor-num-nodes 1 \
-  --actor-num-gpus-per-node "${ACTOR_GPUS}" \
-  --rollout-num-gpus "${ROLLOUT_GPUS}" \
-  "${MODEL_ARGS[@]}" \
-  "${CKPT_ARGS[@]}" \
-  "${ROLLOUT_ARGS[@]}" \
-  "${OPTIMIZER_ARGS[@]}" \
-  "${GRPO_ARGS[@]}" \
-  ${EXTRA_GRPO_ARGS:-} \
-  "${WANDB_ARGS[@]}" \
-  "${PERF_ARGS[@]}" \
-  "${EVAL_ARGS[@]}" \
-  "${SGLANG_ARGS[@]}" \
-  "${MISC_ARGS[@]}" \
-  "${CUSTOM_ARGS[@]}"
+  "${TRAIN_ARGS[@]}"
 
 set +e
 ray job logs --address="http://${MASTER_ADDR}:8265" "${RAY_JOB_SUBMISSION_ID}" -f --log-style=record

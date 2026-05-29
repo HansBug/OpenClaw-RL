@@ -322,6 +322,15 @@ class TerminalEnv:
             timeout=self._timeouts.eval + 30.0,
         )
 
+    def last_eval_details(self) -> dict[str, Any] | None:
+        if self._agent_safetybench_env is not None:
+            details = getattr(self._agent_safetybench_env, "_last_eval", None)
+            return details if isinstance(details, dict) else None
+        if self._agentharm_env is not None:
+            details = getattr(self._agentharm_env, "_last_eval", None)
+            return details if isinstance(details, dict) else None
+        return None
+
     async def close(self) -> None:
         trial_name = (
             self._trial_handler.trial_name
