@@ -119,6 +119,19 @@ case "${DATASET}" in
     exit 1
     ;;
 esac
+HARNESS_OPTION="${HARNESS_OPTION:-camel-agent}"
+case "${HARNESS_OPTION}" in
+  camel-agent|camel_agent)
+    HARNESS_OPTION="camel-agent"
+    ;;
+  a3s-code|a3s_code)
+    HARNESS_OPTION="a3s-code"
+    ;;
+  *)
+    echo "[ERROR] Unknown HARNESS_OPTION=${HARNESS_OPTION}. Use: camel-agent|a3s-code"
+    exit 1
+    ;;
+esac
 SETA_SAFETY="${SETA_SAFETY:-clawsentry}"
 SAFETY_BENCH_REWARD="${SAFETY_BENCH_REWARD:-rule}"
 AGENTHARM_REWARD="${AGENTHARM_REWARD:-rule}"
@@ -257,6 +270,16 @@ WANDB_DIR="${RUN_DIR}/metrics/wandb"
 TERMINAL_STRUCTURED_METRICS="${TERMINAL_STRUCTURED_METRICS:-1}"
 TERMINAL_METRICS_JSONL="${TERMINAL_METRICS_JSONL:-${RUN_LOG_DIR}/metrics.jsonl}"
 export TERMINAL_STRUCTURED_METRICS TERMINAL_METRICS_JSONL
+TRAIN_PYTHON="${TRAIN_PYTHON:-python3}"
+A3S_CODE_REPO_ROOT="${A3S_CODE_REPO_ROOT:-/mnt/shared-storage-user/puyuan/code/a3s-lab/Code}"
+A3S_CODE_CONFIG_PATH="${A3S_CODE_CONFIG_PATH:-${REPO_ROOT}/a3s-code-adapter/generated_configs/a3s-code-shared.hcl}"
+A3S_CODE_WORKSPACE_ROOT="${A3S_CODE_WORKSPACE_ROOT:-${RUN_DIR}/a3s_code_workspaces}"
+A3S_CODE_EXTRA_SITE_PACKAGES="${A3S_CODE_EXTRA_SITE_PACKAGES:-}"
+A3S_CODE_TURN_TIMEOUT_SEC="${A3S_CODE_TURN_TIMEOUT_SEC:-240}"
+A3S_CODE_TOOL_TIMEOUT_MS="${A3S_CODE_TOOL_TIMEOUT_MS:-240000}"
+A3S_CODE_MAX_TOOL_ROUNDS="${A3S_CODE_MAX_TOOL_ROUNDS:-8}"
+A3S_CODE_MAX_PARSE_RETRIES="${A3S_CODE_MAX_PARSE_RETRIES:-4}"
+ENV_EVALUATE_MAX_RETRIES="${ENV_EVALUATE_MAX_RETRIES:-3}"
 
 # ── Rollout knobs (env-configurable, baked into per-run yaml below) ──────
 # MAX_TURN: max model turns per rollout (terminal_max_iterations in generate.py).
@@ -279,12 +302,13 @@ BASE_CUSTOM_CONFIG_PATH="${CUSTOM_CONFIG_PATH}"
 RUN_CUSTOM_CONFIG_PATH="${RUN_DIR}/config/rollout_config.yaml"
 mkdir -p "$(dirname "${RUN_CUSTOM_CONFIG_PATH}")"
 if [[ -f "${BASE_CUSTOM_CONFIG_PATH}" ]]; then
-  python3 - "$BASE_CUSTOM_CONFIG_PATH" "$RUN_CUSTOM_CONFIG_PATH" "$MAX_TURN" "$TRAJECTORY_SAVE_INTERVAL" <<'PY'
+  python3 - "$BASE_CUSTOM_CONFIG_PATH" "$RUN_CUSTOM_CONFIG_PATH" "$MAX_TURN" "$TRAJECTORY_SAVE_INTERVAL" "$HARNESS_OPTION" <<'PY'
 import sys, yaml
-src, dst, max_turn, traj_interval = sys.argv[1], sys.argv[2], int(sys.argv[3]), sys.argv[4].strip()
+src, dst, max_turn, traj_interval, harness_option = sys.argv[1], sys.argv[2], int(sys.argv[3]), sys.argv[4].strip(), sys.argv[5].strip()
 with open(src) as f:
     cfg = yaml.safe_load(f) or {}
 cfg["max_iteration"] = max_turn
+cfg["harness_option"] = harness_option
 if traj_interval:
     cfg["trajectory_save_interval"] = int(traj_interval)
 with open(dst, "w") as f:
@@ -292,12 +316,28 @@ with open(dst, "w") as f:
 PY
   CUSTOM_CONFIG_PATH="${RUN_CUSTOM_CONFIG_PATH}"
   if [[ -n "${TRAJECTORY_SAVE_INTERVAL}" ]]; then
-    echo "[config] rollout yaml -> ${RUN_CUSTOM_CONFIG_PATH} (max_iteration=${MAX_TURN}, trajectory_save_interval=${TRAJECTORY_SAVE_INTERVAL})"
+    echo "[config] rollout yaml -> ${RUN_CUSTOM_CONFIG_PATH} (max_iteration=${MAX_TURN}, harness_option=${HARNESS_OPTION}, trajectory_save_interval=${TRAJECTORY_SAVE_INTERVAL})"
   else
-    echo "[config] rollout yaml -> ${RUN_CUSTOM_CONFIG_PATH} (max_iteration=${MAX_TURN})"
+    echo "[config] rollout yaml -> ${RUN_CUSTOM_CONFIG_PATH} (max_iteration=${MAX_TURN}, harness_option=${HARNESS_OPTION})"
   fi
 else
   echo "[config] base yaml ${BASE_CUSTOM_CONFIG_PATH} not found; MAX_TURN=${MAX_TURN} will not take effect"
+fi
+
+if [[ "${HARNESS_OPTION}" == "a3s-code" && "${DRY_RUN}" != "1" ]]; then
+  if ! "${TRAIN_PYTHON}" -c "import a3s_code" >/dev/null 2>&1; then
+    A3S_SDK_DIR="${A3S_CODE_REPO_ROOT}/sdk/python"
+    if [[ ! -d "${A3S_SDK_DIR}" ]]; then
+      echo "[ERROR] HARNESS_OPTION=a3s-code but a3s SDK dir not found: ${A3S_SDK_DIR}"
+      exit 1
+    fi
+    log "Installing a3s_code SDK with ${TRAIN_PYTHON} from ${A3S_SDK_DIR}"
+    (
+      cd "${A3S_SDK_DIR}"
+      "${TRAIN_PYTHON}" -m pip install -q maturin
+      "${TRAIN_PYTHON}" -m maturin develop --release
+    )
+  fi
 fi
 
 # Symlinks for backward compatibility. Dry-run avoids touching stable repo links.
@@ -358,6 +398,7 @@ echo "========================================"
 echo "  Terminal-RL Run: ${RUN_NAME}"
 echo "  Log dir:  ${RUN_LOG_DIR}"
 echo "  Metrics:  ${TERMINAL_METRICS_JSONL} (structured=${TERMINAL_STRUCTURED_METRICS})"
+echo "  Harness:  ${HARNESS_OPTION}"
 echo "  Ckpt:     ${SAVE_CKPT:-<disabled>}"
 echo "  HF_CKPT:  ${HF_CKPT}"
 echo "  REF_LOAD: ${REF_LOAD}"
@@ -888,7 +929,7 @@ TRAIN_ARGS=(
 if [[ "${DRY_RUN}" == "1" ]]; then
   log "DRY_RUN=1: final train_async command only; router/Ray/training will not start"
   printf '[dry-run] '
-  printf '%q ' python3 -u "${SLIME_DIR}/train_async.py" "${TRAIN_ARGS[@]}"
+  printf '%q ' "${TRAIN_PYTHON}" -u "${SLIME_DIR}/train_async.py" "${TRAIN_ARGS[@]}"
   printf '\n'
   exit 0
 fi
@@ -1011,6 +1052,7 @@ cat > "${RUN_DIR}/config/run_config.json" <<CFGEOF
   "debug_mode": ${DEBUG_MODE},
   "dry_run": "${DRY_RUN}",
   "algo": "${ALGO}",
+  "harness_option": "${HARNESS_OPTION}",
   "model": "Qwen3-8B",
   "hf_ckpt": "${HF_CKPT}",
   "ref_load": "${REF_LOAD}",
@@ -1098,6 +1140,9 @@ cat > "${RUN_DIR}/config/run_config.json" <<CFGEOF
   "clawsentry_evolving_enabled": "${CS_EVOLVING_ENABLED}",
   "terminal_structured_metrics": "${TERMINAL_STRUCTURED_METRICS}",
   "terminal_metrics_jsonl": "${TERMINAL_METRICS_JSONL}",
+  "train_python": "${TRAIN_PYTHON}",
+  "a3s_code_repo_root": "${A3S_CODE_REPO_ROOT}",
+  "a3s_code_config_path": "${A3S_CODE_CONFIG_PATH}",
   "log_dir": "${RUN_LOG_DIR}"
 }
 CFGEOF
@@ -1126,6 +1171,23 @@ done
 # Do NOT inject conda site-packages — Ray workers use the default python3
 # which already has Megatron/TE/sglang installed.
 RUNTIME_PYTHONPATH="${MEGATRON_DIR}:${REPO_ROOT}:${SLIME_DIR}:${SCRIPT_DIR}"
+if [[ "${HARNESS_OPTION}" == "a3s-code" ]]; then
+  RUNTIME_PYTHONPATH="${RUNTIME_PYTHONPATH}:${REPO_ROOT}/a3s-code-adapter"
+fi
+
+A3S_RUNTIME_ENV_JSON=""
+if [[ "${HARNESS_OPTION}" == "a3s-code" ]]; then
+  A3S_RUNTIME_ENV_JSON=",
+    \"A3S_CODE_REPO_ROOT\": \"${A3S_CODE_REPO_ROOT}\",
+    \"A3S_CODE_CONFIG_PATH\": \"${A3S_CODE_CONFIG_PATH}\",
+    \"A3S_CODE_WORKSPACE_ROOT\": \"${A3S_CODE_WORKSPACE_ROOT}\",
+    \"A3S_CODE_EXTRA_SITE_PACKAGES\": \"${A3S_CODE_EXTRA_SITE_PACKAGES}\",
+    \"A3S_CODE_TURN_TIMEOUT_SEC\": \"${A3S_CODE_TURN_TIMEOUT_SEC}\",
+    \"A3S_CODE_TOOL_TIMEOUT_MS\": \"${A3S_CODE_TOOL_TIMEOUT_MS}\",
+    \"A3S_CODE_MAX_TOOL_ROUNDS\": \"${A3S_CODE_MAX_TOOL_ROUNDS}\",
+    \"A3S_CODE_MAX_PARSE_RETRIES\": \"${A3S_CODE_MAX_PARSE_RETRIES}\",
+    \"ENV_EVALUATE_MAX_RETRIES\": \"${ENV_EVALUATE_MAX_RETRIES}\""
+fi
 
 RUNTIME_ENV_JSON="{
   \"env_vars\": {
@@ -1161,6 +1223,7 @@ RUNTIME_ENV_JSON="{
     \"RUN_LOG_DIR\": \"${RUN_LOG_DIR}\",
     \"TERMINAL_STRUCTURED_METRICS\": \"${TERMINAL_STRUCTURED_METRICS}\",
     \"TERMINAL_METRICS_JSONL\": \"${TERMINAL_METRICS_JSONL}\",
+    \"HARNESS_OPTION\": \"${HARNESS_OPTION}\",
     \"DATASET\": \"${DATASET}\",
     \"ALGO\": \"${ALGO}\",
     \"DAPO_OVERLONG_BUFFER_ENABLE\": \"${DAPO_OVERLONG_BUFFER_ENABLE}\",
@@ -1203,6 +1266,7 @@ RUNTIME_ENV_JSON="{
     \"EXPLORE_RETRY_ATTEMPTS\": \"${EXPLORE_RETRY_ATTEMPTS}\",
     \"EXPLORE_RETRY_TRAJ_GAMMA\": \"${EXPLORE_RETRY_TRAJ_GAMMA}\",
     \"WANDB_MODE\": \"${WANDB_MODE:-offline}\"
+    ${A3S_RUNTIME_ENV_JSON}
   }
 }"
 
@@ -1213,7 +1277,7 @@ ray job submit --address="http://${MASTER_ADDR}:8265" \
   --submission-id "${RAY_JOB_SUBMISSION_ID}" \
   --no-wait \
   --runtime-env-json="${RUNTIME_ENV_JSON}" \
-  -- python3 -u "${SLIME_DIR}/train_async.py" \
+  -- "${TRAIN_PYTHON}" -u "${SLIME_DIR}/train_async.py" \
   "${TRAIN_ARGS[@]}"
 
 set +e

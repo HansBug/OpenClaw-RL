@@ -28,7 +28,7 @@ from custom_types import (
     TurnResult,
 )
 from inference_client import SGLangTurnClient
-from agent_runner import create_agent_runner
+from agent_runner import create_agent_runner, normalize_harness_option
 from env_client import TerminalEnvClient
 from safety_reward import (
     DEFAULT_ZERO_THRESHOLD as _SAFETY_ZERO_THRESHOLD,
@@ -1394,6 +1394,7 @@ async def generate(
 
     env_client: Optional[TerminalEnvClient] = None
     lease_id: Optional[str] = None
+    agent_runner = None
 
     prm_enable = bool(getattr(args, "prm_enable", False)) and (not evaluation)
     prm_coef = float(getattr(args, "prm_turn_coef", 1.0))
@@ -1449,7 +1450,11 @@ async def generate(
         logger.info("%s Start terminal rollout", _log_tag)
 
         tool_schemas = _normalize_tool_schemas(raw_tools)
-        agent_type = str(getattr(args, "terminal_agent_type", "camel_agent"))
+        agent_type = normalize_harness_option(
+            getattr(args, "harness_option", None)
+            or getattr(args, "terminal_agent_type", None)
+            or "camel_agent"
+        )
         model_type = str(getattr(args, "model_type", "slime-sglang"))
         non_think_mode = bool(getattr(args, "non_think_mode", True))
         non_think_mode_source = str(
@@ -1544,6 +1549,10 @@ async def generate(
             tool_schemas=tool_schemas,
             non_think_mode=enable_prompt_non_think,
             max_total_tokens=max_total_tokens,
+            env_client=env_client,
+            lease_id=lease_id,
+            run_context=run_ctx,
+            task_meta=task_meta,
         )
         agent_runner.reset(user_msg)
         agent_runner.set_max_parse_errors(terminal_max_parse_errors)
@@ -1570,11 +1579,21 @@ async def generate(
                 context_result.context_messages
             )
             interaction = turn_state.interaction
+            turn_interactions = (
+                getattr(turn_state, "interactions", None) or [turn_state.interaction]
+            )
             turn_idx = int(interaction.turn_idx)
-            interactions.append(interaction)
+            interactions.extend(turn_interactions)
+            sdk_tool_calls = getattr(turn_state.model_response, "tool_calls", None)
+            sdk_tool_calls_count = getattr(
+                turn_state.model_response,
+                "tool_calls_count",
+                len(sdk_tool_calls or []),
+            )
 
             current_turn_record: dict[str, Any] = {
                 "turn_idx": turn_idx,
+                "harness_option": agent_type,
                 "context_messages": context_result.context_messages,
                 "assistant_output": interaction.output_text or "",
                 "finish_reason": interaction.finish_reason,
@@ -1582,6 +1601,19 @@ async def generate(
                 "n_input_tokens": len(interaction.input_ids or []),
                 "n_output_tokens": len(interaction.output_token_ids or []),
                 "parse_error_recorded": bool(turn_state.parse_error_recorded),
+                "sdk_model_turns": [
+                    {
+                        "turn_idx": int(it.turn_idx),
+                        "assistant_output": it.output_text or "",
+                        "finish_reason": it.finish_reason,
+                        "latency_ms": float(it.latency_ms),
+                        "n_input_tokens": len(it.input_ids or []),
+                        "n_output_tokens": len(it.output_token_ids or []),
+                    }
+                    for it in turn_interactions
+                ],
+                "sdk_tool_calls": _jsonable(sdk_tool_calls) if sdk_tool_calls else [],
+                "sdk_tool_calls_count": int(sdk_tool_calls_count or 0),
                 "tool_calls": [],
             }
             turn_records.append(current_turn_record)
@@ -2055,6 +2087,12 @@ async def generate(
                 await cs_client.aclose()
             except Exception as exc:
                 logger.debug("ClawSentry aclose ignored: %s", exc)
+
+        if agent_runner is not None:
+            try:
+                await agent_runner.close()
+            except Exception as exc:
+                logger.debug("%s Agent runner close ignored: %s", _log_tag, exc)
 
         if env_client is not None and lease_id is not None:
             try:
