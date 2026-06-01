@@ -1,14 +1,21 @@
 from __future__ import annotations
 
 import asyncio
+import concurrent.futures
+import json
 import logging
 import os
+import shlex
+import socket
 import sys
+import tempfile
+import threading
 import time
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List
 
 from custom_types import Interaction, TurnResult
 from inference_client import SGLangTurnClient
@@ -17,21 +24,24 @@ logger = logging.getLogger(__name__)
 
 
 @dataclass
-class A3SCodeModelResponse:
-    text: str
-    tool_calls: List[dict[str, Any]]
-    tool_calls_count: int
-    prompt_tokens: int
-    completion_tokens: int
-    total_tokens: int
+class A3SCodeResponse:
+    msg: str
+    terminated: bool = False
+    info: dict[str, Any] = field(default_factory=dict)
+    tool_calls: List[dict[str, Any]] = field(default_factory=list)
+    tool_calls_count: int = 0
+    prompt_tokens: int = 0
+    completion_tokens: int = 0
+    total_tokens: int = 0
     raw_result: Any = None
 
+    @property
+    def text(self) -> str:
+        return self.msg
 
-@dataclass
-class A3SCodeFinalResponse:
-    msg: str
-    terminated: bool
-    info: dict[str, Any]
+
+A3SCodeFinalResponse = A3SCodeResponse
+A3SCodeModelResponse = A3SCodeResponse
 
 
 def _env_flag(name: str, default: bool) -> bool:
@@ -67,11 +77,14 @@ def _repo_root() -> Path:
     return Path(__file__).resolve().parents[2]
 
 
-def _bootstrap_a3s_code() -> tuple[Any, Any]:
-    try:
-        from a3s_code import Agent, SessionOptions
+def _bootstrap_a3s_code() -> tuple[Any, Any, Any, Any]:
+    def _import() -> tuple[Any, Any, Any, Any]:
+        from a3s_code import Agent, PermissionPolicy, SessionOptions, SessionQueueConfig
 
-        return Agent, SessionOptions
+        return Agent, PermissionPolicy, SessionOptions, SessionQueueConfig
+
+    try:
+        return _import()
     except ImportError:
         pass
 
@@ -97,23 +110,12 @@ def _bootstrap_a3s_code() -> tuple[Any, Any]:
     for site in candidates:
         if (site / "a3s_code").exists():
             sys.path.insert(0, str(site))
-            from a3s_code import Agent, SessionOptions
-
-            return Agent, SessionOptions
+            return _import()
 
     raise RuntimeError(
         "a3s_code is not importable. Set A3S_CODE_REPO_ROOT or "
-        "A3S_CODE_EXTRA_SITE_PACKAGES, or build the SDK before running "
-        "HARNESS_OPTION=a3s-code."
-    )
-
-
-def _default_config_path() -> Path:
-    return (
-        _repo_root()
-        / "a3s-code-adapter"
-        / "generated_configs"
-        / "a3s-code-shared.hcl"
+        "A3S_CODE_EXTRA_SITE_PACKAGES, or install the a3s-code SDK before "
+        "running HARNESS_OPTION=a3s-code."
     )
 
 
@@ -131,7 +133,7 @@ def _text_from_message_content(content: Any) -> str:
     return "" if content is None else str(content)
 
 
-def _last_user_text(messages: List[dict[str, Any]]) -> str:
+def _last_user_text(messages: List[dict[str, Any]] | None) -> str:
     for message in reversed(messages or []):
         if str(message.get("role", "")).lower() == "user":
             text = _text_from_message_content(message.get("content"))
@@ -155,13 +157,254 @@ def _tokenize(tokenizer: Any, text: str) -> list[int]:
         return []
 
 
-class A3SCodeAgent:
-    """A3S Code SDK-backed harness for terminal-rl rollouts.
+def _append_no_proxy(hosts: list[str]) -> None:
+    existing = os.getenv("NO_PROXY") or os.getenv("no_proxy") or ""
+    parts = [item.strip() for item in existing.split(",") if item.strip()]
+    for host in hosts:
+        if host not in parts:
+            parts.append(host)
+    value = ",".join(parts)
+    os.environ["NO_PROXY"] = value
+    os.environ["no_proxy"] = value
 
-    The SDK owns code-workspace tool execution inside `session.send()`, so this
-    adapter returns no external `tool_call_requests`. The surrounding terminal-rl
-    pipeline still evaluates the final response, logs trajectories, and releases
-    the terminal lease in the usual `generate.py` finally block.
+
+def _clear_proxy_env_for_local_bridge() -> None:
+    _append_no_proxy(["127.0.0.1", "localhost", "::1"])
+    if not _env_flag("A3S_CODE_CLEAR_PROXY_FOR_BRIDGE", True):
+        return
+    for key in (
+        "http_proxy",
+        "https_proxy",
+        "all_proxy",
+        "HTTP_PROXY",
+        "HTTPS_PROXY",
+        "ALL_PROXY",
+    ):
+        os.environ.pop(key, None)
+
+
+class A3SOpenAIModelBridge:
+    """OpenAI-compatible local bridge from a3s-code SDK back to SGLangTurnClient."""
+
+    def __init__(self, *, sglang_client: SGLangTurnClient, model_name: str) -> None:
+        self._sglang_client = sglang_client
+        self._model_name = model_name
+        self._server: ThreadingHTTPServer | None = None
+        self._thread: threading.Thread | None = None
+        self._lock = threading.Lock()
+        self._interactions: list[Interaction] = []
+        self._turn_idx_base = 0
+
+    @property
+    def base_url(self) -> str:
+        if self._server is None:
+            raise RuntimeError("A3S OpenAI bridge is not started")
+        host, port = self._server.server_address[:2]
+        return f"http://{host}:{port}"
+
+    def set_turn_idx_base(self, turn_idx: int) -> None:
+        self._turn_idx_base = max(0, int(turn_idx))
+
+    def start(self) -> None:
+        if self._server is not None:
+            return
+
+        parent = self
+
+        class Handler(BaseHTTPRequestHandler):
+            def log_message(self, fmt: str, *args: Any) -> None:
+                logger.debug("a3s-code bridge: " + fmt, *args)
+
+            def do_GET(self) -> None:
+                if self.path == "/v1/models":
+                    self._write_json(
+                        {"object": "list", "data": [{"id": parent._model_name}]}
+                    )
+                    return
+                self.send_error(404)
+
+            def do_POST(self) -> None:
+                if self.path != "/v1/chat/completions":
+                    self.send_error(404)
+                    return
+                try:
+                    length = int(self.headers.get("Content-Length", "0") or "0")
+                    payload = json.loads(self.rfile.read(length).decode("utf-8"))
+                    if payload.get("stream"):
+                        self._write_sse(parent._stream_chunks(payload))
+                        return
+                    self._write_json(parent._complete(payload))
+                except Exception as exc:
+                    logger.exception("a3s-code bridge request failed")
+                    self._write_json({"error": str(exc)}, status=500)
+
+            def _write_json(self, payload: dict[str, Any], status: int = 200) -> None:
+                body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+                self.send_response(status)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def _write_sse(self, chunks: list[dict[str, Any]]) -> None:
+                self.send_response(200)
+                self.send_header("Content-Type", "text/event-stream")
+                self.send_header("Cache-Control", "no-cache")
+                self.end_headers()
+                for chunk in chunks:
+                    body = f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n".encode(
+                        "utf-8"
+                    )
+                    self.wfile.write(body)
+                    self.wfile.flush()
+                self.wfile.write(b"data: [DONE]\n\n")
+                self.wfile.flush()
+
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.bind(("127.0.0.1", 0))
+        host, port = sock.getsockname()
+        sock.close()
+        self._server = ThreadingHTTPServer((host, port), Handler)
+        self._thread = threading.Thread(
+            target=self._server.serve_forever,
+            name=f"a3s-openai-bridge-{port}",
+            daemon=True,
+        )
+        self._thread.start()
+
+    def close(self) -> None:
+        server = self._server
+        if server is None:
+            return
+        server.shutdown()
+        server.server_close()
+        if self._thread is not None:
+            self._thread.join(timeout=2)
+        self._server = None
+        self._thread = None
+
+    def interactions(self) -> list[Interaction]:
+        with self._lock:
+            return list(self._interactions)
+
+    def _complete(self, payload: dict[str, Any]) -> dict[str, Any]:
+        messages = self._normalize_messages(payload.get("messages") or [])
+        tools = payload.get("tools") or None
+        with self._lock:
+            turn_idx = self._turn_idx_base + len(self._interactions)
+
+        chat_completion, interaction = asyncio.run(
+            self._sglang_client.generate_turn(
+                messages=messages,
+                tools=tools,
+                turn_idx=turn_idx,
+            )
+        )
+        with self._lock:
+            self._interactions.append(interaction)
+
+        response = chat_completion.model_dump(mode="json", exclude_none=True)
+        response["model"] = str(payload.get("model") or self._model_name)
+        return response
+
+    def _stream_chunks(self, payload: dict[str, Any]) -> list[dict[str, Any]]:
+        full_payload = dict(payload)
+        full_payload["stream"] = False
+        response = self._complete(full_payload)
+        choice = (response.get("choices") or [{}])[0]
+        message = choice.get("message") or {}
+        finish_reason = choice.get("finish_reason") or "stop"
+        base = {
+            "id": response.get("id", f"chatcmpl-{uuid.uuid4().hex}"),
+            "object": "chat.completion.chunk",
+            "created": response.get("created", int(time.time())),
+            "model": response.get("model", self._model_name),
+        }
+
+        chunks = [
+            {
+                **base,
+                "choices": [
+                    {"index": 0, "delta": {"role": "assistant"}, "finish_reason": None}
+                ],
+            }
+        ]
+        delta: dict[str, Any] = {}
+        content = message.get("content")
+        if content:
+            delta["content"] = str(content)
+        tool_calls = message.get("tool_calls") or []
+        if tool_calls:
+            delta["tool_calls"] = [
+                self._stream_tool_call_delta(index, tool_call)
+                for index, tool_call in enumerate(tool_calls)
+            ]
+            finish_reason = "tool_calls"
+        if delta:
+            chunks.append(
+                {
+                    **base,
+                    "choices": [
+                        {"index": 0, "delta": delta, "finish_reason": None}
+                    ],
+                }
+            )
+        chunks.append(
+            {
+                **base,
+                "choices": [
+                    {"index": 0, "delta": {}, "finish_reason": finish_reason}
+                ],
+            }
+        )
+        return chunks
+
+    @staticmethod
+    def _stream_tool_call_delta(index: int, tool_call: dict[str, Any]) -> dict[str, Any]:
+        function = dict(tool_call.get("function") or {})
+        arguments = function.get("arguments", "")
+        if not isinstance(arguments, str):
+            arguments = json.dumps(arguments, ensure_ascii=False)
+        return {
+            "index": index,
+            "id": str(tool_call.get("id") or f"call_{uuid.uuid4().hex[:24]}"),
+            "type": str(tool_call.get("type") or "function"),
+            "function": {
+                "name": str(function.get("name") or ""),
+                "arguments": arguments,
+            },
+        }
+
+    @staticmethod
+    def _normalize_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        normalized: list[dict[str, Any]] = []
+        for message in messages:
+            item = dict(message)
+            content = item.get("content")
+            if isinstance(content, list):
+                parts: list[str] = []
+                for block in content:
+                    if isinstance(block, dict):
+                        text = block.get("text")
+                        if text is None:
+                            text = block.get("content")
+                        if text is not None:
+                            parts.append(str(text))
+                    else:
+                        parts.append(str(block))
+                item["content"] = "\n".join(parts)
+            elif content is None:
+                item["content"] = ""
+            normalized.append(item)
+        return normalized
+
+
+class A3SCodeAgent:
+    """a3s-code SDK harness for terminal-rl rollouts.
+
+    The SDK owns the agent loop. Model calls are routed back to terminal-rl's
+    SGLangTurnClient through a local OpenAI-compatible bridge, and SDK external
+    tool tasks are forwarded to the terminal env lease.
     """
 
     def __init__(
@@ -169,23 +412,125 @@ class A3SCodeAgent:
         *,
         model_type: str,
         sglang_client: SGLangTurnClient,
-        env_client: Any | None,
-        lease_id: str | None,
-        run_context: Any | None,
-        task_meta: Dict[str, Any],
         max_total_tokens: int,
+        env_client: Any | None = None,
+        lease_id: str | None = None,
+        run_context: Any | None = None,
+        task_meta: Dict[str, Any] | None = None,
+        non_think_mode: bool | None = None,
+        max_parse_errors: int | None = None,
+        tool_timeout_ms: int | None = None,
     ) -> None:
-        _ = (model_type, env_client, lease_id, max_total_tokens)
+        _ = non_think_mode
+        self.model_type = model_type or "slime-sglang"
         self._sglang_client = sglang_client
+        self._max_total_tokens = int(max_total_tokens)
+        self._env_client = env_client
+        self._lease_id = lease_id
         self._run_context = run_context
         self._task_meta = task_meta or {}
-        self._input_message = ""
-        self._session = None
-        self._agent = None
-        self._session_id = ""
-        self._workspace = self._resolve_workspace()
-        self._max_parse_errors = 3
+        self._tool_timeout_ms = int(
+            tool_timeout_ms or os.getenv("A3S_CODE_TOOL_TIMEOUT_MS", "7200000")
+        )
+        self._max_tool_rounds = max(1, _env_int("A3S_CODE_MAX_TOOL_ROUNDS", 10))
+        self._turn_timeout_sec = _env_float("A3S_CODE_TURN_TIMEOUT_SEC", 900.0)
+        self.max_parse_errors = max(1, int(max_parse_errors or 3))
         self.parse_error_count = 0
+        self._prompt = ""
+        self._session_id = ""
+        self._tmpdir: tempfile.TemporaryDirectory[str] | None = None
+        self._bridge: A3SOpenAIModelBridge | None = None
+        self._agent: Any | None = None
+        self._session: Any | None = None
+        self._workspace = self._resolve_workspace()
+        self._last_response: A3SCodeResponse | None = None
+        self._tool_call_records: list[dict[str, Any]] = []
+
+    def set_max_parse_errors(self, max_parse_errors: int) -> None:
+        self.max_parse_errors = max(1, int(max_parse_errors))
+
+    def set_max_iterations(self, max_iterations: int) -> None:
+        # The a3s-code SDK controls inner tool rounds independently through
+        # A3S_CODE_MAX_TOOL_ROUNDS. terminal-rl max_iteration limits outer loops.
+        _ = max_iterations
+
+    def start_turn_loop(self, input_message: Any) -> None:
+        self.parse_error_count = 0
+        self._tool_call_records = []
+        self._last_response = None
+        self._prompt = _text_from_message_content(input_message)
+        uid = getattr(self._run_context, "uid", None) or uuid.uuid4().hex[:8]
+        self._session_id = os.getenv("A3S_CODE_SESSION_ID") or (
+            f"terminal-rl-a3s-{uid}-{uuid.uuid4().hex[:8]}"
+        )
+        self._close_session()
+
+    async def get_turn_context(
+        self,
+    ) -> tuple[list[dict[str, Any]] | None, A3SCodeResponse | None]:
+        if self._last_response is not None:
+            return None, self._last_response
+        return [{"role": "user", "content": self._prompt}], None
+
+    async def consume_completion(
+        self, chat_completion: Any
+    ) -> tuple[Any | None, list[Any], bool, A3SCodeResponse | None]:
+        _ = chat_completion
+        raise RuntimeError("A3SCodeAgent uses the a3s-code SDK run path")
+
+    def record_tool_result(self, tool_call_request: Any, raw_result: Any) -> None:
+        _ = (tool_call_request, raw_result)
+
+    async def run_model_turn(
+        self,
+        context_messages: list[dict[str, Any]] | None = None,
+        *,
+        sglang_client: SGLangTurnClient | None = None,
+        tool_schemas: List[Dict[str, Any]] | None = None,
+        turn_idx: int = 0,
+    ) -> TurnResult:
+        _ = (sglang_client, tool_schemas)
+        prompt = _last_user_text(context_messages) or self._prompt
+        if prompt:
+            self._prompt = prompt
+
+        try:
+            result = await self._run_send_thread(turn_idx)
+        except asyncio.TimeoutError as exc:
+            self._try_cancel_session()
+            self._close_session()
+            raise TimeoutError(
+                f"a3s-code session.send timed out after {self._turn_timeout_sec:.0f}s"
+            ) from exc
+
+        interactions = self._bridge.interactions() if self._bridge is not None else []
+        self._last_response = self._response_from_result(result)
+        if not interactions:
+            interactions = [self._fallback_interaction(turn_idx, self._last_response.msg)]
+
+        return TurnResult(
+            interaction=interactions[-1],
+            model_response=self._last_response,
+            tool_call_requests=[],
+            parse_error_recorded=False,
+            terminated_response=None,
+            interactions=interactions,
+        )
+
+    def finalize_response(self, model_response: Any) -> A3SCodeResponse:
+        if isinstance(model_response, A3SCodeResponse):
+            return model_response
+        return self._last_response or A3SCodeResponse(
+            msg="",
+            terminated=True,
+            info={
+                "termination_reasons": ["missing_a3s_code_response"],
+                "harness_option": "a3s-code",
+            },
+        )
+
+    async def close(self) -> None:
+        self._close_session()
 
     def _resolve_workspace(self) -> Path:
         raw = os.getenv("A3S_CODE_WORKSPACE")
@@ -193,166 +538,413 @@ class A3SCodeAgent:
             path = Path(raw).expanduser()
         else:
             uid = getattr(self._run_context, "uid", None) or uuid.uuid4().hex[:8]
+            task_name = str(self._task_meta.get("task_name") or "task")
+            safe_task = "".join(c if c.isalnum() or c in "._-" else "-" for c in task_name)
             root = Path(
                 os.getenv(
                     "A3S_CODE_WORKSPACE_ROOT",
                     str(_repo_root() / "runs" / "a3s_code_workspaces"),
                 )
             )
-            path = root / f"a3s-code-{uid}"
+            path = root / f"a3s-code-{safe_task[:48]}-{uid}"
         path.mkdir(parents=True, exist_ok=True)
         return path
 
-    def _session_options(self, SessionOptions: Any) -> Any:
-        opts = SessionOptions()
-        self._session_id = os.getenv("A3S_CODE_SESSION_ID") or (
-            f"a3s-code-{int(time.time())}-{uuid.uuid4().hex[:8]}"
-        )
-        opts.session_id = self._session_id
-        opts.builtin_skills = _env_flag("A3S_CODE_BUILTIN_SKILLS", True)
-        opts.auto_compact = _env_flag("A3S_CODE_AUTO_COMPACT", True)
-        opts.auto_compact_threshold = _env_float("A3S_CODE_AUTO_COMPACT_THRESHOLD", 0.85)
-        opts.tool_timeout_ms = _env_int("A3S_CODE_TOOL_TIMEOUT_MS", 240000)
-        opts.max_parse_retries = _env_int("A3S_CODE_MAX_PARSE_RETRIES", 4)
-        opts.max_tool_rounds = _env_int("A3S_CODE_MAX_TOOL_ROUNDS", 8)
-        opts.circuit_breaker_threshold = _env_int("A3S_CODE_CIRCUIT_BREAKER_THRESHOLD", 5)
-        thinking_budget = _env_int("A3S_CODE_THINKING_BUDGET", 12000)
-        opts.thinking_budget = thinking_budget if thinking_budget > 0 else None
-        opts.continuation_enabled = _env_flag("A3S_CODE_CONTINUATION_ENABLED", True)
-        opts.max_continuation_turns = _env_int("A3S_CODE_MAX_CONTINUATION_TURNS", 5)
-        return opts
-
-    def _ensure_session(self) -> Any:
+    def _ensure_session(self, turn_idx: int = 0) -> None:
         if self._session is not None:
-            return self._session
+            if self._bridge is not None:
+                self._bridge.set_turn_idx_base(turn_idx)
+            return
 
-        Agent, SessionOptions = _bootstrap_a3s_code()
-        config_path = Path(os.getenv("A3S_CODE_CONFIG_PATH", str(_default_config_path())))
-        if not config_path.exists():
-            raise FileNotFoundError(
-                f"A3S_CODE_CONFIG_PATH={config_path} not found. "
-                "Set A3S_CODE_CONFIG_PATH or generate a3s-code shared config first."
-            )
+        _clear_proxy_env_for_local_bridge()
+        Agent, PermissionPolicy, SessionOptions, SessionQueueConfig = _bootstrap_a3s_code()
+        self._tmpdir = tempfile.TemporaryDirectory(prefix="terminal-rl-a3s-")
+        tmpdir = Path(self._tmpdir.name)
+
+        self._bridge = A3SOpenAIModelBridge(
+            sglang_client=self._sglang_client,
+            model_name=self.model_type,
+        )
+        self._bridge.set_turn_idx_base(turn_idx)
+        self._bridge.start()
+        config_path = tmpdir / "agent.acl"
+        config_path.write_text(
+            self._render_agent_config(self._bridge.base_url),
+            encoding="utf-8",
+        )
+
+        opts = SessionOptions()
+        opts.session_id = self._session_id
+        opts.builtin_skills = _env_flag("A3S_CODE_BUILTIN_SKILLS", False)
+        opts.max_parse_retries = self.max_parse_errors
+        opts.max_tool_rounds = self._max_tool_rounds
+        opts.tool_timeout_ms = self._tool_timeout_ms
+        opts.circuit_breaker_threshold = _env_int("A3S_CODE_CIRCUIT_BREAKER", 3)
+        opts.planning_mode = os.getenv("A3S_CODE_PLANNING_MODE", "disabled")
+        thinking_budget = os.getenv("A3S_CODE_THINKING_BUDGET", "").strip()
+        if thinking_budget:
+            opts.thinking_budget = int(thinking_budget)
+        opts.permission_policy = PermissionPolicy(default_decision="allow")
+
+        queue = SessionQueueConfig()
+        queue.set_lane_handler("query", "external", self._tool_timeout_ms)
+        queue.set_lane_handler("execute", "external", self._tool_timeout_ms)
+        opts.queue_config = queue
+
         self._agent = Agent.create(str(config_path))
-        opts = self._session_options(SessionOptions)
-        self._session = self._agent.session(
-            str(self._workspace),
-            opts,
-            permissive=_env_flag("A3S_CODE_PERMISSIVE", True),
+        self._session = self._agent.session(str(self._workspace), opts)
+
+    async def _run_send_thread(self, turn_idx: int) -> Any:
+        loop = asyncio.get_running_loop()
+        result_box: dict[str, Any] = {}
+
+        def target() -> None:
+            try:
+                result_box["result"] = self._send_with_external_tools(turn_idx, loop)
+            except BaseException as exc:
+                result_box["error"] = exc
+
+        thread = threading.Thread(
+            target=target,
+            name=f"a3s-code-send-{self._session_id or uuid.uuid4().hex[:8]}",
+            daemon=True,
         )
-        return self._session
+        thread.start()
 
-    def set_max_parse_errors(self, max_parse_errors: int) -> None:
-        self._max_parse_errors = max(1, int(max_parse_errors))
+        deadline = (
+            time.monotonic() + self._turn_timeout_sec
+            if self._turn_timeout_sec > 0
+            else None
+        )
+        while thread.is_alive():
+            if deadline is not None and time.monotonic() >= deadline:
+                raise asyncio.TimeoutError()
+            await asyncio.sleep(0.05)
 
-    def start_turn_loop(self, input_message: Any) -> None:
-        self.parse_error_count = 0
-        self._input_message = _text_from_message_content(input_message)
+        if "error" in result_box:
+            raise result_box["error"]
+        return result_box.get("result")
 
-    async def get_turn_context(self) -> tuple[Optional[List[dict[str, Any]]], Optional[Any]]:
-        return [{"role": "user", "content": self._input_message}], None
-
-    async def run_model_turn(
+    def _send_with_external_tools(
         self,
-        *,
-        context_messages: List[dict[str, Any]],
-        sglang_client: SGLangTurnClient,
-        tool_schemas: List[Dict[str, Any]],
         turn_idx: int,
-    ) -> TurnResult:
-        _ = (sglang_client, tool_schemas)
-        prompt = _last_user_text(context_messages) or self._input_message
-        session = self._ensure_session()
-        timeout = _env_float("A3S_CODE_TURN_TIMEOUT_SEC", 240.0)
-        try:
-            raw_result = await asyncio.wait_for(
-                asyncio.to_thread(session.send, prompt),
-                timeout=timeout,
+        loop: asyncio.AbstractEventLoop,
+    ) -> Any:
+        self._ensure_session(turn_idx)
+        assert self._session is not None
+
+        result_box: dict[str, Any] = {}
+
+        def send_target() -> None:
+            try:
+                result_box["result"] = self._session.send(self._prompt)
+            except Exception as exc:
+                result_box["error"] = exc
+
+        sender = threading.Thread(target=send_target, daemon=True)
+        sender.start()
+
+        handled: set[str] = set()
+        while sender.is_alive():
+            self._drain_external_tasks(handled, loop)
+            sender.join(timeout=0.1)
+
+        self._drain_external_tasks(handled, loop)
+        if "error" in result_box:
+            raise result_box["error"]
+        return result_box.get("result")
+
+    def _drain_external_tasks(
+        self,
+        handled: set[str],
+        loop: asyncio.AbstractEventLoop,
+    ) -> None:
+        if self._session is None:
+            return
+        pending_fn = getattr(self._session, "pending_external_tasks", None)
+        if not callable(pending_fn):
+            return
+        for task in list(pending_fn() or []):
+            task_id = str(self._task_get(task, "task_id") or "")
+            if not task_id or task_id in handled:
+                continue
+            handled.add(task_id)
+            tool_name = str(
+                self._task_get(task, "command_type")
+                or self._task_get(task, "tool_name")
+                or self._task_get(task, "name")
+                or ""
             )
-        except asyncio.TimeoutError:
-            cancel = getattr(session, "cancel", None)
-            if callable(cancel):
-                try:
-                    cancel()
-                except Exception:
-                    pass
-            raise TimeoutError(f"a3s-code session.send timed out after {timeout:.0f}s")
+            payload = self._task_get(task, "payload")
+            if payload is None:
+                payload = self._task_get(task, "arguments")
+            if payload is None:
+                payload = self._task_get(task, "args")
+            args = payload if isinstance(payload, dict) else {}
+            mapped_name, mapped_args = self._map_tool_call(tool_name, args)
 
-        output_text = str(getattr(raw_result, "text", "") or "")
-        tool_calls = list(getattr(raw_result, "tool_calls", []) or [])
-        tool_calls_count = int(
-            getattr(raw_result, "tool_calls_count", len(tool_calls)) or 0
+            try:
+                output = self._exec_terminal_tool_on_loop(loop, mapped_name, mapped_args)
+                self._complete_external_task(
+                    task_id,
+                    success=True,
+                    payload={"output": output, "exit_code": 0},
+                    error=None,
+                )
+                self._tool_call_records.append(
+                    {
+                        "tool_call_id": task_id,
+                        "tool_name": mapped_name,
+                        "sdk_tool_name": tool_name,
+                        "args": mapped_args,
+                        "sdk_args": args,
+                        "result": (
+                            output[:4096]
+                            if isinstance(output, str)
+                            else str(output)[:4096]
+                        ),
+                        "source": "a3s-code-sdk",
+                    }
+                )
+            except Exception as exc:
+                self._complete_external_task(
+                    task_id,
+                    success=False,
+                    payload=None,
+                    error=str(exc),
+                )
+                self._tool_call_records.append(
+                    {
+                        "tool_call_id": task_id,
+                        "tool_name": mapped_name,
+                        "sdk_tool_name": tool_name,
+                        "args": mapped_args,
+                        "sdk_args": args,
+                        "error": f"{type(exc).__name__}: {exc}",
+                        "source": "a3s-code-sdk",
+                    }
+                )
+
+    def _exec_terminal_tool_on_loop(
+        self,
+        loop: asyncio.AbstractEventLoop,
+        tool_name: str,
+        args: dict[str, Any],
+    ) -> str:
+        future = asyncio.run_coroutine_threadsafe(
+            self._exec_terminal_tool(tool_name, args),
+            loop,
         )
-        prompt_tokens = int(getattr(raw_result, "prompt_tokens", 0) or 0)
-        completion_tokens = int(getattr(raw_result, "completion_tokens", 0) or 0)
+        try:
+            return future.result(timeout=max(1.0, self._tool_timeout_ms / 1000.0))
+        except concurrent.futures.TimeoutError:
+            future.cancel()
+            raise TimeoutError(
+                f"a3s-code terminal tool {tool_name!r} timed out after "
+                f"{self._tool_timeout_ms}ms"
+            )
+
+    @staticmethod
+    def _task_get(task: Any, key: str) -> Any:
+        if isinstance(task, dict):
+            return task.get(key)
+        return getattr(task, key, None)
+
+    def _complete_external_task(
+        self,
+        task_id: str,
+        *,
+        success: bool,
+        payload: dict[str, Any] | None,
+        error: str | None,
+    ) -> None:
+        if self._session is None:
+            return
+        complete = getattr(self._session, "complete_external_task", None)
+        if not callable(complete):
+            return
+        try:
+            if success:
+                complete(task_id, True, payload)
+            else:
+                complete(task_id, False, payload, error)
+        except TypeError:
+            complete(task_id=task_id, success=success, result=payload, error=error)
+
+    async def _exec_terminal_tool(self, tool_name: str, args: dict[str, Any]) -> str:
+        if self._env_client is None or self._lease_id is None:
+            raise RuntimeError("terminal env client is required for a3s-code tool execution")
+        heartbeat = getattr(self._env_client, "heartbeat", None)
+        if callable(heartbeat):
+            await heartbeat(self._lease_id)
+        return await self._env_client.exec_tool(self._lease_id, tool_name, args)
+
+    @staticmethod
+    def _map_tool_call(tool_name: str, args: dict[str, Any]) -> tuple[str, dict[str, Any]]:
+        if tool_name in {
+            "shell_exec",
+            "shell_view",
+            "shell_write_to_process",
+            "shell_write_content_to_file",
+        }:
+            return tool_name, args
+
+        if tool_name in {"bash", "execute"}:
+            command = str(args.get("command") or args.get("cmd") or "")
+            return "shell_exec", {"command": command}
+
+        if tool_name == "read":
+            path = str(args.get("path") or args.get("file_path") or "")
+            offset = int(args.get("offset") or args.get("line_offset") or 1)
+            limit = int(args.get("limit") or args.get("line_limit") or 200)
+            command = (
+                f"sed -n '{max(1, offset)},{max(1, offset) + max(1, limit) - 1}p' "
+                f"{shlex.quote(path)}"
+            )
+            return "shell_exec", {"command": command}
+
+        if tool_name == "ls":
+            path = str(args.get("path") or ".")
+            return "shell_exec", {"command": f"ls -la {shlex.quote(path)}"}
+
+        if tool_name == "grep":
+            pattern = str(args.get("pattern") or args.get("query") or "")
+            path = str(args.get("path") or ".")
+            command = (
+                f"grep -RIn -- {shlex.quote(pattern)} {shlex.quote(path)} | head -200"
+            )
+            return "shell_exec", {"command": command}
+
+        if tool_name == "glob":
+            pattern = str(args.get("pattern") or args.get("glob") or "*")
+            command = (
+                "python3 - <<'PY'\n"
+                "import glob\n"
+                f"for p in glob.glob({json.dumps(pattern)}, recursive=True)[:200]: print(p)\n"
+                "PY"
+            )
+            return "shell_exec", {"command": command}
+
+        if tool_name == "write":
+            path = str(args.get("path") or args.get("file_path") or "")
+            content = str(args.get("content") or "")
+            return "shell_write_content_to_file", {"file_path": path, "content": content}
+
+        if tool_name == "edit":
+            path = str(args.get("path") or args.get("file_path") or "")
+            old = str(args.get("old_string") or args.get("old") or "")
+            new = str(args.get("new_string") or args.get("new") or "")
+            command = (
+                "python3 - <<'PY'\n"
+                "from pathlib import Path\n"
+                f"path = Path({json.dumps(path)})\n"
+                f"old = {json.dumps(old)}\n"
+                f"new = {json.dumps(new)}\n"
+                "text = path.read_text()\n"
+                "if old not in text:\n"
+                "    raise SystemExit('old_string not found')\n"
+                "path.write_text(text.replace(old, new, 1))\n"
+                "PY"
+            )
+            return "shell_exec", {"command": command}
+
+        return "shell_exec", {
+            "command": f"echo unsupported a3s-code tool: {shlex.quote(tool_name)}"
+        }
+
+    def _response_from_result(self, result: Any) -> A3SCodeResponse:
+        text = str(getattr(result, "text", "") or "")
+        sdk_tool_calls = list(getattr(result, "tool_calls", []) or [])
+        tool_calls = self._tool_call_records or sdk_tool_calls
+        prompt_tokens = int(getattr(result, "prompt_tokens", 0) or 0)
+        completion_tokens = int(getattr(result, "completion_tokens", 0) or 0)
         total_tokens = int(
-            getattr(raw_result, "total_tokens", prompt_tokens + completion_tokens) or 0
+            getattr(result, "total_tokens", prompt_tokens + completion_tokens) or 0
         )
-
-        tokenizer = getattr(self._sglang_client, "tokenizer", None)
-        input_ids = _tokenize(tokenizer, prompt)
-        output_ids = _tokenize(tokenizer, output_text)
-        interaction = Interaction(
-            turn_idx=turn_idx,
-            input_ids=input_ids,
-            output_token_ids=output_ids,
-            output_token_logprobs=[0.0] * len(output_ids),
-            output_text=output_text,
-            finish_reason=str(getattr(raw_result, "finish_reason", "stop") or "stop"),
-            messages=context_messages,
-            latency_ms=float(getattr(raw_result, "latency_ms", 0.0) or 0.0),
+        tool_calls_count = int(
+            getattr(result, "tool_calls_count", len(tool_calls)) or len(tool_calls)
         )
-        model_response = A3SCodeModelResponse(
-            text=output_text,
-            tool_calls=tool_calls,
+        info = {
+            "termination_reasons": [],
+            "harness_option": "a3s-code",
+            "harness": "a3s-code",
+            "session_id": self._session_id,
+            "workspace": str(self._workspace),
+            "task_path": self._task_meta.get("task_path"),
+            "tool_calls_count": tool_calls_count,
+            "prompt_tokens": prompt_tokens,
+            "completion_tokens": completion_tokens,
+            "total_tokens": total_tokens,
+            "parse_error_count": self.parse_error_count,
+            "tool_calls": list(tool_calls),
+        }
+        return A3SCodeResponse(
+            msg=text,
+            terminated=False,
+            info=info,
+            tool_calls=list(tool_calls),
             tool_calls_count=tool_calls_count,
             prompt_tokens=prompt_tokens,
             completion_tokens=completion_tokens,
             total_tokens=total_tokens,
-            raw_result=raw_result,
-        )
-        return TurnResult(
-            interaction=interaction,
-            interactions=[interaction],
-            model_response=model_response,
-            tool_call_requests=[],
-            parse_error_recorded=False,
+            raw_result=result,
         )
 
-    async def consume_completion(
-        self, chat_completion: Any
-    ) -> tuple[Optional[Any], List[Any], bool, Optional[Any]]:
-        _ = chat_completion
-        raise RuntimeError("A3SCodeAgent consumes completions inside run_model_turn().")
-
-    def record_tool_result(self, tool_call_request: Any, raw_result: Any) -> None:
-        _ = (tool_call_request, raw_result)
-
-    def finalize_response(self, model_response: Any) -> A3SCodeFinalResponse:
-        text = str(getattr(model_response, "text", "") or "")
-        return A3SCodeFinalResponse(
-            msg=text,
-            terminated=False,
-            info={
-                "termination_reasons": [],
-                "harness_option": "a3s-code",
-                "session_id": self._session_id,
-                "workspace": str(self._workspace),
-                "task_path": self._task_meta.get("task_path"),
-                "tool_calls_count": getattr(model_response, "tool_calls_count", 0),
-                "prompt_tokens": getattr(model_response, "prompt_tokens", 0),
-                "completion_tokens": getattr(model_response, "completion_tokens", 0),
-                "total_tokens": getattr(model_response, "total_tokens", 0),
-            },
+    def _fallback_interaction(self, turn_idx: int, text: str) -> Interaction:
+        tokenizer = getattr(self._sglang_client, "tokenizer", None)
+        input_ids = _tokenize(tokenizer, self._prompt)
+        output_ids = _tokenize(tokenizer, text)
+        return Interaction(
+            turn_idx=turn_idx,
+            input_ids=input_ids,
+            output_token_ids=output_ids,
+            output_token_logprobs=[0.0] * len(output_ids),
+            output_text=text,
+            finish_reason="stop",
+            messages=[{"role": "user", "content": self._prompt}],
+            latency_ms=0.0,
         )
 
-    async def close(self) -> None:
+    def _render_agent_config(self, base_url: str) -> str:
+        output_tokens = _env_int("A3S_CODE_OUTPUT_TOKENS", 8192)
+        return (
+            f'default_model = "openai/{self.model_type}"\n\n'
+            'providers "openai" {\n'
+            '  api_key = "terminal-rl"\n'
+            f'  base_url = "{base_url}"\n\n'
+            f'  models "{self.model_type}" {{\n'
+            f'    name = "{self.model_type}"\n'
+            "    tool_call = true\n\n"
+            "    limit = {\n"
+            f"      context = {self._max_total_tokens}\n"
+            f"      output = {output_tokens}\n"
+            "    }\n"
+            "  }\n"
+            "}\n"
+        )
+
+    def _try_cancel_session(self) -> None:
+        cancel = getattr(self._session, "cancel", None)
+        if callable(cancel):
+            try:
+                cancel()
+            except Exception:
+                pass
+
+    def _close_session(self) -> None:
         session = self._session
         self._session = None
-        if session is None:
-            return
-        close_fn = getattr(session, "close", None)
-        if callable(close_fn):
-            result = close_fn()
-            if asyncio.iscoroutine(result):
-                await result
+        if session is not None:
+            close_fn = getattr(session, "close", None)
+            if callable(close_fn):
+                try:
+                    close_fn()
+                except Exception:
+                    logger.debug("a3s-code session close ignored", exc_info=True)
+        if self._bridge is not None:
+            self._bridge.close()
+        self._bridge = None
+        self._agent = None
+        if self._tmpdir is not None:
+            self._tmpdir.cleanup()
+        self._tmpdir = None

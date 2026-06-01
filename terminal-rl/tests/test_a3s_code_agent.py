@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import sys
+import time
 import types
 from pathlib import Path
 
@@ -25,55 +26,153 @@ class DummySGLangClient:
     tokenizer = DummyTokenizer()
 
 
-def test_a3s_code_agent_run_model_turn_with_mock_sdk(monkeypatch, tmp_path):
-    config_path = tmp_path / "a3s-code.hcl"
-    config_path.write_text("# fake config\n")
+class FakeResult:
+    text = "done"
+    tool_calls = []
+    tool_calls_count = 0
+    prompt_tokens = 7
+    completion_tokens = 3
+    total_tokens = 10
 
-    class FakeResult:
-        text = "done"
-        tool_calls = [{"name": "read_file"}]
-        tool_calls_count = 1
-        prompt_tokens = 7
-        completion_tokens = 3
-        total_tokens = 10
-        finish_reason = "stop"
-        latency_ms = 12.5
 
-    class FakeSession:
-        closed = False
+class FakeSessionOptions:
+    pass
 
-        def send(self, prompt):
-            assert prompt == "fix the bug"
-            return FakeResult()
 
-        def close(self):
-            self.closed = True
+class FakeSessionQueueConfig:
+    def __init__(self):
+        self.handlers = []
 
-    fake_session = FakeSession()
+    def set_lane_handler(self, lane, mode, timeout_ms):
+        self.handlers.append((lane, mode, timeout_ms))
 
-    class FakeAgent:
-        @classmethod
-        def create(cls, path):
-            assert path == str(config_path)
-            return cls()
 
-        def session(self, workspace, opts, permissive=True):
-            assert Path(workspace).exists()
-            assert opts.session_id
-            assert permissive is True
-            return fake_session
+class FakePermissionPolicy:
+    def __init__(self, **kwargs):
+        self.kwargs = kwargs
 
-    class FakeSessionOptions:
+
+class FakeBridge:
+    closed = False
+
+    def __init__(self, *, sglang_client, model_name):
+        _ = (sglang_client, model_name)
+        self.base_url = "http://127.0.0.1:9"
+        self.turn_idx_base = 0
+
+    def set_turn_idx_base(self, turn_idx):
+        self.turn_idx_base = int(turn_idx)
+
+    def start(self):
         pass
 
+    def interactions(self):
+        return [
+            a3s_agent_module.Interaction(
+                turn_idx=self.turn_idx_base,
+                input_ids=[1, 2],
+                output_token_ids=[3, 4],
+                output_token_logprobs=[-0.1, -0.2],
+                output_text="done",
+                finish_reason="stop",
+                messages=[{"role": "user", "content": "fix the bug"}],
+            )
+        ]
+
+    def close(self):
+        FakeBridge.closed = True
+
+
+class FakeSession:
+    closed = False
+
+    def __init__(self, *, external_task=None):
+        self.sent = []
+        self.external_task = external_task
+        self.completed = external_task is None
+        self.completed_payloads = []
+
+    def send(self, prompt):
+        self.sent.append(prompt)
+        deadline = time.time() + 2
+        while not self.completed and time.time() < deadline:
+            time.sleep(0.01)
+        if not self.completed:
+            raise RuntimeError("external task was not completed")
+        return FakeResult()
+
+    def pending_external_tasks(self):
+        if self.completed or self.external_task is None:
+            return []
+        return [self.external_task]
+
+    def complete_external_task(self, task_id, success, payload=None, error=None):
+        self.completed = True
+        self.completed_payloads.append((task_id, success, payload, error))
+
+    def close(self):
+        self.closed = True
+        FakeSession.closed = True
+
+
+class FakeAgent:
+    created_config = None
+    last_session = None
+    next_session = None
+    last_opts = None
+
+    @classmethod
+    def create(cls, path):
+        config_path = Path(path)
+        assert config_path.exists()
+        assert "base_url" in config_path.read_text()
+        cls.created_config = str(config_path)
+        return cls()
+
+    def session(self, workspace, opts):
+        assert Path(workspace).exists()
+        FakeAgent.last_opts = opts
+        FakeAgent.last_session = FakeAgent.next_session or FakeSession()
+        return FakeAgent.last_session
+
+
+class FakeEnvClient:
+    def __init__(self):
+        self.calls = []
+        self.heartbeats = []
+
+    async def heartbeat(self, lease_id):
+        self.heartbeats.append(lease_id)
+
+    async def exec_tool(self, lease_id, tool_name, args):
+        self.calls.append((lease_id, tool_name, args))
+        return "tool output"
+
+
+def _patch_sdk(monkeypatch):
+    FakeBridge.closed = False
+    FakeSession.closed = False
+    FakeAgent.created_config = None
+    FakeAgent.last_session = None
+    FakeAgent.next_session = None
+    FakeAgent.last_opts = None
     monkeypatch.setattr(
         a3s_agent_module,
         "_bootstrap_a3s_code",
-        lambda: (FakeAgent, FakeSessionOptions),
+        lambda: (
+            FakeAgent,
+            FakePermissionPolicy,
+            FakeSessionOptions,
+            FakeSessionQueueConfig,
+        ),
     )
-    monkeypatch.setenv("A3S_CODE_CONFIG_PATH", str(config_path))
-    monkeypatch.setenv("A3S_CODE_WORKSPACE_ROOT", str(tmp_path / "workspaces"))
+    monkeypatch.setattr(a3s_agent_module, "A3SOpenAIModelBridge", FakeBridge)
     monkeypatch.setenv("A3S_CODE_TURN_TIMEOUT_SEC", "5")
+
+
+def test_a3s_code_agent_run_model_turn_with_mock_sdk(monkeypatch):
+    _patch_sdk(monkeypatch)
+    monkeypatch.setenv("A3S_CODE_WORKSPACE_ROOT", "/tmp/openclaw_a3s_test_workspaces")
 
     agent = a3s_agent_module.A3SCodeAgent(
         model_type="Qwen3",
@@ -81,7 +180,7 @@ def test_a3s_code_agent_run_model_turn_with_mock_sdk(monkeypatch, tmp_path):
         env_client=None,
         lease_id=None,
         run_context=types.SimpleNamespace(uid="abc123"),
-        task_meta={"task_path": "seta_env/1"},
+        task_meta={"task_name": "seta-task", "task_path": "seta_env/1"},
         max_total_tokens=8192,
     )
     agent.start_turn_loop("fix the bug")
@@ -97,15 +196,80 @@ def test_a3s_code_agent_run_model_turn_with_mock_sdk(monkeypatch, tmp_path):
             turn_idx=0,
         )
     )
+
+    assert FakeAgent.created_config is not None
+    assert FakeAgent.last_session.sent == ["fix the bug"]
+    assert FakeAgent.last_opts.max_tool_rounds == 10
     assert result.interaction.output_text == "done"
     assert result.interactions == [result.interaction]
     assert result.tool_call_requests == []
-    assert result.model_response.tool_calls_count == 1
+    assert result.model_response.tool_calls_count == 0
 
     final = agent.finalize_response(result.model_response)
     assert isinstance(final, a3s_agent_module.A3SCodeFinalResponse)
     assert final.msg == "done"
     assert final.info["harness_option"] == "a3s-code"
+    assert final.info["workspace"].endswith("a3s-code-seta-task-abc123")
 
     asyncio.run(agent.close())
-    assert fake_session.closed is True
+    assert FakeSession.closed is True
+    assert FakeBridge.closed is True
+
+
+def test_a3s_code_agent_external_tasks_route_to_terminal_env(monkeypatch):
+    _patch_sdk(monkeypatch)
+    monkeypatch.setenv("A3S_CODE_WORKSPACE_ROOT", "/tmp/openclaw_a3s_test_workspaces")
+    FakeAgent.next_session = FakeSession(
+        external_task={
+            "task_id": "task-1",
+            "command_type": "bash",
+            "payload": {"command": "pwd"},
+        }
+    )
+    env_client = FakeEnvClient()
+
+    agent = a3s_agent_module.A3SCodeAgent(
+        model_type="Qwen3",
+        sglang_client=DummySGLangClient(),
+        env_client=env_client,
+        lease_id="lease-1",
+        run_context=types.SimpleNamespace(uid="abc123"),
+        task_meta={"task_name": "seta-task"},
+        max_total_tokens=8192,
+    )
+    agent.start_turn_loop("fix the bug")
+
+    result = asyncio.run(
+        agent.run_model_turn(
+            context_messages=[{"role": "user", "content": "fix the bug"}],
+            sglang_client=DummySGLangClient(),
+            tool_schemas=[],
+            turn_idx=0,
+        )
+    )
+
+    assert env_client.heartbeats == ["lease-1"]
+    assert env_client.calls == [("lease-1", "shell_exec", {"command": "pwd"})]
+    assert FakeAgent.last_session.completed_payloads == [
+        ("task-1", True, {"output": "tool output", "exit_code": 0}, None)
+    ]
+    assert result.model_response.tool_calls == [
+        {
+            "tool_call_id": "task-1",
+            "tool_name": "shell_exec",
+            "sdk_tool_name": "bash",
+            "args": {"command": "pwd"},
+            "sdk_args": {"command": "pwd"},
+            "result": "tool output",
+            "source": "a3s-code-sdk",
+        }
+    ]
+
+
+def test_a3s_code_tool_mapping_helpers():
+    assert a3s_agent_module.A3SCodeAgent._map_tool_call(
+        "bash", {"command": "pwd"}
+    ) == ("shell_exec", {"command": "pwd"})
+    assert a3s_agent_module.A3SCodeAgent._map_tool_call(
+        "write", {"path": "x.txt", "content": "hi"}
+    ) == ("shell_write_content_to_file", {"file_path": "x.txt", "content": "hi"})

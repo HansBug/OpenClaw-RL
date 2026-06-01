@@ -144,5 +144,5 @@ def test_agent_runner_fallback_path_for_camel_style_agent():
     )
     result = asyncio.run(runner.run_model_turn([{"role": "user", "content": "x"}]))
     assert result.interaction.output_text == "fallback"
-    assert result.interactions is None
+    assert result.interactions == [result.interaction]
     assert runner.model_turn_count == 1

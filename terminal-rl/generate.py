@@ -1578,10 +1578,10 @@ async def generate(
             turn_state: TurnResult = await agent_runner.run_model_turn(
                 context_result.context_messages
             )
-            interaction = turn_state.interaction
             turn_interactions = (
                 getattr(turn_state, "interactions", None) or [turn_state.interaction]
             )
+            interaction = turn_interactions[-1]
             turn_idx = int(interaction.turn_idx)
             interactions.extend(turn_interactions)
             sdk_tool_calls = getattr(turn_state.model_response, "tool_calls", None)
@@ -1616,6 +1616,12 @@ async def generate(
                 "sdk_tool_calls_count": int(sdk_tool_calls_count or 0),
                 "tool_calls": [],
             }
+            if sdk_tool_calls:
+                for call in _jsonable(sdk_tool_calls):
+                    if isinstance(call, dict):
+                        normalized_call = dict(call)
+                        normalized_call.setdefault("source", "a3s-code-sdk")
+                        current_turn_record["tool_calls"].append(normalized_call)
             turn_records.append(current_turn_record)
 
             if prm_agent is not None:
@@ -1623,6 +1629,11 @@ async def generate(
                     {"tool_name": tc.tool_name, "args": tc.args}
                     for tc in (turn_state.tool_call_requests or [])
                 ]
+                if not tool_calls_for_prm and sdk_tool_calls:
+                    tool_calls_for_prm = [
+                        call for call in _jsonable(sdk_tool_calls)
+                        if isinstance(call, dict)
+                    ]
                 prm_agent.record_model_turn(
                     turn_idx,
                     assistant_text=interaction.output_text or "",

@@ -90,6 +90,9 @@ class AgentRunner:
 
     def set_max_iterations(self, max_iterations: int) -> None:
         self._max_iterations = max(1, int(max_iterations))
+        set_agent_max_iterations = getattr(self._rollout_agent, "set_max_iterations", None)
+        if callable(set_agent_max_iterations):
+            set_agent_max_iterations(self._max_iterations)
 
     def reached_iteration_limit(self) -> bool:
         return self._model_turn_count >= self._max_iterations
@@ -106,15 +109,13 @@ class AgentRunner:
     ) -> TurnResult:
         agent_turn = getattr(self._rollout_agent, "run_model_turn", None)
         if callable(agent_turn):
-            result = agent_turn(
-                context_messages=context_messages,
-                sglang_client=self._sglang_client,
-                tool_schemas=self._tool_schemas,
-                turn_idx=self._model_turn_count,
-            )
+            result = self._call_agent_run_model_turn(agent_turn, context_messages)
             if inspect.isawaitable(result):
                 result = await result
-            self._model_turn_count += 1
+            interactions = getattr(result, "interactions", None) or [
+                result.interaction
+            ]
+            self._model_turn_count += max(1, len(interactions))
             return result
 
         chat_completion, interaction = await self._sglang_client.generate_turn(
@@ -133,6 +134,7 @@ class AgentRunner:
             tool_call_requests=tool_call_requests,
             parse_error_recorded=parse_error_recorded,
             terminated_response=terminated,
+            interactions=[interaction],
         )
 
     def record_tool_result(self, tool_call_request: Any, raw_result: Any) -> None:
@@ -148,6 +150,28 @@ class AgentRunner:
         result = close_fn()
         if inspect.isawaitable(result):
             await result
+
+    def _call_agent_run_model_turn(
+        self,
+        agent_turn: Any,
+        context_messages: List[dict[str, Any]],
+    ) -> Any:
+        signature = inspect.signature(agent_turn)
+        params = signature.parameters
+        accepts_kwargs = any(
+            p.kind is inspect.Parameter.VAR_KEYWORD for p in params.values()
+        )
+        if accepts_kwargs or "context_messages" in params:
+            kwargs: dict[str, Any] = {"context_messages": context_messages}
+            if accepts_kwargs or "sglang_client" in params:
+                kwargs["sglang_client"] = self._sglang_client
+            if accepts_kwargs or "tool_schemas" in params:
+                kwargs["tool_schemas"] = self._tool_schemas
+            if accepts_kwargs or "turn_idx" in params:
+                kwargs["turn_idx"] = self._model_turn_count
+            return agent_turn(**kwargs)
+
+        return agent_turn(context_messages)
 
 
 def create_agent_runner(
@@ -183,6 +207,7 @@ def create_agent_runner(
             lease_id=lease_id,
             run_context=run_context,
             task_meta=task_meta or {},
+            non_think_mode=non_think_mode,
             max_total_tokens=max_total_tokens,
         )
     else:

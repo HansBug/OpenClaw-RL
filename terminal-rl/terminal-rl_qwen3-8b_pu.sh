@@ -273,12 +273,17 @@ export TERMINAL_STRUCTURED_METRICS TERMINAL_METRICS_JSONL
 TRAIN_PYTHON="${TRAIN_PYTHON:-python3}"
 A3S_CODE_REPO_ROOT="${A3S_CODE_REPO_ROOT:-/mnt/shared-storage-user/puyuan/code/a3s-lab/Code}"
 A3S_CODE_CONFIG_PATH="${A3S_CODE_CONFIG_PATH:-${REPO_ROOT}/a3s-code-adapter/generated_configs/a3s-code-shared.hcl}"
+A3S_CODE_CACHE_DIR="${A3S_CODE_CACHE_DIR:-${RUN_DIR}/a3s_code_cache}"
 A3S_CODE_WORKSPACE_ROOT="${A3S_CODE_WORKSPACE_ROOT:-${RUN_DIR}/a3s_code_workspaces}"
 A3S_CODE_EXTRA_SITE_PACKAGES="${A3S_CODE_EXTRA_SITE_PACKAGES:-}"
-A3S_CODE_TURN_TIMEOUT_SEC="${A3S_CODE_TURN_TIMEOUT_SEC:-240}"
-A3S_CODE_TOOL_TIMEOUT_MS="${A3S_CODE_TOOL_TIMEOUT_MS:-240000}"
-A3S_CODE_MAX_TOOL_ROUNDS="${A3S_CODE_MAX_TOOL_ROUNDS:-8}"
+A3S_CODE_TURN_TIMEOUT_SEC="${A3S_CODE_TURN_TIMEOUT_SEC:-900}"
+A3S_CODE_TOOL_TIMEOUT_MS="${A3S_CODE_TOOL_TIMEOUT_MS:-7200000}"
+A3S_CODE_MAX_TOOL_ROUNDS="${A3S_CODE_MAX_TOOL_ROUNDS:-10}"
 A3S_CODE_MAX_PARSE_RETRIES="${A3S_CODE_MAX_PARSE_RETRIES:-4}"
+A3S_CODE_OUTPUT_TOKENS="${A3S_CODE_OUTPUT_TOKENS:-8192}"
+A3S_CODE_PLANNING_MODE="${A3S_CODE_PLANNING_MODE:-disabled}"
+A3S_CODE_THINKING_BUDGET="${A3S_CODE_THINKING_BUDGET:-}"
+A3S_CODE_PIP_PACKAGE="${A3S_CODE_PIP_PACKAGE:-a3s-code==3.3.0}"
 ENV_EVALUATE_MAX_RETRIES="${ENV_EVALUATE_MAX_RETRIES:-3}"
 
 # ── Rollout knobs (env-configurable, baked into per-run yaml below) ──────
@@ -327,16 +332,18 @@ fi
 if [[ "${HARNESS_OPTION}" == "a3s-code" && "${DRY_RUN}" != "1" ]]; then
   if ! "${TRAIN_PYTHON}" -c "import a3s_code" >/dev/null 2>&1; then
     A3S_SDK_DIR="${A3S_CODE_REPO_ROOT}/sdk/python"
-    if [[ ! -d "${A3S_SDK_DIR}" ]]; then
-      echo "[ERROR] HARNESS_OPTION=a3s-code but a3s SDK dir not found: ${A3S_SDK_DIR}"
-      exit 1
+    if [[ -d "${A3S_SDK_DIR}" ]]; then
+      log "Installing a3s_code SDK with ${TRAIN_PYTHON} from ${A3S_SDK_DIR}"
+      (
+        cd "${A3S_SDK_DIR}"
+        "${TRAIN_PYTHON}" -m pip install -q maturin
+        "${TRAIN_PYTHON}" -m maturin develop --release
+      )
+    else
+      log "Installing ${A3S_CODE_PIP_PACKAGE} with ${TRAIN_PYTHON}"
+      "${TRAIN_PYTHON}" -m pip install "${A3S_CODE_PIP_PACKAGE}"
     fi
-    log "Installing a3s_code SDK with ${TRAIN_PYTHON} from ${A3S_SDK_DIR}"
-    (
-      cd "${A3S_SDK_DIR}"
-      "${TRAIN_PYTHON}" -m pip install -q maturin
-      "${TRAIN_PYTHON}" -m maturin develop --release
-    )
+    "${TRAIN_PYTHON}" -c "import a3s_code"
   fi
 fi
 
@@ -1143,6 +1150,13 @@ cat > "${RUN_DIR}/config/run_config.json" <<CFGEOF
   "train_python": "${TRAIN_PYTHON}",
   "a3s_code_repo_root": "${A3S_CODE_REPO_ROOT}",
   "a3s_code_config_path": "${A3S_CODE_CONFIG_PATH}",
+  "a3s_code_cache_dir": "${A3S_CODE_CACHE_DIR}",
+  "a3s_code_workspace_root": "${A3S_CODE_WORKSPACE_ROOT}",
+  "a3s_code_max_tool_rounds": "${A3S_CODE_MAX_TOOL_ROUNDS}",
+  "a3s_code_tool_timeout_ms": "${A3S_CODE_TOOL_TIMEOUT_MS}",
+  "a3s_code_turn_timeout_sec": "${A3S_CODE_TURN_TIMEOUT_SEC}",
+  "a3s_code_output_tokens": "${A3S_CODE_OUTPUT_TOKENS}",
+  "a3s_code_planning_mode": "${A3S_CODE_PLANNING_MODE}",
   "log_dir": "${RUN_LOG_DIR}"
 }
 CFGEOF
@@ -1180,17 +1194,23 @@ if [[ "${HARNESS_OPTION}" == "a3s-code" ]]; then
   A3S_RUNTIME_ENV_JSON=",
     \"A3S_CODE_REPO_ROOT\": \"${A3S_CODE_REPO_ROOT}\",
     \"A3S_CODE_CONFIG_PATH\": \"${A3S_CODE_CONFIG_PATH}\",
+    \"A3S_CODE_CACHE_DIR\": \"${A3S_CODE_CACHE_DIR}\",
     \"A3S_CODE_WORKSPACE_ROOT\": \"${A3S_CODE_WORKSPACE_ROOT}\",
     \"A3S_CODE_EXTRA_SITE_PACKAGES\": \"${A3S_CODE_EXTRA_SITE_PACKAGES}\",
     \"A3S_CODE_TURN_TIMEOUT_SEC\": \"${A3S_CODE_TURN_TIMEOUT_SEC}\",
     \"A3S_CODE_TOOL_TIMEOUT_MS\": \"${A3S_CODE_TOOL_TIMEOUT_MS}\",
     \"A3S_CODE_MAX_TOOL_ROUNDS\": \"${A3S_CODE_MAX_TOOL_ROUNDS}\",
     \"A3S_CODE_MAX_PARSE_RETRIES\": \"${A3S_CODE_MAX_PARSE_RETRIES}\",
+    \"A3S_CODE_OUTPUT_TOKENS\": \"${A3S_CODE_OUTPUT_TOKENS}\",
+    \"A3S_CODE_PLANNING_MODE\": \"${A3S_CODE_PLANNING_MODE}\",
+    \"A3S_CODE_THINKING_BUDGET\": \"${A3S_CODE_THINKING_BUDGET}\",
     \"ENV_EVALUATE_MAX_RETRIES\": \"${ENV_EVALUATE_MAX_RETRIES}\""
 fi
 
 RUNTIME_ENV_JSON="{
   \"env_vars\": {
+    \"PATH\": \"${PATH}\",
+    \"LD_LIBRARY_PATH\": \"${LD_LIBRARY_PATH:-}\",
     \"PYTHONPATH\": \"${RUNTIME_PYTHONPATH}\",
     \"PYTHONUNBUFFERED\": \"1\",
     \"PYTHONFAULTHANDLER\": \"1\",
