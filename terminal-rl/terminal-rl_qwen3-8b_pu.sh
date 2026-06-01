@@ -273,7 +273,15 @@ export TERMINAL_STRUCTURED_METRICS TERMINAL_METRICS_JSONL
 TRAIN_PYTHON="${TRAIN_PYTHON:-python3}"
 A3S_CODE_REPO_ROOT="${A3S_CODE_REPO_ROOT:-/mnt/shared-storage-user/puyuan/code/a3s-lab/Code}"
 A3S_CODE_CONFIG_PATH="${A3S_CODE_CONFIG_PATH:-${REPO_ROOT}/a3s-code-adapter/generated_configs/a3s-code-shared.hcl}"
-A3S_CODE_CACHE_DIR="${A3S_CODE_CACHE_DIR:-${RUN_DIR}/a3s_code_cache}"
+A3S_CODE_PY_TAG="$("${TRAIN_PYTHON}" - <<'PY'
+import platform
+import sys
+
+machine = platform.machine().lower().replace("amd64", "x86_64")
+print(f"cp{sys.version_info.major}{sys.version_info.minor}-{machine}")
+PY
+)"
+A3S_CODE_CACHE_DIR="${A3S_CODE_CACHE_DIR:-/mnt/shared-storage-user/puyuan/.cache/a3s-code-${A3S_CODE_PY_TAG}}"
 A3S_CODE_WORKSPACE_ROOT="${A3S_CODE_WORKSPACE_ROOT:-${RUN_DIR}/a3s_code_workspaces}"
 A3S_CODE_EXTRA_SITE_PACKAGES="${A3S_CODE_EXTRA_SITE_PACKAGES:-}"
 A3S_CODE_TURN_TIMEOUT_SEC="${A3S_CODE_TURN_TIMEOUT_SEC:-900}"
@@ -285,6 +293,24 @@ A3S_CODE_PLANNING_MODE="${A3S_CODE_PLANNING_MODE:-disabled}"
 A3S_CODE_THINKING_BUDGET="${A3S_CODE_THINKING_BUDGET:-}"
 A3S_CODE_PIP_PACKAGE="${A3S_CODE_PIP_PACKAGE:-a3s-code==3.3.0}"
 ENV_EVALUATE_MAX_RETRIES="${ENV_EVALUATE_MAX_RETRIES:-3}"
+
+a3s_code_import_check() {
+  mkdir -p "${RUN_LOG_DIR}"
+  A3S_CODE_CACHE_DIR="${A3S_CODE_CACHE_DIR}" \
+    "${TRAIN_PYTHON}" -c "import a3s_code" > "${RUN_LOG_DIR}/a3s_code_import_check.log" 2>&1
+}
+
+a3s_code_print_cache_hint() {
+  echo "[ERROR] HARNESS_OPTION=a3s-code but a3s_code import failed."
+  echo "[ERROR] a3s-code==3.3.0 downloads its native wheel on first import."
+  echo "[ERROR] Offline GPU workers need a prewarmed shared native cache."
+  echo "[ERROR] On an online CPU/shared-storage node, run:"
+  echo "  A3S_CODE_CACHE_DIR=${A3S_CODE_CACHE_DIR} ${TRAIN_PYTHON} -m pip install ${A3S_CODE_PIP_PACKAGE}"
+  echo "  A3S_CODE_CACHE_DIR=${A3S_CODE_CACHE_DIR} ${TRAIN_PYTHON} -c 'import a3s_code'"
+  echo "[ERROR] Then retry on the GPU worker with the same A3S_CODE_CACHE_DIR."
+  echo "[ERROR] Expected native cache under: ${A3S_CODE_CACHE_DIR}/3.3.0/_native.*"
+  echo "[ERROR] Import log: ${RUN_LOG_DIR}/a3s_code_import_check.log"
+}
 
 # ── Rollout knobs (env-configurable, baked into per-run yaml below) ──────
 # MAX_TURN: max model turns per rollout (terminal_max_iterations in generate.py).
@@ -330,7 +356,7 @@ else
 fi
 
 if [[ "${HARNESS_OPTION}" == "a3s-code" && "${DRY_RUN}" != "1" ]]; then
-  if ! "${TRAIN_PYTHON}" -c "import a3s_code" >/dev/null 2>&1; then
+  if ! a3s_code_import_check; then
     A3S_SDK_DIR="${A3S_CODE_REPO_ROOT}/sdk/python"
     if [[ -d "${A3S_SDK_DIR}" ]]; then
       log "Installing a3s_code SDK with ${TRAIN_PYTHON} from ${A3S_SDK_DIR}"
@@ -339,11 +365,17 @@ if [[ "${HARNESS_OPTION}" == "a3s-code" && "${DRY_RUN}" != "1" ]]; then
         "${TRAIN_PYTHON}" -m pip install -q maturin
         "${TRAIN_PYTHON}" -m maturin develop --release
       )
+    elif "${TRAIN_PYTHON}" -m pip show a3s-code >/dev/null 2>&1; then
+      a3s_code_print_cache_hint
+      exit 1
     else
       log "Installing ${A3S_CODE_PIP_PACKAGE} with ${TRAIN_PYTHON}"
       "${TRAIN_PYTHON}" -m pip install "${A3S_CODE_PIP_PACKAGE}"
     fi
-    "${TRAIN_PYTHON}" -c "import a3s_code"
+    if ! a3s_code_import_check; then
+      a3s_code_print_cache_hint
+      exit 1
+    fi
   fi
 fi
 

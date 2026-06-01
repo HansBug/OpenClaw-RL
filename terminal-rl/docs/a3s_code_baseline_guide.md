@@ -27,7 +27,7 @@ bash terminal-rl/terminal-rl_qwen3-8b_a3s_pu.sh
 | `DAPO_CALCULATE_PER_TOKEN_LOSS` | `1` | token-level loss |
 | `DAPO_DYNAMIC_SAMPLING` | `1` | dynamic sampling |
 | `A3S_CODE_REPO_ROOT` | `/mnt/shared-storage-user/puyuan/code/a3s-lab/Code` | `terminal-rl/terminal-rl_qwen3-8b_pu.sh:274` |
-| `A3S_CODE_CACHE_DIR` | `${RUN_DIR}/a3s_code_cache` | `terminal-rl/terminal-rl_qwen3-8b_pu.sh:276` |
+| `A3S_CODE_CACHE_DIR` | `/mnt/shared-storage-user/puyuan/.cache/a3s-code-cp312-x86_64` | shared native cache; bootstrap appends `/3.3.0` |
 | `A3S_CODE_TURN_TIMEOUT_SEC` | `900` | SDK outer turn timeout |
 | `A3S_CODE_TOOL_TIMEOUT_MS` | `7200000` | SDK external tool timeout |
 | `A3S_CODE_MAX_TOOL_ROUNDS` | `10` | SDK inner tool rounds |
@@ -60,11 +60,32 @@ A3S_CODE_PIP_PACKAGE=a3s-code==3.3.0 \
 bash terminal-rl/terminal-rl_qwen3-8b_a3s_pu.sh
 ```
 
+## 离线 GPU Worker
+
+`a3s-code==3.3.0` 的 PyPI 包会在首次 `import a3s_code` 时下载 native wheel。GPU worker 无网时，先在能联网且共享同一 `/mnt/shared-storage-user` 的 CPU 节点预热 cache：
+
+```bash
+export TRAIN_PYTHON=/mnt/shared-storage-user/puyuan/conda_envs/lightrft_py312/bin/python
+export A3S_CODE_CACHE_DIR=/mnt/shared-storage-user/puyuan/.cache/a3s-code-cp312-x86_64
+
+$TRAIN_PYTHON -m pip install a3s-code==3.3.0
+A3S_CODE_CACHE_DIR=$A3S_CODE_CACHE_DIR $TRAIN_PYTHON -c "import a3s_code"
+find "$A3S_CODE_CACHE_DIR/3.3.0" -name '_native.*' -maxdepth 1 -print
+```
+
+GPU worker 使用同一个 cache 即可离线 import：
+
+```bash
+export A3S_CODE_CACHE_DIR=/mnt/shared-storage-user/puyuan/.cache/a3s-code-cp312-x86_64
+A3S_CODE_CACHE_DIR=$A3S_CODE_CACHE_DIR python3 -c "import a3s_code"
+```
+
 ## 运行前检查
 
 | 检查项 | 命令 |
 |---|---|
 | wrapper dry-run | `DRY_RUN=1 bash terminal-rl/terminal-rl_qwen3-8b_a3s_pu.sh` |
 | SDK import | `${TRAIN_PYTHON:-python3} -c "import a3s_code"` |
+| native cache | `find "$A3S_CODE_CACHE_DIR/3.3.0" -name '_native.*' -maxdepth 1 -print` |
 | pool server | `curl http://<worker-ip>:18081/healthz` |
 | harness tests | `/mnt/shared-storage-user/puyuan/conda_envs/lightrft_py312/bin/python -m pytest terminal-rl/tests/test_a3s_code_agent.py terminal-rl/tests/test_agent_runner_harness_option.py terminal-rl/tests/test_harness_option_routing.py -v` |
