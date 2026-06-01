@@ -31,18 +31,40 @@ HARD_KILL_THRESHOLD="${HARD_KILL_THRESHOLD:-120}"
 CLEANUP_INTERVAL="${CLEANUP_INTERVAL:-60}"
 HEALTH_CHECK_INTERVAL="${HEALTH_CHECK_INTERVAL:-30}"
 CGROUP_MONITOR_INTERVAL="${CGROUP_MONITOR_INTERVAL:-15}"
+PROC_MONITOR_INTERVAL="${PROC_MONITOR_INTERVAL:-15}"
+DOCKER_CLI_CHECK_INTERVAL="${DOCKER_CLI_CHECK_INTERVAL:-30}"
+PROXY_CHECK_INTERVAL="${PROXY_CHECK_INTERVAL:-300}"
 POOL_CHECK_INTERVAL="${POOL_CHECK_INTERVAL:-30}"
 DEEP_PROBE_INTERVAL="${DEEP_PROBE_INTERVAL:-300}"
 PIDS_WARN_PCT="${PIDS_WARN_PCT:-75}"
 PIDS_EMERGENCY_PCT="${PIDS_EMERGENCY_PCT:-90}"
+PROC_WARN_COOLDOWN_S="${PROC_WARN_COOLDOWN_S:-60}"
+DOCKER_PROC_WARN="${DOCKER_PROC_WARN:-512}"
+DOCKER_PROC_EMERGENCY="${DOCKER_PROC_EMERGENCY:-900}"
+SHIM_PROC_WARN="${SHIM_PROC_WARN:-256}"
+SHIM_PROC_EMERGENCY="${SHIM_PROC_EMERGENCY:-512}"
+RUNC_PROC_WARN="${RUNC_PROC_WARN:-50}"
+RUNC_PROC_EMERGENCY="${RUNC_PROC_EMERGENCY:-150}"
+ZOMBIE_WARN="${ZOMBIE_WARN:-50}"
+ZOMBIE_EMERGENCY="${ZOMBIE_EMERGENCY:-200}"
 MEM_WARN_PCT="${MEM_WARN_PCT:-80}"
 MEM_EMERGENCY_PCT="${MEM_EMERGENCY_PCT:-92}"
 MAX_CONSECUTIVE_HEALTH_FAILS="${MAX_CONSECUTIVE_HEALTH_FAILS:-3}"
+MAX_CONSECUTIVE_DOCKER_CLI_FAILS="${MAX_CONSECUTIVE_DOCKER_CLI_FAILS:-2}"
+DOCKER_CLI_TIMEOUT="${DOCKER_CLI_TIMEOUT:-5}"
 LOG_FILE="${LOG_FILE:-/tmp/docker_watchdog.log}"
 LOG_MAX_BYTES="${LOG_MAX_BYTES:-209715200}"            # 200 MiB
 DOCKER_SOCK="${DOCKER_SOCK:-/var/run/docker.sock}"
 DOCKER_DATA_ROOT="${DOCKER_DATA_ROOT:-${DOCKER_ROOT:-/data}}"
+PROXY_URL="${PROXY_URL:-http://httpproxy-headless.kubebrain.svc.pjlab.local:3128}"
+NO_PROXY_LIST="${NO_PROXY_LIST:-localhost,127.0.0.1,10.0.0.0/8,100.96.0.0/12,.pjlab.org.cn,.pjlab.local,.svc}"
 PROXY_ENV_FILE="${PROXY_ENV_FILE:-/etc/seta_build_proxy.env}"
+FIX_SCRIPT="${FIX_SCRIPT:-$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &>/dev/null && pwd)/fix_dockerd_and_proxy.sh}"
+WATCHDOG_AUTO_REPAIR="${WATCHDOG_AUTO_REPAIR:-1}"
+WATCHDOG_REPAIR_MODE="${WATCHDOG_REPAIR_MODE:-restart}"  # restart | full-fix
+WATCHDOG_FULL_FIX_ALLOW_SELF_STOP="${WATCHDOG_FULL_FIX_ALLOW_SELF_STOP:-0}"
+REPAIR_LOCK_DIR="${REPAIR_LOCK_DIR:-/run/docker_watchdog_repair.lock}"
+REPAIR_COOLDOWN_S="${REPAIR_COOLDOWN_S:-300}"
 
 POOL_HOST="${POOL_HOST:-127.0.0.1}"
 POOL_PORT="${POOL_PORT:-18081}"
@@ -76,6 +98,8 @@ LAST_EMERGENCY_TS=0
 LAST_DEEP_PROBE_TS=0
 LAST_DISK_PRUNE_TS=0
 LAST_POOL_STOP_TS=0
+LAST_REPAIR_TS=0
+LAST_PROC_WARN_TS=0
 
 # ── namespace 检测 ────────────────────────────────────────────────────
 HOST_PID_NS=0
@@ -116,6 +140,14 @@ docker_alive() {
         http://./_ping >/dev/null 2>&1
 }
 
+docker_cli_alive() {
+    timeout "${DOCKER_CLI_TIMEOUT}" docker ps -q >/dev/null 2>&1
+}
+
+proxy_alive() {
+    timeout 5 curl -fsS --max-time 4 --noproxy "" -x "${PROXY_URL}" http://example.com >/dev/null 2>&1
+}
+
 # 深度探活：模拟 pool_server 真实 reset 路径——能创建+删 bridge 网络
 docker_deep_alive() {
     local netname="wd_probe_$(date +%s)_$$"
@@ -124,6 +156,89 @@ docker_deep_alive() {
     fi
     timeout 5 docker network rm "$netname" >/dev/null 2>&1 || true
     return 0
+}
+
+# ── repair 防抖和互斥 ────────────────────────────────────────────────
+acquire_repair_lock() {
+    local now owner_pid owner_ts age
+    now=$(date +%s)
+    if mkdir "${REPAIR_LOCK_DIR}" 2>/dev/null; then
+        printf '%s %s\n' "$$" "$now" > "${REPAIR_LOCK_DIR}/owner" 2>/dev/null || true
+        return 0
+    fi
+
+    if [ -f "${REPAIR_LOCK_DIR}/owner" ]; then
+        read -r owner_pid owner_ts < "${REPAIR_LOCK_DIR}/owner" 2>/dev/null || true
+        age=$((now - ${owner_ts:-0}))
+        if [ -n "${owner_pid:-}" ] && ! kill -0 "${owner_pid}" 2>/dev/null && [ "$age" -gt 600 ]; then
+            log "REPAIR: removing stale lock ${REPAIR_LOCK_DIR} (owner=${owner_pid}, age=${age}s)"
+            rm -rf "${REPAIR_LOCK_DIR}" 2>/dev/null || true
+            if mkdir "${REPAIR_LOCK_DIR}" 2>/dev/null; then
+                printf '%s %s\n' "$$" "$now" > "${REPAIR_LOCK_DIR}/owner" 2>/dev/null || true
+                return 0
+            fi
+        fi
+        log "REPAIR suppressed: another repair owns ${REPAIR_LOCK_DIR} (owner=${owner_pid:-?}, age=${age:-?}s)"
+    else
+        log "REPAIR suppressed: another repair owns ${REPAIR_LOCK_DIR}"
+    fi
+    return 1
+}
+
+release_repair_lock() {
+    rm -rf "${REPAIR_LOCK_DIR}" 2>/dev/null || true
+}
+
+repair_snapshot() {
+    log "REPAIR snapshot: pids=${LAST_PIDS_CUR:-?}/${LAST_PIDS_MAX:-?} (${LAST_PIDS_PCT:-?}%) tasks=${LAST_PROC_TASKS:-?} procs=${LAST_PROC_TOTAL:-?} zombies=${LAST_ZOMBIES:-?} dockerd=${LAST_DOCKERD_PROCS:-?} containerd=${LAST_CONTAINERD_PROCS:-?} shim=${LAST_SHIM_PROCS:-?} runc=${LAST_RUNC_PROCS:-?} docker_cli_fails=${DOCKER_CLI_FAILS:-0}"
+}
+
+run_full_fix_script() {
+    if [ "${WATCHDOG_FULL_FIX_ALLOW_SELF_STOP}" != "1" ]; then
+        log "REPAIR: full-fix requested but disabled because fix_dockerd_and_proxy.sh stops docker-watchdog; falling back to internal restart"
+        restart_docker
+        return $?
+    fi
+    if [ ! -f "${FIX_SCRIPT}" ]; then
+        log "REPAIR: full-fix script not found: ${FIX_SCRIPT}; falling back to internal restart"
+        restart_docker
+        return $?
+    fi
+    log "REPAIR: running full fix script with START_WATCHDOG=0 SKIP_VERIFY=1 (this may stop this watchdog service)"
+    DOCKER_DATA_ROOT="${DOCKER_DATA_ROOT}" PROXY_URL="${PROXY_URL}" START_WATCHDOG=0 SKIP_VERIFY=1 \
+        bash "${FIX_SCRIPT}"
+}
+
+trigger_repair() {
+    local reason="$1"
+    local now
+    now=$(date +%s)
+    if [ "${WATCHDOG_AUTO_REPAIR}" != "1" ]; then
+        log "REPAIR disabled (WATCHDOG_AUTO_REPAIR=0): ${reason}"
+        repair_snapshot
+        return 0
+    fi
+    if [ $((now - LAST_REPAIR_TS)) -lt "${REPAIR_COOLDOWN_S}" ]; then
+        log "REPAIR suppressed (cooldown ${REPAIR_COOLDOWN_S}s active): ${reason}"
+        repair_snapshot
+        return 0
+    fi
+    if ! acquire_repair_lock; then
+        return 0
+    fi
+
+    LAST_REPAIR_TS="$now"
+    log "REPAIR trigger: ${reason}"
+    repair_snapshot
+    case "${WATCHDOG_REPAIR_MODE}" in
+        full-fix)
+            run_full_fix_script || log "REPAIR: full-fix/restart path failed"
+            ;;
+        restart|*)
+            restart_docker || log "REPAIR: internal dockerd restart failed"
+            ;;
+    esac
+    release_repair_lock
 }
 
 # ── 紧急泄压（带冷却 + foreground + timeout）─────────────────────────
@@ -252,6 +367,119 @@ detect_cgroup() {
     detect_cgroup_v2 || detect_cgroup_v1 || return 1
 }
 
+read_effective_pids() {
+    local cur="" max=""
+    if [ -n "${CGROUP_PIDS_CUR_FILE}" ] && [ -f "${CGROUP_PIDS_CUR_FILE}" ]; then
+        read -r cur < "${CGROUP_PIDS_CUR_FILE}" 2>/dev/null || cur=""
+        max="${CGROUP_PIDS_MAX_VAL}"
+    fi
+    if [ -z "$cur" ]; then
+        cur="${LAST_PROC_TASKS:-}"
+    fi
+    if [ -z "$max" ] && [ -f /proc/sys/kernel/threads-max ]; then
+        read -r max < /proc/sys/kernel/threads-max 2>/dev/null || max=""
+    fi
+    [ -n "$cur" ] && [ -n "$max" ] && echo "${cur} ${max}"
+}
+
+collect_proc_metrics() {
+    local proc_dir task_dir stat_line rest state name
+    local total=0 tasks=0 zombies=0 dockerd=0 containerd=0 shim=0 runc=0 docker_cli=0
+
+    for proc_dir in /proc/[0-9]*; do
+        [ -d "$proc_dir" ] || continue
+        total=$((total + 1))
+        if IFS= read -r name < "${proc_dir}/comm" 2>/dev/null; then
+            :
+        else
+            name="?"
+        fi
+        if IFS= read -r stat_line < "${proc_dir}/stat" 2>/dev/null; then
+            rest="${stat_line#*) }"
+            state="${rest%% *}"
+            [ "$state" = "Z" ] && zombies=$((zombies + 1))
+        fi
+        for task_dir in "${proc_dir}"/task/[0-9]*; do
+            [ -d "$task_dir" ] && tasks=$((tasks + 1))
+        done
+        case "$name" in
+            dockerd) dockerd=$((dockerd + 1)) ;;
+            containerd) containerd=$((containerd + 1)) ;;
+            containerd-shim*) shim=$((shim + 1)) ;;
+            runc) runc=$((runc + 1)) ;;
+            docker) docker_cli=$((docker_cli + 1)) ;;
+        esac
+    done
+
+    LAST_PROC_TOTAL="$total"
+    LAST_PROC_TASKS="$tasks"
+    LAST_ZOMBIES="$zombies"
+    LAST_DOCKERD_PROCS="$dockerd"
+    LAST_CONTAINERD_PROCS="$containerd"
+    LAST_SHIM_PROCS="$shim"
+    LAST_RUNC_PROCS="$runc"
+    LAST_DOCKER_CLI_PROCS="$docker_cli"
+
+    local pids cur max pct
+    pids="$(read_effective_pids 2>/dev/null || true)"
+    cur="${pids%% *}"
+    max="${pids##* }"
+    pct="?"
+    if [ -n "$cur" ] && [ -n "$max" ] && [ "$max" -gt 0 ] 2>/dev/null; then
+        pct=$((cur * 100 / max))
+    fi
+    LAST_PIDS_CUR="$cur"
+    LAST_PIDS_MAX="$max"
+    LAST_PIDS_PCT="$pct"
+}
+
+proc_warn_log() {
+    local now msg
+    msg="$1"
+    now=$(date +%s)
+    if [ $((now - LAST_PROC_WARN_TS)) -ge "${PROC_WARN_COOLDOWN_S}" ]; then
+        log "$msg"
+        LAST_PROC_WARN_TS="$now"
+    fi
+}
+
+monitor_proc_pressure() {
+    collect_proc_metrics
+
+    local docker_related
+    docker_related=$((LAST_DOCKERD_PROCS + LAST_CONTAINERD_PROCS + LAST_SHIM_PROCS + LAST_RUNC_PROCS + LAST_DOCKER_CLI_PROCS))
+
+    if [ "${LAST_PIDS_PCT}" != "?" ] && [ "${LAST_PIDS_PCT}" -ge "${PIDS_EMERGENCY_PCT}" ] 2>/dev/null; then
+        trigger_repair "pids pressure ${LAST_PIDS_CUR}/${LAST_PIDS_MAX} (${LAST_PIDS_PCT}%) before fork failure"
+        return 0
+    fi
+    if [ "${LAST_ZOMBIES}" -ge "${ZOMBIE_EMERGENCY}" ] 2>/dev/null; then
+        trigger_repair "zombie process pressure zombies=${LAST_ZOMBIES}"
+        return 0
+    fi
+    if [ "${LAST_SHIM_PROCS}" -ge "${SHIM_PROC_EMERGENCY}" ] 2>/dev/null; then
+        trigger_repair "containerd-shim process pressure shim=${LAST_SHIM_PROCS}"
+        return 0
+    fi
+    if [ "${LAST_RUNC_PROCS}" -ge "${RUNC_PROC_EMERGENCY}" ] 2>/dev/null; then
+        trigger_repair "runc process pressure runc=${LAST_RUNC_PROCS}"
+        return 0
+    fi
+    if [ "${docker_related}" -ge "${DOCKER_PROC_EMERGENCY}" ] 2>/dev/null; then
+        trigger_repair "Docker-related process pressure docker_related=${docker_related}"
+        return 0
+    fi
+
+    if [ "${LAST_PIDS_PCT}" != "?" ] && [ "${LAST_PIDS_PCT}" -ge "${PIDS_WARN_PCT}" ] 2>/dev/null; then
+        proc_warn_log "WARN: pids ${LAST_PIDS_CUR}/${LAST_PIDS_MAX} (${LAST_PIDS_PCT}%) tasks=${LAST_PROC_TASKS} procs=${LAST_PROC_TOTAL} zombies=${LAST_ZOMBIES} shim=${LAST_SHIM_PROCS} runc=${LAST_RUNC_PROCS}"
+    elif [ "${LAST_ZOMBIES}" -ge "${ZOMBIE_WARN}" ] 2>/dev/null \
+       || [ "${LAST_SHIM_PROCS}" -ge "${SHIM_PROC_WARN}" ] 2>/dev/null \
+       || [ "${LAST_RUNC_PROCS}" -ge "${RUNC_PROC_WARN}" ] 2>/dev/null \
+       || [ "${docker_related}" -ge "${DOCKER_PROC_WARN}" ] 2>/dev/null; then
+        proc_warn_log "WARN: process pressure tasks=${LAST_PROC_TASKS} procs=${LAST_PROC_TOTAL} zombies=${LAST_ZOMBIES} docker_related=${docker_related} dockerd=${LAST_DOCKERD_PROCS} containerd=${LAST_CONTAINERD_PROCS} shim=${LAST_SHIM_PROCS} runc=${LAST_RUNC_PROCS} docker_cli=${LAST_DOCKER_CLI_PROCS}"
+    fi
+}
+
 monitor_pod_cgroup() {
     [ -z "$CGROUP_VERSION" ] && return 0
 
@@ -261,7 +489,10 @@ monitor_pod_cgroup() {
         if [ -n "$cur" ] && [ "$cur" -ge 0 ] 2>/dev/null; then
             local pct=$(( cur * 100 / CGROUP_PIDS_MAX_VAL ))
             if [ "$pct" -ge "$PIDS_EMERGENCY_PCT" ]; then
-                emergency_pressure_relief "PIDs ${cur}/${CGROUP_PIDS_MAX_VAL} (${pct}%)"
+                LAST_PIDS_CUR="$cur"
+                LAST_PIDS_MAX="$CGROUP_PIDS_MAX_VAL"
+                LAST_PIDS_PCT="$pct"
+                trigger_repair "cgroup PIDs ${cur}/${CGROUP_PIDS_MAX_VAL} (${pct}%)"
             elif [ "$pct" -ge "$PIDS_WARN_PCT" ]; then
                 log "WARN: PIDs ${cur}/${CGROUP_PIDS_MAX_VAL} (${pct}%) — aggressive cleanup"
                 timeout 20 docker container prune -f --filter "until=30s" >/dev/null 2>&1 || true
@@ -331,6 +562,31 @@ except Exception:
         timeout 30 docker network prune -f >/dev/null 2>&1 || true
     fi
     return 0
+}
+
+monitor_docker_cli() {
+    if docker_cli_alive; then
+        DOCKER_CLI_FAILS=0
+        LAST_DOCKER_CLI_STATUS="ok"
+        return 0
+    fi
+
+    DOCKER_CLI_FAILS=$((DOCKER_CLI_FAILS + 1))
+    LAST_DOCKER_CLI_STATUS="fail"
+    log "WARN: docker CLI probe timed out or failed (${DOCKER_CLI_FAILS}/${MAX_CONSECUTIVE_DOCKER_CLI_FAILS}, timeout=${DOCKER_CLI_TIMEOUT}s)"
+    if [ "${DOCKER_CLI_FAILS}" -ge "${MAX_CONSECUTIVE_DOCKER_CLI_FAILS}" ]; then
+        trigger_repair "docker CLI timeout/failure while dockerd ping may still be ambiguous"
+        DOCKER_CLI_FAILS=0
+    fi
+}
+
+monitor_proxy() {
+    if proxy_alive; then
+        LAST_PROXY_STATUS="ok"
+    else
+        LAST_PROXY_STATUS="fail"
+        log "WARN: proxy probe failed: ${PROXY_URL}"
+    fi
 }
 
 stop_pool_server_for_disk_pressure() {
@@ -536,6 +792,11 @@ restart_docker() {
         # shellcheck disable=SC1090
         set -a; . "${PROXY_ENV_FILE}"; set +a
         log "Loaded proxy env from ${PROXY_ENV_FILE} before dockerd restart"
+    else
+        export HTTP_PROXY="${PROXY_URL}" HTTPS_PROXY="${PROXY_URL}"
+        export http_proxy="${PROXY_URL}" https_proxy="${PROXY_URL}"
+        export NO_PROXY="${NO_PROXY_LIST}" no_proxy="${NO_PROXY_LIST}"
+        log "Proxy env file missing; exported PROXY_URL for dockerd restart: ${PROXY_URL}"
     fi
     nohup dockerd --containerd=/run/containerd/containerd.sock \
         > /tmp/dockerd_watchdog_restart.log 2>&1 &
@@ -563,16 +824,20 @@ restart_docker() {
 log "========================================"
 log "Starting docker_watchdog_v2 PID=$$"
 log "  MAX_RUNNING=${MAX_RUNNING_CONTAINERS}  HARD_KILL=${HARD_KILL_THRESHOLD}"
-log "  health every ${HEALTH_CHECK_INTERVAL}s; cgroup every ${CGROUP_MONITOR_INTERVAL}s"
+log "  health every ${HEALTH_CHECK_INTERVAL}s; cgroup every ${CGROUP_MONITOR_INTERVAL}s; proc every ${PROC_MONITOR_INTERVAL}s"
+log "  docker-cli every ${DOCKER_CLI_CHECK_INTERVAL}s timeout=${DOCKER_CLI_TIMEOUT}s fail_trigger=${MAX_CONSECUTIVE_DOCKER_CLI_FAILS}; proxy every ${PROXY_CHECK_INTERVAL}s"
 log "  pool every ${POOL_CHECK_INTERVAL}s; deep probe every ${DEEP_PROBE_INTERVAL}s"
 log "  heartbeat every ${HEARTBEAT_INTERVAL}s"
 log "  disk every ${DISK_CHECK_INTERVAL}s; warn=${DISK_WARN_PCT}% emerg=${DISK_EMERGENCY_PCT}% min_free=${DISK_MIN_FREE_GB}GB inode_warn=${DISK_INODE_WARN_PCT}% inode_emerg=${DISK_INODE_EMERGENCY_PCT}%"
 log "  pool_stop_on_disk_emergency=${POOL_STOP_ON_DISK_EMERGENCY}"
 log "  PIDs warn=${PIDS_WARN_PCT}% emerg=${PIDS_EMERGENCY_PCT}%"
+log "  proc warn: docker_related=${DOCKER_PROC_WARN} shim=${SHIM_PROC_WARN} runc=${RUNC_PROC_WARN} zombies=${ZOMBIE_WARN}"
+log "  proc emerg: docker_related=${DOCKER_PROC_EMERGENCY} shim=${SHIM_PROC_EMERGENCY} runc=${RUNC_PROC_EMERGENCY} zombies=${ZOMBIE_EMERGENCY}"
 log "  Mem  warn=${MEM_WARN_PCT}% emerg=${MEM_EMERGENCY_PCT}%"
 log "  pool=${POOL_HOST}:${POOL_PORT}  pool_server_regex=${POOL_SERVER_NAME_REGEX}"
 log "  task_container_regex=${TASK_CONTAINER_REGEX}"
-log "  docker_data_root=${DOCKER_DATA_ROOT}  proxy_env_file=${PROXY_ENV_FILE}"
+log "  docker_data_root=${DOCKER_DATA_ROOT}  proxy_url=${PROXY_URL}  proxy_env_file=${PROXY_ENV_FILE}"
+log "  auto_repair=${WATCHDOG_AUTO_REPAIR} repair_mode=${WATCHDOG_REPAIR_MODE} repair_cooldown=${REPAIR_COOLDOWN_S}s repair_lock=${REPAIR_LOCK_DIR}"
 log "  log_file=${LOG_FILE}  log_max=${LOG_MAX_BYTES}"
 
 detect_pid_namespace
@@ -583,16 +848,23 @@ if detect_cgroup; then
     [ -n "$CGROUP_PIDS_DIR" ] && log "    pids: ${CGROUP_PIDS_DIR}  (max=${CGROUP_PIDS_MAX_VAL})"
     [ -n "$CGROUP_MEM_DIR"  ] && log "    mem : ${CGROUP_MEM_DIR}  (max=${CGROUP_MEM_MAX_VAL})"
 else
-    log "  cgroup: <NOT DETECTED — pressure monitoring DISABLED>"
+    log "  cgroup: <NOT DETECTED — cgroup pressure disabled; /proc pressure still enabled>"
 fi
 log "========================================"
 
 LAST_CLEANUP=0
 LAST_CGROUP_CHECK=0
+LAST_PROC_CHECK=0
+LAST_DOCKER_CLI_CHECK=0
+LAST_PROXY_CHECK=0
 LAST_POOL_CHECK=0
 LAST_DISK_CHECK=0
 LAST_HEARTBEAT_TS=0
 HEALTH_FAILS=0
+DOCKER_CLI_FAILS=0
+DEEP_PROBE_FAILS=0
+LAST_DOCKER_CLI_STATUS="?"
+LAST_PROXY_STATUS="?"
 
 while true; do
     NOW=$(date +%s)
@@ -604,7 +876,7 @@ while true; do
         HEALTH_FAILS=$((HEALTH_FAILS + 1))
         log "Health check failed (${HEALTH_FAILS}/${MAX_CONSECUTIVE_HEALTH_FAILS})"
         if [ "${HEALTH_FAILS}" -ge "${MAX_CONSECUTIVE_HEALTH_FAILS}" ]; then
-            restart_docker
+            trigger_repair "dockerd unix-socket ping failed ${HEALTH_FAILS} consecutive times"
             HEALTH_FAILS=0
             sleep 10
             continue
@@ -617,41 +889,65 @@ while true; do
     if [ $((NOW - LAST_DEEP_PROBE_TS)) -ge "${DEEP_PROBE_INTERVAL}" ]; then
         if docker_deep_alive; then
             LAST_DEEP_PROBE_TS="$NOW"
+            DEEP_PROBE_FAILS=0
         else
-            log "WARN: deep probe failed (network create/rm) — likely address-pool exhausted"
+            DEEP_PROBE_FAILS=$((DEEP_PROBE_FAILS + 1))
+            log "WARN: deep probe failed (network create/rm, fails=${DEEP_PROBE_FAILS}) — likely address-pool exhausted or docker CLI/API wedged"
             timeout 30 docker network prune -f >/dev/null 2>&1 || true
+            if [ "${DEEP_PROBE_FAILS}" -ge 2 ]; then
+                trigger_repair "deep docker network probe failed ${DEEP_PROBE_FAILS} consecutive times"
+                DEEP_PROBE_FAILS=0
+            fi
             LAST_DEEP_PROBE_TS="$NOW"
         fi
     fi
 
-    # 3) cgroup 监控
+    # 3) /proc 进程压力监控：不依赖 docker CLI，尽量在 fork 失败前预警/修复
+    if [ $((NOW - LAST_PROC_CHECK)) -ge "${PROC_MONITOR_INTERVAL}" ]; then
+        monitor_proc_pressure
+        LAST_PROC_CHECK="$NOW"
+    fi
+
+    # 4) cgroup 监控
     if [ $((NOW - LAST_CGROUP_CHECK)) -ge "${CGROUP_MONITOR_INTERVAL}" ]; then
         monitor_pod_cgroup
         LAST_CGROUP_CHECK="$NOW"
     fi
 
-    # 4) pool_server 监控
+    # 5) Docker CLI 探针：dockerd _ping OK 但 CLI/daemon metadata 卡死时触发
+    if [ $((NOW - LAST_DOCKER_CLI_CHECK)) -ge "${DOCKER_CLI_CHECK_INTERVAL}" ]; then
+        monitor_docker_cli
+        LAST_DOCKER_CLI_CHECK="$NOW"
+    fi
+
+    # 6) proxy 低频探测：只告警，restart_docker 会显式带上 PROXY_URL
+    if [ $((NOW - LAST_PROXY_CHECK)) -ge "${PROXY_CHECK_INTERVAL}" ]; then
+        monitor_proxy
+        LAST_PROXY_CHECK="$NOW"
+    fi
+
+    # 7) pool_server 监控
     if [ $((NOW - LAST_POOL_CHECK)) -ge "${POOL_CHECK_INTERVAL}" ]; then
         check_pool_server || true
         LAST_POOL_CHECK="$NOW"
     fi
 
-    # 5) 容器清理 + 上限
+    # 8) 容器清理 + 上限
     if [ $((NOW - LAST_CLEANUP)) -ge "${CLEANUP_INTERVAL}" ]; then
         cleanup_stopped
         enforce_container_limit
         LAST_CLEANUP="$NOW"
     fi
 
-    # 6) Docker data-root 磁盘压力监控
+    # 9) Docker data-root 磁盘压力监控
     if [ $((NOW - LAST_DISK_CHECK)) -ge "${DISK_CHECK_INTERVAL}" ]; then
         monitor_docker_disk
         LAST_DISK_CHECK="$NOW"
     fi
 
-    # 7) 低频心跳（默认 10 min）—— 复用上面已采集的指标，不发起新的 docker / curl
+    # 10) 低频心跳（默认 10 min）—— 复用上面已采集的指标，不发起新的 docker / curl
     if [ $((NOW - LAST_HEARTBEAT_TS)) -ge "${HEARTBEAT_INTERVAL}" ]; then
-        log "OK: dockerd alive | pool active=${LAST_POOL_ACTIVE} pending_closes=${LAST_POOL_PENDING} | bridges=${LAST_BRIDGE_NETS} | task_containers=${LAST_RUNNING_TASKS}"
+        log "OK: dockerd alive | docker_cli=${LAST_DOCKER_CLI_STATUS} proxy=${LAST_PROXY_STATUS} | pids=${LAST_PIDS_CUR:-?}/${LAST_PIDS_MAX:-?} (${LAST_PIDS_PCT:-?}%) tasks=${LAST_PROC_TASKS:-?} zombies=${LAST_ZOMBIES:-?} shim=${LAST_SHIM_PROCS:-?} runc=${LAST_RUNC_PROCS:-?} | pool active=${LAST_POOL_ACTIVE} pending_closes=${LAST_POOL_PENDING} | bridges=${LAST_BRIDGE_NETS} | task_containers=${LAST_RUNNING_TASKS}"
         LAST_HEARTBEAT_TS="$NOW"
     fi
 
