@@ -19,6 +19,10 @@
 #   bash terminal-rl/terminal-rl_qwen3-8b_pu.sh                    # full run
 #   DEBUG_MODE=1 bash terminal-rl/terminal-rl_qwen3-8b_pu.sh       # tiny rollout
 #   NUM_GPUS=4 ACTOR_GPUS=2 ROLLOUT_GPUS=2 bash ... _pu.sh         # override
+#
+# Structured reward observability:
+#   TERMINAL_STRUCTURED_METRICS=1 writes per-rollout dataset reward breakdowns
+#   to logs and to ${RUN_DIR}/logs/metrics.jsonl.
 
 set -euo pipefail
 set -x
@@ -250,6 +254,9 @@ MAX_CKPT_KEEP="${MAX_CKPT_KEEP}" python3 "${SCRIPT_DIR}/run_paths.py" init \
 RUN_LOG_DIR="${RUN_DIR}/logs"
 TERMINAL_SAVE_TRAJ_DIR="${RUN_DIR}/trajectories"
 WANDB_DIR="${RUN_DIR}/metrics/wandb"
+TERMINAL_STRUCTURED_METRICS="${TERMINAL_STRUCTURED_METRICS:-1}"
+TERMINAL_METRICS_JSONL="${TERMINAL_METRICS_JSONL:-${RUN_LOG_DIR}/metrics.jsonl}"
+export TERMINAL_STRUCTURED_METRICS TERMINAL_METRICS_JSONL
 
 # ── Rollout knobs (env-configurable, baked into per-run yaml below) ──────
 # MAX_TURN: max model turns per rollout (terminal_max_iterations in generate.py).
@@ -350,6 +357,7 @@ exec > >(tee -a "${RUN_LOG}" "${GPU_RUN_LOG}") 2>&1
 echo "========================================"
 echo "  Terminal-RL Run: ${RUN_NAME}"
 echo "  Log dir:  ${RUN_LOG_DIR}"
+echo "  Metrics:  ${TERMINAL_METRICS_JSONL} (structured=${TERMINAL_STRUCTURED_METRICS})"
 echo "  Ckpt:     ${SAVE_CKPT:-<disabled>}"
 echo "  HF_CKPT:  ${HF_CKPT}"
 echo "  REF_LOAD: ${REF_LOAD}"
@@ -572,7 +580,7 @@ fi
 
 # ── Router / worker URLs ─────────────────────────────────────────────
 WORKER_URLS="${WORKER_URLS:-}"
-if [[ "${NEEDS_ENV_ROUTER}" == "1" && -z "${WORKER_URLS}" ]]; then
+if [[ "${DRY_RUN}" != "1" && "${NEEDS_ENV_ROUTER}" == "1" && -z "${WORKER_URLS}" ]]; then
   echo "[ERROR] WORKER_URLS is unset. Example:"
   echo "        export WORKER_URLS=http://<worker-ip>:18081"
   exit 1
@@ -847,6 +855,7 @@ MISC_ARGS=(
 CUSTOM_ARGS=(
   --custom-generate-function-path generate.generate
   --custom-rollout-log-function-path rollout_log.rollout_log
+  --custom-eval-rollout-log-function-path rollout_log.eval_rollout_log
 )
 if [[ "${EXPLORE_ADVANTAGE_BONUS_ENABLED}" == "1" ]]; then
   CUSTOM_ARGS+=(--custom-reward-post-process-path reward_postprocess.post_process_rewards)
@@ -1087,6 +1096,8 @@ cat > "${RUN_DIR}/config/run_config.json" <<CFGEOF
   "clawsentry_llm_provider": "${CS_LLM_PROVIDER}",
   "clawsentry_l3_enabled": "${CS_L3_ENABLED}",
   "clawsentry_evolving_enabled": "${CS_EVOLVING_ENABLED}",
+  "terminal_structured_metrics": "${TERMINAL_STRUCTURED_METRICS}",
+  "terminal_metrics_jsonl": "${TERMINAL_METRICS_JSONL}",
   "log_dir": "${RUN_LOG_DIR}"
 }
 CFGEOF
@@ -1145,6 +1156,11 @@ RUNTIME_ENV_JSON="{
     \"TERMINAL_SAVE_TRAJ_DIR\": \"${TERMINAL_SAVE_TRAJ_DIR}\",
     \"TRAJECTORY_SAVE_INTERVAL\": \"${TRAJECTORY_SAVE_INTERVAL}\",
     \"RUN_DIR\": \"${RUN_DIR}\",
+    \"RUN_ID\": \"${RUN_ID}\",
+    \"RUN_NAME\": \"${RUN_NAME}\",
+    \"RUN_LOG_DIR\": \"${RUN_LOG_DIR}\",
+    \"TERMINAL_STRUCTURED_METRICS\": \"${TERMINAL_STRUCTURED_METRICS}\",
+    \"TERMINAL_METRICS_JSONL\": \"${TERMINAL_METRICS_JSONL}\",
     \"DATASET\": \"${DATASET}\",
     \"ALGO\": \"${ALGO}\",
     \"DAPO_OVERLONG_BUFFER_ENABLE\": \"${DAPO_OVERLONG_BUFFER_ENABLE}\",
