@@ -28,6 +28,8 @@
 #   WORKER_MIN_DOCKER_FREE_GB   (default 50) — refuse start/admission below this
 #   WORKER_MAX_DOCKER_USED_PCT  (default 85) — refuse start/admission above this
 #   WORKER_MAX_DOCKER_INODE_PCT (default 80) — refuse start/admission above this
+#   WORKER_MAX_CONCURRENT_BUILDS (default 4) — cap concurrent docker compose builds
+#   WORKER_PRESSURE_GUARD_ENABLED (default 1) — pids/shim/docker-cli admission guard
 #
 # Logs written:
 #   tmp_doc_latest/cpu_pool.log   — full stdout/stderr
@@ -60,13 +62,26 @@ WORKER_MIN_DOCKER_FREE_GB="${WORKER_MIN_DOCKER_FREE_GB:-50}"
 WORKER_MAX_DOCKER_USED_PCT="${WORKER_MAX_DOCKER_USED_PCT:-85}"
 WORKER_MAX_DOCKER_INODE_PCT="${WORKER_MAX_DOCKER_INODE_PCT:-80}"
 PREFLIGHT_DISK_CLEANUP="${PREFLIGHT_DISK_CLEANUP:-1}"
+WORKER_MAX_CONCURRENT_BUILDS="${WORKER_MAX_CONCURRENT_BUILDS:-4}"
+WORKER_PRESSURE_GUARD_ENABLED="${WORKER_PRESSURE_GUARD_ENABLED:-1}"
+WORKER_PIDS_PAUSE_ALLOCATE_PCT="${WORKER_PIDS_PAUSE_ALLOCATE_PCT:-75}"
+WORKER_PIDS_REJECT_RESET_PCT="${WORKER_PIDS_REJECT_RESET_PCT:-85}"
+WORKER_SHIM_PAUSE_ALLOCATE="${WORKER_SHIM_PAUSE_ALLOCATE:-256}"
+WORKER_SHIM_REJECT_RESET="${WORKER_SHIM_REJECT_RESET:-384}"
+WORKER_PENDING_CLOSES_PAUSE_ALLOCATE="${WORKER_PENDING_CLOSES_PAUSE_ALLOCATE:-50}"
+WORKER_PENDING_CLOSES_REJECT_RESET="${WORKER_PENDING_CLOSES_REJECT_RESET:-100}"
+WORKER_DOCKER_CLI_TIMEOUT="${WORKER_DOCKER_CLI_TIMEOUT:-3}"
+WORKER_PRESSURE_CACHE_TTL="${WORKER_PRESSURE_CACHE_TTL:-5}"
 
 log "=== pool_server_pu_v2 starting ==="
 log "  max_tasks=${WORKER_MAX_TASKS}  max_runs_per_task=${WORKER_MAX_RUNS_PER_TASK}"
 log "  max_concurrent_closes=${WORKER_MAX_CONCURRENT_CLOSES}"
+log "  max_concurrent_builds=${WORKER_MAX_CONCURRENT_BUILDS}"
 log "  port=${ENV_SERVER_PORT}  skip_cleanup=${SKIP_PREFLIGHT_CLEANUP}"
 log "  total_capacity=$((WORKER_MAX_TASKS * WORKER_MAX_RUNS_PER_TASK)) slots"
 log "  docker_data_root=${DOCKER_DATA_ROOT} disk_guard=${WORKER_DISK_GUARD_ENABLED}"
+log "  pressure_guard=${WORKER_PRESSURE_GUARD_ENABLED} pids_pause=${WORKER_PIDS_PAUSE_ALLOCATE_PCT}% pids_reset=${WORKER_PIDS_REJECT_RESET_PCT}%"
+log "  pressure_guard shim_pause=${WORKER_SHIM_PAUSE_ALLOCATE} shim_reset=${WORKER_SHIM_REJECT_RESET} pending_pause=${WORKER_PENDING_CLOSES_PAUSE_ALLOCATE} pending_reset=${WORKER_PENDING_CLOSES_REJECT_RESET}"
 
 if [[ "${SKIP_PROXY_ENV}" != "1" && -f "${PROXY_ENV_FILE}" ]]; then
     # shellcheck disable=SC1090
@@ -296,6 +311,8 @@ echo "  max_tasks:             ${WORKER_MAX_TASKS}"
 echo "  max_runs_per_task:     ${WORKER_MAX_RUNS_PER_TASK}"
 echo "  total_capacity:        $((WORKER_MAX_TASKS * WORKER_MAX_RUNS_PER_TASK)) leases"
 echo "  max_concurrent_closes: ${WORKER_MAX_CONCURRENT_CLOSES}"
+echo "  max_concurrent_builds: ${WORKER_MAX_CONCURRENT_BUILDS}"
+echo "  pressure_guard:        ${WORKER_PRESSURE_GUARD_ENABLED}"
 echo "  port:                  ${ENV_SERVER_PORT}"
 echo "  log:                   ${CPU_POOL_LOG}"
 echo "  nofile soft:           $(ulimit -Sn)"
@@ -317,6 +334,16 @@ export WORKER_DISK_GUARD_ENABLED
 export WORKER_MIN_DOCKER_FREE_GB
 export WORKER_MAX_DOCKER_USED_PCT
 export WORKER_MAX_DOCKER_INODE_PCT
+export WORKER_MAX_CONCURRENT_BUILDS
+export WORKER_PRESSURE_GUARD_ENABLED
+export WORKER_PIDS_PAUSE_ALLOCATE_PCT
+export WORKER_PIDS_REJECT_RESET_PCT
+export WORKER_SHIM_PAUSE_ALLOCATE
+export WORKER_SHIM_REJECT_RESET
+export WORKER_PENDING_CLOSES_PAUSE_ALLOCATE
+export WORKER_PENDING_CLOSES_REJECT_RESET
+export WORKER_DOCKER_CLI_TIMEOUT
+export WORKER_PRESSURE_CACHE_TTL
 
 if [ -d "${REPO_ROOT}/.venv" ]; then
     source .venv/bin/activate

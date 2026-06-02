@@ -39,10 +39,12 @@ DEEP_PROBE_INTERVAL="${DEEP_PROBE_INTERVAL:-300}"
 PIDS_WARN_PCT="${PIDS_WARN_PCT:-75}"
 PIDS_EMERGENCY_PCT="${PIDS_EMERGENCY_PCT:-90}"
 PROC_WARN_COOLDOWN_S="${PROC_WARN_COOLDOWN_S:-60}"
+PIDS_RELIEF_COOLDOWN_S="${PIDS_RELIEF_COOLDOWN_S:-30}"
 DOCKER_PROC_WARN="${DOCKER_PROC_WARN:-512}"
 DOCKER_PROC_EMERGENCY="${DOCKER_PROC_EMERGENCY:-900}"
 SHIM_PROC_WARN="${SHIM_PROC_WARN:-256}"
 SHIM_PROC_EMERGENCY="${SHIM_PROC_EMERGENCY:-512}"
+DOCKER_DOWN_SHIM_RELIEF="${DOCKER_DOWN_SHIM_RELIEF:-128}"
 RUNC_PROC_WARN="${RUNC_PROC_WARN:-50}"
 RUNC_PROC_EMERGENCY="${RUNC_PROC_EMERGENCY:-150}"
 ZOMBIE_WARN="${ZOMBIE_WARN:-50}"
@@ -63,6 +65,7 @@ FIX_SCRIPT="${FIX_SCRIPT:-$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &>/dev/nul
 WATCHDOG_AUTO_REPAIR="${WATCHDOG_AUTO_REPAIR:-1}"
 WATCHDOG_REPAIR_MODE="${WATCHDOG_REPAIR_MODE:-restart}"  # restart | full-fix
 WATCHDOG_FULL_FIX_ALLOW_SELF_STOP="${WATCHDOG_FULL_FIX_ALLOW_SELF_STOP:-0}"
+WATCHDOG_KILL_SHIMS_ON_DOCKER_DOWN="${WATCHDOG_KILL_SHIMS_ON_DOCKER_DOWN:-1}"
 REPAIR_LOCK_DIR="${REPAIR_LOCK_DIR:-/run/docker_watchdog_repair.lock}"
 REPAIR_COOLDOWN_S="${REPAIR_COOLDOWN_S:-300}"
 
@@ -72,7 +75,8 @@ POOL_PENDING_CLOSES_WARN="${POOL_PENDING_CLOSES_WARN:-50}"
 BRIDGE_NETS_WARN="${BRIDGE_NETS_WARN:-200}"
 EMERGENCY_COOLDOWN_S="${EMERGENCY_COOLDOWN_S:-60}"
 POOL_SERVER_NAME_REGEX="${POOL_SERVER_NAME_REGEX:-openclaw_pool_server}"
-TASK_CONTAINER_REGEX="${TASK_CONTAINER_REGEX:-^[0-9]+-.*[-_](client|helper)([-_][0-9]+)?$}"
+TASK_CONTAINER_REGEX="${TASK_CONTAINER_REGEX:-^[0-9]+-.*([-_](client|helper)([-_][0-9]+)?|-slime-run)$}"
+TASK_IMAGE_REGEX="${TASK_IMAGE_REGEX:-^tb__[0-9]+__(client|helper)(:|$)}"
 HEARTBEAT_INTERVAL="${HEARTBEAT_INTERVAL:-600}"  # "I'm alive" line every 10 min
 
 DISK_CHECK_INTERVAL="${DISK_CHECK_INTERVAL:-60}"
@@ -100,6 +104,7 @@ LAST_DISK_PRUNE_TS=0
 LAST_POOL_STOP_TS=0
 LAST_REPAIR_TS=0
 LAST_PROC_WARN_TS=0
+LAST_PIDS_RELIEF_TS=0
 
 # ── namespace 检测 ────────────────────────────────────────────────────
 HOST_PID_NS=0
@@ -121,6 +126,7 @@ rotate_log_if_big() {
     [ -f "${LOG_FILE}" ] || return 0
     local sz
     sz=$(stat -c%s "${LOG_FILE}" 2>/dev/null || echo 0)
+    [ -n "${sz}" ] && [ "${sz}" -ge 0 ] 2>/dev/null || sz=0
     [ "${sz}" -gt "${LOG_MAX_BYTES}" ] || return 0
     local tail_bytes=52428800   # 保留尾部 50 MB
     local tmp
@@ -211,6 +217,7 @@ run_full_fix_script() {
 
 trigger_repair() {
     local reason="$1"
+    local force="${2:-0}"
     local now
     now=$(date +%s)
     if [ "${WATCHDOG_AUTO_REPAIR}" != "1" ]; then
@@ -218,7 +225,7 @@ trigger_repair() {
         repair_snapshot
         return 0
     fi
-    if [ $((now - LAST_REPAIR_TS)) -lt "${REPAIR_COOLDOWN_S}" ]; then
+    if [ "${force}" != "1" ] && [ $((now - LAST_REPAIR_TS)) -lt "${REPAIR_COOLDOWN_S}" ]; then
         log "REPAIR suppressed (cooldown ${REPAIR_COOLDOWN_S}s active): ${reason}"
         repair_snapshot
         return 0
@@ -228,7 +235,7 @@ trigger_repair() {
     fi
 
     LAST_REPAIR_TS="$now"
-    log "REPAIR trigger: ${reason}"
+    log "REPAIR trigger: ${reason}$([ "${force}" = "1" ] && echo " (forced)" || true)"
     repair_snapshot
     case "${WATCHDOG_REPAIR_MODE}" in
         full-fix)
@@ -239,6 +246,80 @@ trigger_repair() {
             ;;
     esac
     release_repair_lock
+}
+
+task_container_lines() {
+    timeout "${DOCKER_CLI_TIMEOUT}" docker ps --format '{{.ID}}\t{{.Names}}\t{{.Image}}' 2>/dev/null \
+        | awk -F '\t' -v name_re="${TASK_CONTAINER_REGEX}" -v image_re="${TASK_IMAGE_REGEX}" '
+            $2 ~ name_re || $3 ~ image_re {print $0}
+        '
+}
+
+task_container_ids() {
+    task_container_lines | awk -F '\t' '{print $1}'
+}
+
+task_container_count() {
+    task_container_lines | wc -l
+}
+
+stop_pool_server_for_pressure() {
+    local reason="$1"
+    local proc_dir pid cmdline killed=0
+
+    for proc_dir in /proc/[0-9]*; do
+        [ -r "${proc_dir}/cmdline" ] || continue
+        pid="${proc_dir##*/}"
+        cmdline="$(< "${proc_dir}/cmdline")"
+        case "${cmdline}" in
+            *terminal-rl.remote.pool_server*|*remote.pool_server*|*pool_server.py*|*run_pool_server_pu_v2.sh*)
+                log "PRESSURE: stopping pool_server pid=${pid} reason=${reason}"
+                kill "${pid}" 2>/dev/null || true
+                killed=$((killed + 1))
+                ;;
+        esac
+    done
+
+    if [ "${killed}" -eq 0 ]; then
+        log "PRESSURE: no pool_server process matched for stop (reason=${reason})"
+    fi
+}
+
+kill_task_containers_for_pressure() {
+    local reason="$1"
+    local limit="${2:-0}"
+    local ids n
+
+    if [ "${limit}" -gt 0 ] 2>/dev/null; then
+        ids="$(task_container_ids | head -n "${limit}" 2>/dev/null || true)"
+    else
+        ids="$(task_container_ids 2>/dev/null || true)"
+    fi
+    if [ -z "${ids}" ]; then
+        log "PRESSURE: no task containers matched for kill (reason=${reason}, name_re=${TASK_CONTAINER_REGEX}, image_re=${TASK_IMAGE_REGEX})"
+        return 1
+    fi
+
+    n="$(printf '%s\n' "${ids}" | wc -l)"
+    log "PRESSURE: killing ${n} task containers (reason=${reason})"
+    printf '%s\n' "${ids}" | xargs -r -n 10 timeout 30 docker kill >/dev/null 2>&1 || true
+    return 0
+}
+
+pids_pressure_relief() {
+    local reason="$1"
+    local now
+    now=$(date +%s)
+    if [ $((now - LAST_PIDS_RELIEF_TS)) -lt "${PIDS_RELIEF_COOLDOWN_S}" ]; then
+        log "PRESSURE suppressed (cooldown ${PIDS_RELIEF_COOLDOWN_S}s active): ${reason}"
+        return 0
+    fi
+    LAST_PIDS_RELIEF_TS="$now"
+
+    log "PRESSURE: pids emergency relief: ${reason}"
+    repair_snapshot
+    stop_pool_server_for_pressure "${reason}"
+    kill_task_containers_for_pressure "${reason}" 0 || true
 }
 
 # ── 紧急泄压（带冷却 + foreground + timeout）─────────────────────────
@@ -253,21 +334,7 @@ emergency_pressure_relief() {
     LAST_EMERGENCY_TS="$now"
     log "EMERGENCY: ${reason} — kill task containers + prune"
 
-    # 杀最旧的 30 个 task 容器（按 pattern，绝不动 pool_server）
-    local victims
-    victims=$(docker ps --format '{{.ID}} {{.Names}}' 2>/dev/null \
-        | grep -vE "${POOL_SERVER_NAME_REGEX}" \
-        | grep -E "${TASK_CONTAINER_REGEX}" \
-        | tail -n 30 \
-        | awk '{print $1}')
-    if [ -n "${victims}" ]; then
-        local n
-        n=$(echo "${victims}" | wc -l)
-        echo "${victims}" | xargs -r -n 10 timeout 30 docker kill >/dev/null 2>&1 || true
-        log "EMERGENCY: killed ~${n} task containers"
-    else
-        log "EMERGENCY: no task containers matched pattern (regex=${TASK_CONTAINER_REGEX})"
-    fi
+    kill_task_containers_for_pressure "${reason}" 30 || true
 
     # 清理 stopped + dangling network（foreground，防并发拖死 dockerd）
     timeout 30 docker container prune -f >/dev/null 2>&1 || true
@@ -450,6 +517,7 @@ monitor_proc_pressure() {
     docker_related=$((LAST_DOCKERD_PROCS + LAST_CONTAINERD_PROCS + LAST_SHIM_PROCS + LAST_RUNC_PROCS + LAST_DOCKER_CLI_PROCS))
 
     if [ "${LAST_PIDS_PCT}" != "?" ] && [ "${LAST_PIDS_PCT}" -ge "${PIDS_EMERGENCY_PCT}" ] 2>/dev/null; then
+        pids_pressure_relief "pids pressure ${LAST_PIDS_CUR}/${LAST_PIDS_MAX} (${LAST_PIDS_PCT}%) before fork failure"
         trigger_repair "pids pressure ${LAST_PIDS_CUR}/${LAST_PIDS_MAX} (${LAST_PIDS_PCT}%) before fork failure"
         return 0
     fi
@@ -492,6 +560,7 @@ monitor_pod_cgroup() {
                 LAST_PIDS_CUR="$cur"
                 LAST_PIDS_MAX="$CGROUP_PIDS_MAX_VAL"
                 LAST_PIDS_PCT="$pct"
+                pids_pressure_relief "cgroup PIDs ${cur}/${CGROUP_PIDS_MAX_VAL} (${pct}%)"
                 trigger_repair "cgroup PIDs ${cur}/${CGROUP_PIDS_MAX_VAL} (${pct}%)"
             elif [ "$pct" -ge "$PIDS_WARN_PCT" ]; then
                 log "WARN: PIDs ${cur}/${CGROUP_PIDS_MAX_VAL} (${pct}%) — aggressive cleanup"
@@ -721,61 +790,73 @@ monitor_docker_disk() {
 # 副作用：更新 LAST_RUNNING_TASKS 供 heartbeat 复用
 LAST_RUNNING_TASKS="?"
 enforce_container_limit() {
-    local running victims
+    local running
     # 只统计 task 容器（带数字前缀 + client/helper 后缀），不算 pool_server 等基础容器
-    running=$(docker ps --format '{{.Names}}' 2>/dev/null \
-        | grep -cE "${TASK_CONTAINER_REGEX}" || true)
+    running=$(task_container_count 2>/dev/null || echo 0)
     LAST_RUNNING_TASKS="$running"
 
     if [ "${running}" -gt "${HARD_KILL_THRESHOLD}" ]; then
         local excess=$((running - MAX_RUNNING_CONTAINERS))
         log "HARD LIMIT: ${running} task containers > ${HARD_KILL_THRESHOLD}, killing ${excess} oldest"
-        victims=$(docker ps --format '{{.ID}} {{.Names}}' 2>/dev/null \
-            | grep -vE "${POOL_SERVER_NAME_REGEX}" \
-            | grep -E "${TASK_CONTAINER_REGEX}" \
-            | tail -n "${excess}" \
-            | awk '{print $1}')
-        [ -n "$victims" ] && echo "$victims" | xargs -r -n 10 timeout 30 docker kill >/dev/null 2>&1 || true
+        kill_task_containers_for_pressure "hard task container limit ${running}>${HARD_KILL_THRESHOLD}" "${excess}" || true
         return
     fi
 
     if [ "${running}" -gt "${MAX_RUNNING_CONTAINERS}" ]; then
         local excess=$((running - MAX_RUNNING_CONTAINERS))
         log "Soft limit: ${running} task containers > ${MAX_RUNNING_CONTAINERS}, killing ${excess} oldest"
-        victims=$(docker ps --format '{{.ID}} {{.Names}}' 2>/dev/null \
-            | grep -vE "${POOL_SERVER_NAME_REGEX}" \
-            | grep -E "${TASK_CONTAINER_REGEX}" \
-            | tail -n "${excess}" \
-            | awk '{print $1}')
-        [ -n "$victims" ] && echo "$victims" | xargs -r -n 10 timeout 30 docker kill >/dev/null 2>&1 || true
+        kill_task_containers_for_pressure "soft task container limit ${running}>${MAX_RUNNING_CONTAINERS}" "${excess}" || true
     fi
 }
 
 # ── dockerd 重启（绕过 systemctl restart，沿用 restart_docker_force.sh 模式）──
 restart_docker() {
     log "Docker daemon is DOWN. Attempting forced restart (no systemctl restart)..."
+    collect_proc_metrics
+    repair_snapshot
+
+    if [ "${LAST_SHIM_PROCS:-0}" -ge "${DOCKER_DOWN_SHIM_RELIEF}" ] 2>/dev/null; then
+        log "Docker is down with ${LAST_SHIM_PROCS} containerd-shim processes (threshold=${DOCKER_DOWN_SHIM_RELIEF}); stopping pool_server before restart"
+        stop_pool_server_for_pressure "dockerd down with shim pressure"
+    fi
 
     # 1) 阻断 systemd auto-restart：reset-failed + stop docker.socket
     timeout 5 systemctl reset-failed docker.service docker.socket 2>/dev/null || true
     timeout 5 systemctl stop docker.socket 2>/dev/null || true
 
-    # 2) pkill -9
+    # 2) pkill -9 dockerd; optionally clear shim processes once Docker is confirmed down.
     pkill -9 -x dockerd 2>/dev/null || true
     sleep 2
     if pgrep -x dockerd >/dev/null 2>&1; then
         log "WARN: dockerd still alive after SIGKILL (D state?), aborting state cleanup"
         return 1
     fi
+
+    if [ "${WATCHDOG_KILL_SHIMS_ON_DOCKER_DOWN}" = "1" ] \
+       && [ "${LAST_SHIM_PROCS:-0}" -ge "${DOCKER_DOWN_SHIM_RELIEF}" ] 2>/dev/null; then
+        local shim_pids shim_n
+        shim_pids="$(pgrep -f containerd-shim 2>/dev/null || true)"
+        if [ -n "${shim_pids}" ]; then
+            shim_n="$(printf '%s\n' "${shim_pids}" | wc -l)"
+            log "Killing ${shim_n} containerd-shim processes because dockerd is down and shim pressure is high"
+            printf '%s\n' "${shim_pids}" | xargs -r kill -9 2>/dev/null || true
+            sleep 1
+        fi
+    fi
+
     rm -f /var/run/docker.pid "${DOCKER_SOCK}"
 
-    # 3) 谨慎清理 container state — 仅在 host pid namespace 下且没有 shim 残留时才清
+    # 3) 清理 container state。正常情况下仅在 no-shim 时清；Docker 已 down 且 shim 压力高时，
+    #    这些 state 已无法安全恢复，清理后让 dockerd 干净启动。
     if [ "$HOST_PID_NS" = "1" ]; then
-        if ! pgrep -f containerd-shim >/dev/null 2>&1; then
+        if ! pgrep -f containerd-shim >/dev/null 2>&1 \
+           || { [ "${WATCHDOG_KILL_SHIMS_ON_DOCKER_DOWN}" = "1" ] \
+                && [ "${LAST_SHIM_PROCS:-0}" -ge "${DOCKER_DOWN_SHIM_RELIEF}" ] 2>/dev/null; }; then
             if [ -d "${DOCKER_DATA_ROOT}/containers" ]; then
                 local n
                 n=$(find "${DOCKER_DATA_ROOT}/containers" -maxdepth 1 -mindepth 1 2>/dev/null | wc -l)
                 if [ "${n}" -gt 0 ]; then
-                    log "Clearing ${n} stale container states (host ns + no shim alive)"
+                    log "Clearing ${n} stale container states before dockerd restart"
                     rm -rf "${DOCKER_DATA_ROOT}/containers"/* 2>/dev/null || true
                 fi
             fi
@@ -833,9 +914,11 @@ log "  pool_stop_on_disk_emergency=${POOL_STOP_ON_DISK_EMERGENCY}"
 log "  PIDs warn=${PIDS_WARN_PCT}% emerg=${PIDS_EMERGENCY_PCT}%"
 log "  proc warn: docker_related=${DOCKER_PROC_WARN} shim=${SHIM_PROC_WARN} runc=${RUNC_PROC_WARN} zombies=${ZOMBIE_WARN}"
 log "  proc emerg: docker_related=${DOCKER_PROC_EMERGENCY} shim=${SHIM_PROC_EMERGENCY} runc=${RUNC_PROC_EMERGENCY} zombies=${ZOMBIE_EMERGENCY}"
+log "  docker_down_shim_relief=${DOCKER_DOWN_SHIM_RELIEF} kill_shims_on_docker_down=${WATCHDOG_KILL_SHIMS_ON_DOCKER_DOWN}"
 log "  Mem  warn=${MEM_WARN_PCT}% emerg=${MEM_EMERGENCY_PCT}%"
 log "  pool=${POOL_HOST}:${POOL_PORT}  pool_server_regex=${POOL_SERVER_NAME_REGEX}"
 log "  task_container_regex=${TASK_CONTAINER_REGEX}"
+log "  task_image_regex=${TASK_IMAGE_REGEX}"
 log "  docker_data_root=${DOCKER_DATA_ROOT}  proxy_url=${PROXY_URL}  proxy_env_file=${PROXY_ENV_FILE}"
 log "  auto_repair=${WATCHDOG_AUTO_REPAIR} repair_mode=${WATCHDOG_REPAIR_MODE} repair_cooldown=${REPAIR_COOLDOWN_S}s repair_lock=${REPAIR_LOCK_DIR}"
 log "  log_file=${LOG_FILE}  log_max=${LOG_MAX_BYTES}"
@@ -876,7 +959,7 @@ while true; do
         HEALTH_FAILS=$((HEALTH_FAILS + 1))
         log "Health check failed (${HEALTH_FAILS}/${MAX_CONSECUTIVE_HEALTH_FAILS})"
         if [ "${HEALTH_FAILS}" -ge "${MAX_CONSECUTIVE_HEALTH_FAILS}" ]; then
-            trigger_repair "dockerd unix-socket ping failed ${HEALTH_FAILS} consecutive times"
+            trigger_repair "dockerd unix-socket ping failed ${HEALTH_FAILS} consecutive times" 1
             HEALTH_FAILS=0
             sleep 10
             continue

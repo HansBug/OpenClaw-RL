@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 import shutil
 import subprocess
+import threading
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal
@@ -17,6 +19,27 @@ from terminal_bench.terminal.terminal import Terminal
 class ImagePreparationResult:
     mode: Literal["build", "pull"]
     client_image_name: str | None = None
+
+
+def _env_int(name: str, default: int) -> int:
+    raw = os.getenv(name)
+    if raw is None or raw == "":
+        return default
+    try:
+        value = int(raw)
+    except ValueError:
+        return default
+    return value if value > 0 else default
+
+
+_MAX_CONCURRENT_BUILDS = _env_int("WORKER_MAX_CONCURRENT_BUILDS", 4)
+_BUILD_SEMAPHORE = threading.BoundedSemaphore(_MAX_CONCURRENT_BUILDS)
+
+
+def _safe_project_component(value: str, fallback: str = "task") -> str:
+    cleaned = re.sub(r"[^A-Za-z0-9_.-]+", "-", value.strip())
+    cleaned = cleaned.strip("-.")
+    return (cleaned or fallback)[:80]
 
 
 def _shorten_output(text: str | None, max_chars: int = 4000) -> str:
@@ -109,8 +132,9 @@ def build_docker_image(task: dict[str, Any], timeout: float = 1200.0) -> None:
         raise ValueError("DATASET_DIR is required")
 
     task_path = Path(dataset_dir) / str(task.get("task_path", ""))
+    task_name = _safe_project_component(str(task.get("task_name") or task_path.name))
     trial_handler = TrialHandler(
-        trial_name="build_run",
+        trial_name=f"build_run_{task_name}",
         input_path=task_path,
         output_path=Path("build_outputs"),
     )
@@ -125,11 +149,12 @@ def build_docker_image(task: dict[str, Any], timeout: float = 1200.0) -> None:
         sessions_logs_path=trial_handler.trial_paths.sessions_path,
         agent_logs_path=trial_handler.trial_paths.agent_logging_dir,
     )
-    import inspect
-    if "timeout" in inspect.signature(compose_manager.build).parameters:
-        compose_manager.build(timeout=timeout)
-    else:
-        compose_manager.build()
+    with _BUILD_SEMAPHORE:
+        import inspect
+        if "timeout" in inspect.signature(compose_manager.build).parameters:
+            compose_manager.build(timeout=timeout)
+        else:
+            compose_manager.build()
 
 
 def _resolve_pull_image(task: dict[str, Any]) -> str:

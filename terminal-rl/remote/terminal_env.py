@@ -85,6 +85,7 @@ class TerminalEnv:
         self._tools: dict[str, Any] = {}
         self._agent_safetybench_env: AgentSafetyBenchEnv | None = None
         self._agentharm_env: AgentHarmEnv | None = None
+        self._eval_attempt = 0
 
     async def reset(
         self,
@@ -100,6 +101,7 @@ class TerminalEnv:
         self._task_spec = task_spec
         self._run_ctx = run_ctx
         self._timeouts = timeouts
+        self._eval_attempt = 0
 
         if task_meta.get("data_source") == "agent_safetybench":
             self._agent_safetybench_env = AgentSafetyBenchEnv()
@@ -261,8 +263,10 @@ class TerminalEnv:
                 container_dir=str(DockerComposeManager.CONTAINER_TEST_DIR),
             )
 
+            self._eval_attempt += 1
+            run_uid = self._run_ctx.uid if self._run_ctx is not None else "unknown"
             test_session = self._terminal.create_session(
-                "tests",
+                f"tests-{run_uid}-{self._eval_attempt}",
                 is_active_stream=False,
                 as_configured_user=False,
             )

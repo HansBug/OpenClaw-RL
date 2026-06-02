@@ -5,6 +5,7 @@ import asyncio
 import logging
 import os
 import shutil
+import subprocess
 import time
 import uuid
 from dataclasses import dataclass, field
@@ -107,6 +108,18 @@ def _env_float(name: str, default: float) -> float:
         return default
 
 
+def _env_int(name: str, default: int) -> int:
+    raw = os.getenv(name)
+    if raw is None or raw == "":
+        return default
+    try:
+        value = int(raw)
+    except ValueError:
+        logger.warning("Invalid %s=%r; using default %s", name, raw, default)
+        return default
+    return value
+
+
 def docker_data_root_stats() -> dict[str, Any]:
     path = os.getenv("DOCKER_DATA_ROOT") or os.getenv("DOCKER_ROOT") or "/data"
     usage = shutil.disk_usage(path)
@@ -131,47 +144,214 @@ def docker_data_root_stats() -> dict[str, Any]:
     }
 
 
-def assert_worker_has_capacity_for_docker() -> None:
-    if os.getenv("WORKER_DISK_GUARD_ENABLED", "1") == "0":
-        return
+_PRESSURE_CACHE: tuple[float, dict[str, Any]] | None = None
 
-    min_free_gb = _env_float("WORKER_MIN_DOCKER_FREE_GB", 50.0)
-    max_used_pct = _env_float("WORKER_MAX_DOCKER_USED_PCT", 85.0)
-    max_inode_pct = _env_float("WORKER_MAX_DOCKER_INODE_PCT", 80.0)
 
+def _read_proc_pressure_stats() -> dict[str, Any]:
+    total_procs = 0
+    total_tasks = 0
+    zombies = 0
+    shim = 0
+    runc = 0
+    dockerd = 0
+    containerd = 0
+    docker_cli = 0
+
+    for proc_dir in Path("/proc").glob("[0-9]*"):
+        if not proc_dir.is_dir():
+            continue
+        total_procs += 1
+        try:
+            name = (proc_dir / "comm").read_text(errors="ignore").strip()
+        except OSError:
+            name = ""
+        try:
+            stat = (proc_dir / "stat").read_text(errors="ignore")
+            rest = stat.split(") ", 1)[1]
+            if rest.split(" ", 1)[0] == "Z":
+                zombies += 1
+        except (OSError, IndexError):
+            pass
+        try:
+            total_tasks += sum(1 for p in (proc_dir / "task").iterdir() if p.is_dir())
+        except OSError:
+            pass
+
+        if name == "dockerd":
+            dockerd += 1
+        elif name == "containerd":
+            containerd += 1
+        elif name.startswith("containerd-shim"):
+            shim += 1
+        elif name == "runc":
+            runc += 1
+        elif name == "docker":
+            docker_cli += 1
+
+    pids_max = 0
     try:
-        stats = docker_data_root_stats()
-    except Exception as exc:
-        raise ResourcePressureError(
-            "WORKER_DISK_STATS_FAILED",
-            f"Failed to read Docker data-root stats: {exc}",
-            {"error": str(exc)},
-        ) from exc
+        pids_max = int(Path("/proc/sys/kernel/threads-max").read_text().strip())
+    except (OSError, ValueError):
+        pids_max = 0
+    pids_pct = (total_tasks * 100.0 / pids_max) if pids_max > 0 else 0.0
+    return {
+        "procs": total_procs,
+        "tasks": total_tasks,
+        "pids_max": pids_max,
+        "pids_pct": pids_pct,
+        "zombies": zombies,
+        "dockerd": dockerd,
+        "containerd": containerd,
+        "shim": shim,
+        "runc": runc,
+        "docker_cli_procs": docker_cli,
+    }
 
-    over_capacity = (
-        stats["free_gb"] < min_free_gb
-        or stats["used_pct"] > max_used_pct
-        or stats["inode_used_pct"] > max_inode_pct
-    )
-    if not over_capacity:
+
+def _docker_cli_ok(timeout_sec: float) -> bool:
+    try:
+        result = subprocess.run(
+            ["docker", "ps", "-q"],
+            check=False,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=timeout_sec,
+        )
+        return result.returncode == 0
+    except Exception:
+        return False
+
+
+def worker_pressure_stats(*, force: bool = False) -> dict[str, Any]:
+    global _PRESSURE_CACHE
+    ttl = _env_float("WORKER_PRESSURE_CACHE_TTL", 5.0)
+    now = time.time()
+    if (
+        not force
+        and _PRESSURE_CACHE is not None
+        and now - _PRESSURE_CACHE[0] <= ttl
+    ):
+        return dict(_PRESSURE_CACHE[1])
+
+    stats = _read_proc_pressure_stats()
+    docker_timeout = _env_float("WORKER_DOCKER_CLI_TIMEOUT", 3.0)
+    stats["docker_cli_ok"] = _docker_cli_ok(docker_timeout)
+    stats["docker_cli_timeout_sec"] = docker_timeout
+    _PRESSURE_CACHE = (now, dict(stats))
+    return stats
+
+
+def assert_worker_has_capacity_for_docker(
+    *, phase: str = "health", pending_closes: int = 0
+) -> None:
+    if os.getenv("WORKER_DISK_GUARD_ENABLED", "1") == "0":
+        disk_guard_enabled = False
+    else:
+        disk_guard_enabled = True
+
+    if disk_guard_enabled:
+        min_free_gb = _env_float("WORKER_MIN_DOCKER_FREE_GB", 50.0)
+        max_used_pct = _env_float("WORKER_MAX_DOCKER_USED_PCT", 85.0)
+        max_inode_pct = _env_float("WORKER_MAX_DOCKER_INODE_PCT", 80.0)
+
+        try:
+            stats = docker_data_root_stats()
+        except Exception as exc:
+            raise ResourcePressureError(
+                "WORKER_DISK_STATS_FAILED",
+                f"Failed to read Docker data-root stats: {exc}",
+                {"error": str(exc), "phase": phase},
+            ) from exc
+
+        over_capacity = (
+            stats["free_gb"] < min_free_gb
+            or stats["used_pct"] > max_used_pct
+            or stats["inode_used_pct"] > max_inode_pct
+        )
+        if over_capacity:
+            raise ResourcePressureError(
+                "WORKER_DOCKER_DISK_PRESSURE",
+                (
+                    "Worker Docker data-root is under disk pressure: "
+                    f"path={stats['path']} free={stats['free_gb']:.1f}GB "
+                    f"used={stats['used_pct']:.1f}% inode={stats['inode_used_pct']:.1f}% "
+                    f"thresholds free>={min_free_gb:.1f}GB used<={max_used_pct:.1f}% "
+                    f"inode<={max_inode_pct:.1f}%"
+                ),
+                {
+                    **stats,
+                    "phase": phase,
+                    "min_free_gb": min_free_gb,
+                    "max_used_pct": max_used_pct,
+                    "max_inode_pct": max_inode_pct,
+                },
+            )
+
+    if os.getenv("WORKER_PRESSURE_GUARD_ENABLED", "1") == "0":
         return
 
-    raise ResourcePressureError(
-        "WORKER_DOCKER_DISK_PRESSURE",
-        (
-            "Worker Docker data-root is under disk pressure: "
-            f"path={stats['path']} free={stats['free_gb']:.1f}GB "
-            f"used={stats['used_pct']:.1f}% inode={stats['inode_used_pct']:.1f}% "
-            f"thresholds free>={min_free_gb:.1f}GB used<={max_used_pct:.1f}% "
-            f"inode<={max_inode_pct:.1f}%"
-        ),
-        {
-            **stats,
-            "min_free_gb": min_free_gb,
-            "max_used_pct": max_used_pct,
-            "max_inode_pct": max_inode_pct,
-        },
-    )
+    pressure = worker_pressure_stats()
+    pids_pause_pct = _env_float("WORKER_PIDS_PAUSE_ALLOCATE_PCT", 75.0)
+    pids_reject_reset_pct = _env_float("WORKER_PIDS_REJECT_RESET_PCT", 85.0)
+    shim_pause = _env_int("WORKER_SHIM_PAUSE_ALLOCATE", 256)
+    shim_reject_reset = _env_int("WORKER_SHIM_REJECT_RESET", 384)
+    pending_pause = _env_int("WORKER_PENDING_CLOSES_PAUSE_ALLOCATE", 50)
+    pending_reject_reset = _env_int("WORKER_PENDING_CLOSES_REJECT_RESET", 100)
+
+    details = {**pressure, "phase": phase, "pending_closes": pending_closes}
+    if not bool(pressure.get("docker_cli_ok", False)):
+        raise ResourcePressureError(
+            "WORKER_DOCKER_CLI_UNHEALTHY",
+            "Worker Docker CLI probe failed; refusing new Docker work.",
+            details,
+        )
+
+    if phase == "reset":
+        if pressure["pids_pct"] >= pids_reject_reset_pct:
+            raise ResourcePressureError(
+                "WORKER_PIDS_PRESSURE",
+                (
+                    f"Worker pids pressure {pressure['pids_pct']:.1f}% "
+                    f">= reset threshold {pids_reject_reset_pct:.1f}%"
+                ),
+                details,
+            )
+        if pressure["shim"] >= shim_reject_reset:
+            raise ResourcePressureError(
+                "WORKER_SHIM_PRESSURE",
+                f"Worker shim pressure {pressure['shim']} >= reset threshold {shim_reject_reset}",
+                details,
+            )
+        if pending_closes >= pending_reject_reset:
+            raise ResourcePressureError(
+                "WORKER_PENDING_CLOSES_PRESSURE",
+                f"Worker pending_closes {pending_closes} >= reset threshold {pending_reject_reset}",
+                details,
+            )
+        return
+
+    if phase in {"allocate", "health"}:
+        if pressure["pids_pct"] >= pids_pause_pct:
+            raise ResourcePressureError(
+                "WORKER_PIDS_PRESSURE",
+                (
+                    f"Worker pids pressure {pressure['pids_pct']:.1f}% "
+                    f">= allocate threshold {pids_pause_pct:.1f}%"
+                ),
+                details,
+            )
+        if pressure["shim"] >= shim_pause:
+            raise ResourcePressureError(
+                "WORKER_SHIM_PRESSURE",
+                f"Worker shim pressure {pressure['shim']} >= allocate threshold {shim_pause}",
+                details,
+            )
+        if pending_closes >= pending_pause:
+            raise ResourcePressureError(
+                "WORKER_PENDING_CLOSES_PRESSURE",
+                f"Worker pending_closes {pending_closes} >= allocate threshold {pending_pause}",
+                details,
+            )
 
 
 @dataclass
@@ -476,7 +656,13 @@ POOL: WorkerPool | None = None
 @app.get("/healthz")
 async def healthz() -> JSONResponse:
     try:
-        assert_worker_has_capacity_for_docker()
+        pending_closes = 0
+        if POOL is not None:
+            pool_status = await POOL.status()
+            pending_closes = int(pool_status.get("pending_closes", 0))
+        assert_worker_has_capacity_for_docker(
+            phase="health", pending_closes=pending_closes
+        )
         return JSONResponse({"ok": True})
     except ResourcePressureError as exc:
         return JSONResponse(
@@ -497,23 +683,30 @@ async def status() -> JSONResponse:
             {"ok": False, "error": "Pool is not initialized"}, status_code=500
         )
     disk: dict[str, Any] | None = None
+    pressure: dict[str, Any] | None = None
     disk_ok = True
     disk_error: str | None = None
+    pool_status = await POOL.status()
     try:
         disk = docker_data_root_stats()
-        assert_worker_has_capacity_for_docker()
+        pressure = worker_pressure_stats()
+        assert_worker_has_capacity_for_docker(
+            phase="health",
+            pending_closes=int(pool_status.get("pending_closes", 0)),
+        )
     except ResourcePressureError as exc:
         disk_ok = False
         disk_error = exc.message
-        disk = exc.details
+        pressure = exc.details
     except Exception as exc:
         disk_ok = False
         disk_error = str(exc)
     return JSONResponse(
         {
             "ok": True,
-            "pool": await POOL.status(),
+            "pool": pool_status,
             "docker_data_root": disk,
+            "resource_pressure": pressure,
             "admission_ok": disk_ok,
             "admission_error": disk_error,
         }
@@ -537,7 +730,11 @@ async def allocate(request: Request) -> JSONResponse:
         )
 
     try:
-        assert_worker_has_capacity_for_docker()
+        pool_status = await POOL.status()
+        assert_worker_has_capacity_for_docker(
+            phase="allocate",
+            pending_closes=int(pool_status.get("pending_closes", 0)),
+        )
         result = await POOL.allocate(task_key=str(task_key), request_id=request_id)
         return JSONResponse({"ok": True, **result})
     except ResourcePressureError as exc:
@@ -602,7 +799,11 @@ async def reset(request: Request) -> JSONResponse:
         )
 
     try:
-        assert_worker_has_capacity_for_docker()
+        pool_status = await POOL.status()
+        assert_worker_has_capacity_for_docker(
+            phase="reset",
+            pending_closes=int(pool_status.get("pending_closes", 0)),
+        )
         out = await POOL.reset(
             run_lease_id=str(lease_id),
             task_meta=task_meta,
