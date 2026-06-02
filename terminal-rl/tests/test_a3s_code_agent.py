@@ -168,6 +168,8 @@ def _patch_sdk(monkeypatch):
     )
     monkeypatch.setattr(a3s_agent_module, "A3SOpenAIModelBridge", FakeBridge)
     monkeypatch.setenv("A3S_CODE_TURN_TIMEOUT_SEC", "5")
+    monkeypatch.delenv("A3S_CODE_TERMINAL_RL_EXTRA_PROMPT", raising=False)
+    monkeypatch.delenv("A3S_CODE_EXTRA_PROMPT", raising=False)
 
 
 def test_a3s_code_agent_run_model_turn_with_mock_sdk(monkeypatch):
@@ -200,6 +202,8 @@ def test_a3s_code_agent_run_model_turn_with_mock_sdk(monkeypatch):
     assert FakeAgent.created_config is not None
     assert FakeAgent.last_session.sent == ["fix the bug"]
     assert FakeAgent.last_opts.max_tool_rounds == 10
+    assert "Terminal-RL Harness Instructions" in FakeAgent.last_opts.extra
+    assert "limited to about 10 A3S agent turns" in FakeAgent.last_opts.extra
     assert result.interaction.output_text == "done"
     assert result.interactions == [result.interaction]
     assert result.tool_call_requests == []
@@ -263,6 +267,67 @@ def test_a3s_code_agent_external_tasks_route_to_terminal_env(monkeypatch):
             "result": "tool output",
             "source": "a3s-code-sdk",
         }
+    ]
+
+
+def test_a3s_code_agent_prompt_extra_can_be_disabled_or_extended(monkeypatch):
+    _patch_sdk(monkeypatch)
+    monkeypatch.setenv("A3S_CODE_WORKSPACE_ROOT", "/tmp/openclaw_a3s_test_workspaces")
+    monkeypatch.setenv("A3S_CODE_TERMINAL_RL_EXTRA_PROMPT", "0")
+    monkeypatch.setenv("A3S_CODE_EXTRA_PROMPT", "Custom a3s extra instruction.")
+
+    agent = a3s_agent_module.A3SCodeAgent(
+        model_type="Qwen3",
+        sglang_client=DummySGLangClient(),
+        env_client=None,
+        lease_id=None,
+        run_context=types.SimpleNamespace(uid="abc123"),
+        task_meta={"task_name": "seta-task"},
+        max_total_tokens=8192,
+    )
+    agent.start_turn_loop("fix the bug")
+    asyncio.run(
+        agent.run_model_turn(
+            context_messages=[{"role": "user", "content": "fix the bug"}],
+            sglang_client=DummySGLangClient(),
+            tool_schemas=[],
+            turn_idx=0,
+        )
+    )
+
+    assert FakeAgent.last_opts.extra == "Custom a3s extra instruction."
+
+
+def test_a3s_code_tool_timeout_is_capped_below_turn_timeout(monkeypatch):
+    _patch_sdk(monkeypatch)
+    monkeypatch.setenv("A3S_CODE_WORKSPACE_ROOT", "/tmp/openclaw_a3s_test_workspaces")
+    monkeypatch.setenv("A3S_CODE_TURN_TIMEOUT_SEC", "10")
+    monkeypatch.setenv("A3S_CODE_TOOL_TIMEOUT_MS", "7200000")
+
+    agent = a3s_agent_module.A3SCodeAgent(
+        model_type="Qwen3",
+        sglang_client=DummySGLangClient(),
+        env_client=None,
+        lease_id=None,
+        run_context=types.SimpleNamespace(uid="abc123"),
+        task_meta={"task_name": "seta-task"},
+        max_total_tokens=8192,
+    )
+    agent.start_turn_loop("fix the bug")
+    asyncio.run(
+        agent.run_model_turn(
+            context_messages=[{"role": "user", "content": "fix the bug"}],
+            sglang_client=DummySGLangClient(),
+            tool_schemas=[],
+            turn_idx=0,
+        )
+    )
+
+    assert agent._tool_timeout_ms == 9000
+    assert FakeAgent.last_opts.tool_timeout_ms == 9000
+    assert FakeAgent.last_opts.queue_config.handlers == [
+        ("query", "external", 9000),
+        ("execute", "external", 9000),
     ]
 
 

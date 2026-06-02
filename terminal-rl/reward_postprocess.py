@@ -45,6 +45,24 @@ def _component_value(sample: Any, key: str) -> float:
     return 0.0
 
 
+def _sync_reward_aliases(
+    reward: dict[str, Any] | None,
+    *,
+    total_reward: float | None = None,
+    extra_exploration_reward: float = 0.0,
+) -> None:
+    if not isinstance(reward, dict):
+        return
+    total = reward.get("score") if total_reward is None else total_reward
+    raw = reward.get("raw_score", total)
+    task = reward.get("base_score", raw)
+    exploration = float(reward.get("explore_total_bonus", 0.0) or 0.0) + extra_exploration_reward
+    reward["raw_reward"] = raw
+    reward["task_reward"] = task
+    reward["exploration_reward"] = exploration
+    reward["total_reward"] = total
+
+
 def _normalize_values(values: list[float], use_std: bool) -> list[float]:
     if not values:
         return []
@@ -139,4 +157,10 @@ def post_process_rewards(args: Any, samples: list[Any]) -> tuple[list[float], li
             reward["explore_post_norm_bonus_coef"] = coef
             reward["explore_post_norm_bonus_clip"] = clip
             reward["explore_post_norm_bonus_components"] = ",".join(component_names)
+            reward["postprocess_total_reward"] = adjusted[i]
+            _sync_reward_aliases(
+                reward,
+                total_reward=adjusted[i],
+                extra_exploration_reward=bonus,
+            )
     return raw_rewards, adjusted

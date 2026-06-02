@@ -77,6 +77,7 @@ _REWARD_DETAIL_NUMERIC_KEYS = (
 )
 _STRUCTURED_LOG_PREFIX = "TERMINAL_RL_METRIC_JSON"
 _STRUCTURED_SCHEMA = "terminal_rl.per_dataset_metrics.v1"
+_STRUCTURED_SCHEMA_VERSION = 2
 _LAST_EVAL_BY_DATASET: dict[str, dict[str, Any]] = {}
 
 
@@ -458,17 +459,11 @@ def _analysis_dataset_name_from_raw(raw_name: Any) -> str:
         return "seta"
     if name.startswith("seta_"):
         return "seta"
-    if name in {
-        "agent_safetybench",
-        "asb",
-        "agentharm",
-        "safety",
-        "security",
-        "mcpsafety",
-        "harmbench",
-    }:
-        return "security"
-    if name.startswith("agent_safetybench") or name.startswith("agentharm") or name.startswith("safety"):
+    if name in {"agent_safetybench", "asb"} or name.startswith("agent_safetybench"):
+        return "agent_safetybench"
+    if name in {"agentharm", "ah"} or name.startswith("agentharm"):
+        return "agentharm"
+    if name in {"safety", "security", "mcpsafety", "harmbench"} or name.startswith("safety"):
         return "security"
     return name
 
@@ -517,6 +512,25 @@ def _metric_record_from_samples(
     if task_reward is not None and exploration_reward is not None:
         denom = task_reward + exploration_reward
 
+    scale_sources = {_analysis_dataset_name_from_raw(src) for src in source_datasets}
+    if dataset_name == "seta" or scale_sources == {"seta"}:
+        raw_reward_scale = "pass_rate_0_1"
+        raw_reward_semantics = "terminal task test pass rate; 1.0 means all trainable samples passed"
+        raw_reward_min = 0.0
+        raw_reward_max = 1.0
+    elif dataset_name in {"agent_safetybench", "agentharm"} or scale_sources.intersection(
+        {"agent_safetybench", "agentharm"}
+    ):
+        raw_reward_scale = "direct_safety_score"
+        raw_reward_semantics = "dataset reward-model score, not a 0/1 pass rate"
+        raw_reward_min = None
+        raw_reward_max = None
+    else:
+        raw_reward_scale = "unknown"
+        raw_reward_semantics = None
+        raw_reward_min = None
+        raw_reward_max = None
+
     status_counts: dict[str, int] = defaultdict(int)
     for sample in samples:
         status_counts[_status_name(sample)] += 1
@@ -528,6 +542,7 @@ def _metric_record_from_samples(
     # reported as null rather than omitted.
     return {
         "schema": _STRUCTURED_SCHEMA,
+        "schema_version": _STRUCTURED_SCHEMA_VERSION,
         "run": _run_name(),
         "phase": phase,
         "dataset": dataset_name,
@@ -548,6 +563,14 @@ def _metric_record_from_samples(
         "reward/exploration_ratio": (
             exploration_reward / denom if denom and abs(denom) > 1e-12 else None
         ),
+        "total_reward": _stats_mean(total_stats),
+        "task_reward": task_reward,
+        "raw_reward": raw_score,
+        "exploration_reward": exploration_reward if exploration_reward is not None else 0.0,
+        "raw_reward_scale": raw_reward_scale,
+        "raw_reward_semantics": raw_reward_semantics,
+        "raw_reward_min": raw_reward_min,
+        "raw_reward_max": raw_reward_max,
         "test_acc": _mean_from_samples(reward_source, "accuracy"),
         "reward_std": total_stats["std"] if total_stats else None,
         "response_length": _stats_mean(
@@ -575,6 +598,7 @@ def _metric_record_from_rewards(
     stats = _stats(reward_values)
     return {
         "schema": _STRUCTURED_SCHEMA,
+        "schema_version": _STRUCTURED_SCHEMA_VERSION,
         "run": _run_name(),
         "phase": phase,
         "dataset": dataset_name,
@@ -593,6 +617,14 @@ def _metric_record_from_rewards(
         "reward/raw": _stats_mean(stats),
         "reward/exploration": None,
         "reward/exploration_ratio": None,
+        "total_reward": _stats_mean(stats),
+        "task_reward": _stats_mean(stats),
+        "raw_reward": _stats_mean(stats),
+        "exploration_reward": 0.0,
+        "raw_reward_scale": "eval_reward_values",
+        "raw_reward_semantics": "aggregate eval reward values without sample-level reward components",
+        "raw_reward_min": None,
+        "raw_reward_max": None,
         "test_acc": _stats_mean(stats),
         "reward_std": stats["std"] if stats else None,
         "response_length": None,
@@ -664,6 +696,10 @@ def _add_per_dataset_log_dict(log_dict: Dict[str, Any], records: list[dict[str, 
             "reward/raw",
             "reward/exploration",
             "reward/exploration_ratio",
+            "total_reward",
+            "task_reward",
+            "raw_reward",
+            "exploration_reward",
             "test_acc",
             "reward_std",
             "response_length",

@@ -81,6 +81,7 @@ SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &>/dev/null && pwd)"
 USER_ALGO_SET="${ALGO+x}"
 DATASET="${DATASET:-seta}"
 ALGO="${ALGO:-grpo}"
+HARNESS_OPTION="${HARNESS_OPTION:-camel-agent}"
 case "${DATASET}" in
   seta|safety|agentharm|mixed) ;;
   *)
@@ -95,7 +96,19 @@ case "${ALGO}" in
     exit 1
     ;;
 esac
-export DATASET ALGO
+case "${HARNESS_OPTION}" in
+  camel-agent|camel_agent)
+    HARNESS_OPTION="camel-agent"
+    ;;
+  a3s-code|a3s_code)
+    HARNESS_OPTION="a3s-code"
+    ;;
+  *)
+    echo "[ERROR] Unknown HARNESS_OPTION=${HARNESS_OPTION}. Use: camel-agent|a3s-code" >&2
+    exit 1
+    ;;
+esac
+export DATASET ALGO HARNESS_OPTION
 SETA_SAFETY="${SETA_SAFETY:-clawsentry}"
 SAFETY_BENCH_REWARD="${SAFETY_BENCH_REWARD:-rule}"
 AGENTHARM_REWARD="${AGENTHARM_REWARD:-rule}"
@@ -190,6 +203,7 @@ echo "========================================"
 echo "  Exploration Options"
 echo "  DATASET         = ${DATASET}"
 echo "  ALGO            = ${ALGO}"
+echo "  HARNESS_OPTION  = ${HARNESS_OPTION}"
 if [[ "${DATASET}" == "mixed" ]]; then
 echo "  MIX_RATIOS      = seta:${MIX_SETA_RATIO:-<default>} safety:${MIX_SAFETY_RATIO:-<default>} agentharm:${MIX_AGENTHARM_RATIO:-<unset>}"
 fi
@@ -326,7 +340,8 @@ if [[ -n "${SUF}" ]]; then
     GPUS="${NUM_GPUS:-4}"
   fi
   export RUN_TIMESTAMP="${TS}"
-  export RUN_ID="${RUN_ID:-terminal-rl_qwen3-8b_${GPUS}gpu_${DATASET}_${ALGO}_explore${SUF}_${TS}}"
+  RUN_HARNESS_TAG="$(printf '%s' "${HARNESS_OPTION}" | tr -c 'A-Za-z0-9_.-' '-' | sed 's/-\{1,\}/-/g; s/^-//; s/-$//')"
+  export RUN_ID="${RUN_ID:-terminal-rl_qwen3-8b_${GPUS}gpu_${DATASET}_${ALGO}_harness-${RUN_HARNESS_TAG}_explore${SUF}_${TS}}"
   echo "[explore] RUN_ID=${RUN_ID}"
 fi
 

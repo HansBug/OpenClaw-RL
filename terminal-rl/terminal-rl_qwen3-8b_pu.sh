@@ -238,16 +238,17 @@ build_algo_tag() {
 
 RUN_DATASET_TAG="$(sanitize_run_part "$(build_dataset_tag)")"
 RUN_ALGO_TAG="$(sanitize_run_part "$(build_algo_tag)")"
+RUN_HARNESS_TAG="$(sanitize_run_part "${HARNESS_OPTION}")"
 # Checkpoint saving is OFF by default. Set MAX_CKPT_KEEP=N (N>0) to enable.
 # When enabled, only the latest N checkpoints are kept; older ones are auto-deleted.
 MAX_CKPT_KEEP="${MAX_CKPT_KEEP:-0}"
 SAVE_INTERVAL="${SAVE_INTERVAL:-8}"
 if [[ "${DEBUG_MODE}" == "1" ]]; then
-  RUN_NAME="${RUN_NAME:-terminal-rl_qwen3-8b_${NUM_GPUS}gpu_debug_${RUN_DATASET_TAG}_${RUN_ALGO_TAG}_mt${MAX_TURN}_${RUN_TIMESTAMP}}"
+  RUN_NAME="${RUN_NAME:-terminal-rl_qwen3-8b_${NUM_GPUS}gpu_debug_${RUN_DATASET_TAG}_${RUN_ALGO_TAG}_harness-${RUN_HARNESS_TAG}_mt${MAX_TURN}_${RUN_TIMESTAMP}}"
   # Debug mode: never save checkpoints regardless of MAX_CKPT_KEEP
   MAX_CKPT_KEEP=0
 else
-  RUN_NAME="${RUN_NAME:-terminal-rl_qwen3-8b_${NUM_GPUS}gpu_${RUN_DATASET_TAG}_${RUN_ALGO_TAG}_mt${MAX_TURN}_${RUN_TIMESTAMP}}"
+  RUN_NAME="${RUN_NAME:-terminal-rl_qwen3-8b_${NUM_GPUS}gpu_${RUN_DATASET_TAG}_${RUN_ALGO_TAG}_harness-${RUN_HARNESS_TAG}_mt${MAX_TURN}_${RUN_TIMESTAMP}}"
 fi
 
 # ── Unified run directory (see STORAGE.md) ───────────────────────────────
@@ -285,7 +286,7 @@ A3S_CODE_CACHE_DIR="${A3S_CODE_CACHE_DIR:-/mnt/shared-storage-user/puyuan/.cache
 A3S_CODE_WORKSPACE_ROOT="${A3S_CODE_WORKSPACE_ROOT:-${RUN_DIR}/a3s_code_workspaces}"
 A3S_CODE_EXTRA_SITE_PACKAGES="${A3S_CODE_EXTRA_SITE_PACKAGES:-}"
 A3S_CODE_TURN_TIMEOUT_SEC="${A3S_CODE_TURN_TIMEOUT_SEC:-900}"
-A3S_CODE_TOOL_TIMEOUT_MS="${A3S_CODE_TOOL_TIMEOUT_MS:-7200000}"
+A3S_CODE_TOOL_TIMEOUT_MS="${A3S_CODE_TOOL_TIMEOUT_MS:-300000}"
 A3S_CODE_MAX_TOOL_ROUNDS="${A3S_CODE_MAX_TOOL_ROUNDS:-10}"
 A3S_CODE_MAX_PARSE_RETRIES="${A3S_CODE_MAX_PARSE_RETRIES:-4}"
 A3S_CODE_OUTPUT_TOKENS="${A3S_CODE_OUTPUT_TOKENS:-8192}"

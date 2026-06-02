@@ -13,6 +13,8 @@ set -euo pipefail
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &>/dev/null && pwd)"
 
 # ── Harness / data / algorithm defaults ──────────────────────────────
+# terminal-rl_qwen3-8b_pu.sh includes this value as harness-a3s-code in
+# the default RUN_NAME/RUN_ID.
 export HARNESS_OPTION="${HARNESS_OPTION:-a3s-code}"
 export DATASET="${DATASET:-seta}"
 export ALGO="${ALGO:-dapo}"

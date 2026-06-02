@@ -71,6 +71,15 @@ def _env_float(name: str, default: float) -> float:
         return default
 
 
+async def _await_with_optional_timeout(awaitable, timeout: float, *, op_name: str):
+    if timeout <= 0:
+        return await awaitable
+    try:
+        return await asyncio.wait_for(awaitable, timeout=timeout)
+    except asyncio.TimeoutError as exc:
+        raise TimeoutError(f"{op_name} timed out after {timeout:.1f}s") from exc
+
+
 # ── Exploration: count-based intrinsic reward (MERCI simplified) ──────────────
 _EXPLORE_INTRINSIC_ENABLED = _env_bool("EXPLORE_INTRINSIC_ENABLED", False)
 _EXPLORE_INTRINSIC_COEF = _env_float("EXPLORE_INTRINSIC_COEF", 0.1)
@@ -686,6 +695,7 @@ def _save_rollout_artifacts(
             r0 = samples[0].reward if isinstance(samples[0].reward, dict) else {}
             for k in (
                 "accuracy", "raw_score", "base_score", "score",
+                "raw_reward", "task_reward", "exploration_reward", "total_reward",
                 "prm_turn_score", "safety_score", "safety_coef",
                 "explore_intrinsic", "explore_intrinsic_scaled",
                 "explore_intrinsic_coef", "explore_intrinsic_effective_coef",
@@ -799,6 +809,11 @@ def _save_rollout_artifacts(
             "exploration": _jsonable(_exploration_audit_from_reward(reward_breakdown)),
             "status": str(status),
             "raw_score": raw_score,
+            "dataset": primary_metadata.get("data_source"),
+            "raw_reward": reward_breakdown.get("raw_reward", reward_breakdown.get("raw_score")),
+            "task_reward": reward_breakdown.get("task_reward", reward_breakdown.get("base_score")),
+            "exploration_reward": reward_breakdown.get("exploration_reward", 0.0),
+            "total_reward": reward_breakdown.get("total_reward", reward_breakdown.get("score")),
             "ts_ns": ts_ns,
         }
         (run_dir / "meta.json").write_text(
@@ -899,6 +914,27 @@ def _dapo_overlong_reward(response_length: int, cfg: dict[str, Any] | None) -> f
         return 0.0
     exceed_len = int(response_length) - int(cfg["expected_len"])
     return min(-exceed_len / float(cfg["buffer_len"]) * float(cfg["penalty_factor"]), 0.0)
+
+
+def _sync_reward_aliases(reward: Dict[str, Any] | None) -> None:
+    """Add explicit reward component aliases while preserving legacy keys."""
+    if not isinstance(reward, dict):
+        return
+
+    total = reward.get("score")
+    raw = reward.get("raw_score")
+    task = reward.get("base_score", raw)
+    exploration = reward.get("explore_total_bonus", 0.0)
+
+    if raw is None and total is not None:
+        raw = total
+    if task is None and raw is not None:
+        task = raw
+
+    reward["raw_reward"] = raw
+    reward["task_reward"] = task
+    reward["exploration_reward"] = exploration
+    reward["total_reward"] = total
 
 
 def _build_samples(
@@ -1002,6 +1038,7 @@ def _build_samples(
         if safety_turn_scores is not None:
             s.reward["safety_score"] = safety_val
             s.reward["safety_coef"] = safety_coef
+        _sync_reward_aliases(s.reward)
         samples.append(s)
 
     return samples
@@ -1012,6 +1049,7 @@ def _mark_non_trainable_samples(samples: List[Sample]) -> None:
         if sample.status in {Sample.Status.ABORTED, Sample.Status.FAILED}:
             if sample.reward is None:
                 sample.reward = {"score": 0.0}
+            _sync_reward_aliases(sample.reward)
             sample.remove_sample = True
 
 
@@ -1265,7 +1303,12 @@ async def _create_env_client(
     request_id = (
         f"{task_key}:{run_ctx.uid}:{run_ctx.group_index}:{run_ctx.sample_index}"
     )
-    lease = await env_client.allocate(task_key=task_key, request_id=request_id)
+    allocate_timeout = _env_float("ENV_ALLOCATE_HTTP_TIMEOUT", 300.0)
+    lease = await _await_with_optional_timeout(
+        env_client.allocate(task_key=task_key, request_id=request_id),
+        allocate_timeout,
+        op_name="terminal env allocate",
+    )
     lease_id = str(lease["lease_id"])
     logger.info(
         "Using remote terminal env backend lease=%s server=%s", lease_id, env_server_url
@@ -1439,11 +1482,20 @@ async def generate(
         env_client, lease_id = await _create_env_client(
             task_spec, run_ctx, task_meta=task_meta
         )
-        reset_payload = await env_client.reset(
+        reset_http_timeout = _env_float(
+            "ENV_RESET_HTTP_TIMEOUT",
+            float(timeouts.reset_session) + 30.0,
+        )
+        reset_coro = env_client.reset(
             lease_id=lease_id,
             task_meta=task_meta,
             run_ctx=run_ctx_payload,
             task_timeouts=timeouts_payload,
+        )
+        reset_payload = await _await_with_optional_timeout(
+            reset_coro,
+            reset_http_timeout,
+            op_name=f"{_log_tag} env reset",
         )
         user_msg = str(reset_payload.get("user_msg", ""))
         raw_tools = list(reset_payload.get("tool_schemas", []))
@@ -1755,6 +1807,7 @@ async def generate(
             sample.status = Sample.Status.ABORTED
             sample.remove_sample = True
             sample.reward = {"score": 0.0}
+            _sync_reward_aliases(sample.reward)
             return [sample]
 
         finish_reasons = final_response.info.get("termination_reasons", [])
@@ -1835,6 +1888,7 @@ async def generate(
             sample.status = status
             sample.remove_sample = True
             sample.reward = {"score": 0.0}
+            _sync_reward_aliases(sample.reward)
             return [sample]
 
         if prm_agent is not None and prm_pending:
@@ -2031,6 +2085,7 @@ async def generate(
                         s.reward["explore_cde_actor_clipped"] = _cde_actor["clipped"]
                     s.reward["explore_total_bonus"] = _explore_total
                     s.reward.update(_explore_debug)
+                    _sync_reward_aliases(s.reward)
 
         for s in samples:
             s.metadata["model_turn_count"] = agent_runner.model_turn_count
@@ -2074,6 +2129,7 @@ async def generate(
         sample.status = Sample.Status.FAILED
         sample.remove_sample = True
         sample.reward = {"score": 0.0}
+        _sync_reward_aliases(sample.reward)
 
         eos = state.tokenizer.eos_token_id
         if eos is None:
@@ -2107,7 +2163,15 @@ async def generate(
 
         if env_client is not None and lease_id is not None:
             try:
-                await env_client.close(lease_id)
+                close_timeout = _env_float(
+                    "ENV_CLOSE_HTTP_TIMEOUT",
+                    float(timeouts.close_session) + 30.0,
+                )
+                await _await_with_optional_timeout(
+                    env_client.close(lease_id),
+                    close_timeout,
+                    op_name=f"{_log_tag} env close",
+                )
             except Exception as exc:
                 logger.debug(
                     "%s Best-effort remote close failed lease=%s: %s",

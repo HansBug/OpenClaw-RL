@@ -22,6 +22,8 @@ from inference_client import SGLangTurnClient
 
 logger = logging.getLogger(__name__)
 
+DEFAULT_A3S_CODE_TOOL_TIMEOUT_MS = 300_000
+
 
 @dataclass
 class A3SCodeResponse:
@@ -71,6 +73,69 @@ def _env_float(name: str, default: float) -> float:
     except ValueError:
         logger.warning("Invalid %s=%r; using %.2f", name, raw, default)
         return default
+
+
+def _resolve_tool_timeout_ms(raw: Any, turn_timeout_sec: float) -> int:
+    if raw is None or raw == "":
+        value = DEFAULT_A3S_CODE_TOOL_TIMEOUT_MS
+    else:
+        try:
+            value = int(raw)
+        except (TypeError, ValueError):
+            logger.warning(
+                "Invalid A3S_CODE_TOOL_TIMEOUT_MS=%r; using %d",
+                raw,
+                DEFAULT_A3S_CODE_TOOL_TIMEOUT_MS,
+            )
+            value = DEFAULT_A3S_CODE_TOOL_TIMEOUT_MS
+
+    if value <= 0:
+        logger.warning(
+            "Non-positive A3S_CODE_TOOL_TIMEOUT_MS=%r; using %d",
+            raw,
+            DEFAULT_A3S_CODE_TOOL_TIMEOUT_MS,
+        )
+        value = DEFAULT_A3S_CODE_TOOL_TIMEOUT_MS
+
+    if turn_timeout_sec > 0:
+        turn_timeout_ms = max(1_000, int(turn_timeout_sec * 1000))
+        if value >= turn_timeout_ms:
+            capped = max(1_000, turn_timeout_ms - 1_000)
+            logger.warning(
+                "A3S_CODE_TOOL_TIMEOUT_MS=%d is not below turn timeout %.0fs; using %d",
+                value,
+                turn_timeout_sec,
+                capped,
+            )
+            value = capped
+
+    return value
+
+
+def _terminal_rl_prompt_extra(max_tool_rounds: int) -> str:
+    return f"""## Terminal-RL Harness Instructions
+
+- You are running under the OpenClaw terminal-rl harness. Terminal commands and
+  task file operations are executed in the task Docker container; treat that
+  Docker environment as the source of truth for task state.
+- A3S Code tools are bridged to terminal-rl tools. `bash` and `execute` map to
+  `shell_exec`; `read`, `ls`, `grep`, and `glob` are executed through shell
+  commands; `write` maps to `shell_write_content_to_file`; `edit` is emulated
+  as a single string replacement.
+- Use absolute paths from the task instruction whenever possible. Start with
+  compact inspection commands such as `pwd`, `ls -la`, and targeted `grep` only
+  when they help solve the task.
+- Keep command output bounded. Redirect verbose logs to files, use `head`,
+  `tail`, or targeted filters, and avoid repeatedly printing large files.
+- Long-running commands should be managed with non-blocking terminal execution
+  if the exposed schema supports it; otherwise use explicit timeouts and write
+  progress or logs to files that can be inspected later.
+- The session is limited to about {max_tool_rounds} A3S agent turns. Batch
+  related inspection, implementation, and verification work so there is enough
+  budget left to produce a final answer.
+- Always verify the result with the narrowest meaningful command available. Once
+  the task is complete, stop calling tools and return a concise final answer.
+"""
 
 
 def _repo_root() -> Path:
@@ -429,11 +494,14 @@ class A3SCodeAgent:
         self._lease_id = lease_id
         self._run_context = run_context
         self._task_meta = task_meta or {}
-        self._tool_timeout_ms = int(
-            tool_timeout_ms or os.getenv("A3S_CODE_TOOL_TIMEOUT_MS", "7200000")
-        )
         self._max_tool_rounds = max(1, _env_int("A3S_CODE_MAX_TOOL_ROUNDS", 10))
         self._turn_timeout_sec = _env_float("A3S_CODE_TURN_TIMEOUT_SEC", 900.0)
+        self._tool_timeout_ms = _resolve_tool_timeout_ms(
+            tool_timeout_ms
+            if tool_timeout_ms is not None
+            else os.getenv("A3S_CODE_TOOL_TIMEOUT_MS"),
+            self._turn_timeout_sec,
+        )
         self.max_parse_errors = max(1, int(max_parse_errors or 3))
         self.parse_error_count = 0
         self._prompt = ""
@@ -581,6 +649,14 @@ class A3SCodeAgent:
         opts.tool_timeout_ms = self._tool_timeout_ms
         opts.circuit_breaker_threshold = _env_int("A3S_CODE_CIRCUIT_BREAKER", 3)
         opts.planning_mode = os.getenv("A3S_CODE_PLANNING_MODE", "disabled")
+        extra_prompts: list[str] = []
+        if _env_flag("A3S_CODE_TERMINAL_RL_EXTRA_PROMPT", True):
+            extra_prompts.append(_terminal_rl_prompt_extra(self._max_tool_rounds))
+        custom_extra = os.getenv("A3S_CODE_EXTRA_PROMPT", "").strip()
+        if custom_extra:
+            extra_prompts.append(custom_extra)
+        if extra_prompts:
+            opts.extra = "\n\n".join(extra_prompts)
         thinking_budget = os.getenv("A3S_CODE_THINKING_BUDGET", "").strip()
         if thinking_budget:
             opts.thinking_budget = int(thinking_budget)

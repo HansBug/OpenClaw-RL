@@ -395,6 +395,34 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                     "You could use `slime.rollout.filter_hub.dynamic_sampling_filters.check_reward_nonzero_std` as an example."
                 ),
             )
+            parser.add_argument(
+                "--dynamic-sampling-max-groups",
+                type=int,
+                default=None,
+                help=(
+                    "Maximum number of prompt groups that one rollout may submit while dynamic sampling tries "
+                    "to collect rollout_batch_size kept groups. If unset and dynamic sampling is enabled, "
+                    "defaults to max(rollout_batch_size*64, over_sampling_batch_size*64). Use <=0 to disable."
+                ),
+            )
+            parser.add_argument(
+                "--dynamic-sampling-max-seconds",
+                type=float,
+                default=None,
+                help=(
+                    "Optional wall-clock timeout in seconds for one dynamic-sampling rollout. "
+                    "Use <=0 or leave unset to disable."
+                ),
+            )
+            parser.add_argument(
+                "--rollout-abort-wait-timeout",
+                type=float,
+                default=300.0,
+                help=(
+                    "Maximum seconds to wait for pending generation tasks to finish after rollout abort. "
+                    "If exceeded, pending tasks are canceled and rollout state is reset."
+                ),
+            )
 
             # partial rollout
             parser.add_argument(
