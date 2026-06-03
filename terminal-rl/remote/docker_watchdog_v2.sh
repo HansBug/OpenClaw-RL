@@ -591,12 +591,22 @@ LAST_POOL_ACTIVE="?"
 LAST_POOL_PENDING="?"
 LAST_BRIDGE_NETS="?"
 check_pool_server() {
-    timeout 3 curl -fsS --noproxy '*' "http://${POOL_HOST}:${POOL_PORT}/healthz" >/dev/null 2>&1 || {
+    local health_tmp health_code
+    health_tmp="$(mktemp /tmp/pool_health.XXXXXX 2>/dev/null || echo /tmp/pool_health.$$)"
+    health_code=$(timeout 5 curl -sS --noproxy '*' -o "$health_tmp" -w '%{http_code}' \
+        "http://${POOL_HOST}:${POOL_PORT}/healthz" 2>/dev/null || echo "000")
+    if [ "$health_code" = "000" ]; then
         log "WARN: pool_server /healthz unreachable"
         LAST_POOL_ACTIVE="down"
         LAST_POOL_PENDING="down"
+        rm -f "$health_tmp" 2>/dev/null || true
         return 1
-    }
+    fi
+    if [ "$health_code" -ge 400 ] 2>/dev/null; then
+        log "WARN: pool_server /healthz returned HTTP ${health_code}: $(head -c 300 "$health_tmp" 2>/dev/null)"
+    fi
+    rm -f "$health_tmp" 2>/dev/null || true
+
     local body pending=0 active=0
     body=$(timeout 3 curl -fsS --noproxy '*' "http://${POOL_HOST}:${POOL_PORT}/status" 2>/dev/null)
     if [ -n "$body" ]; then

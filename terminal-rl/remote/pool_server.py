@@ -390,6 +390,10 @@ class WorkerPool:
         self.output_root.mkdir(parents=True, exist_ok=True)
         self.default_timeouts = default_timeouts
         self.idempotency_ttl = idempotency_ttl
+        self.close_task_timeout = _env_float(
+            "WORKER_CLOSE_TASK_TIMEOUT",
+            max(30.0, float(default_timeouts.close_session) + 30.0),
+        )
 
         self._tasks: dict[str, TaskSlot] = {}
         self._run_to_task: dict[str, str] = {}
@@ -409,7 +413,17 @@ class WorkerPool:
         async with self._close_sem:
             async with run_slot.lock:
                 try:
-                    await run_slot.env.close()
+                    await asyncio.wait_for(
+                        run_slot.env.close(), timeout=self.close_task_timeout
+                    )
+                except asyncio.TimeoutError:
+                    logger.warning(
+                        "Timed out closing run session %s after %.1fs; dropping it from "
+                        "the pool so close backlog can drain. Watchdog/preflight cleanup "
+                        "will remove any orphan Docker objects.",
+                        run_lease_id,
+                        self.close_task_timeout,
+                    )
                 except Exception:
                     logger.exception("Failed to close run session %s", run_lease_id)
 
