@@ -51,7 +51,9 @@ def _group_sample_stats(group: list[Sample] | list[list[Sample]]) -> dict[str, i
         "failed": failed,
         "aborted": aborted,
         "all_removed": int(bool(samples) and removed == len(samples)),
+        "all_failed": int(bool(samples) and failed == len(samples)),
         "any_removed": int(removed > 0),
+        "any_failed": int(failed > 0),
     }
 
 
@@ -96,6 +98,45 @@ def _rollout_abort_wait_timeout(args: Namespace) -> float:
     return value if value > 0 else 300.0
 
 
+def _dynamic_sampling_failed_group_abort_min_groups(args: Namespace, target_data_size: int) -> int | None:
+    raw = getattr(args, "dynamic_sampling_failed_group_abort_min_groups", None)
+    if raw is None:
+        return None
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        return None
+    if value <= 0:
+        return None
+    return max(1, min(value, target_data_size))
+
+
+def _dynamic_sampling_failed_group_abort_ratio(args: Namespace) -> float:
+    raw = getattr(args, "dynamic_sampling_failed_group_abort_ratio", 1.0)
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        return 1.0
+    return min(max(value, 0.0), 1.0)
+
+
+def _should_abort_for_failed_rollout_groups(
+    *,
+    completed_groups: int,
+    kept_groups: int,
+    failed_groups: int,
+    min_groups: int | None,
+    ratio: float,
+) -> bool:
+    if min_groups is None:
+        return False
+    if kept_groups > 0 or completed_groups < min_groups or completed_groups <= 0:
+        return False
+    if failed_groups <= 0:
+        return False
+    return failed_groups / completed_groups >= ratio
+
+
 def _format_dynamic_sampling_state(
     *,
     rollout_id: int,
@@ -105,19 +146,27 @@ def _format_dynamic_sampling_state(
     kept_groups: int,
     dropped_groups: int,
     removed_groups: int,
+    failed_groups: int,
     failed_samples: int,
     removed_samples: int,
     pending_groups: int,
     max_groups: int | None,
     max_seconds: float | None,
+    failed_group_abort_min_groups: int | None = None,
+    failed_group_abort_ratio: float | None = None,
 ) -> str:
     return (
         f"rollout_id={rollout_id} target_groups={target_data_size} "
         f"kept={kept_groups} dropped={dropped_groups} "
         f"submitted={submitted_groups} completed={completed_groups} pending={pending_groups} "
-        f"removed_groups={removed_groups} removed_samples={removed_samples} failed_samples={failed_samples} "
+        f"removed_groups={removed_groups} failed_groups={failed_groups} "
+        f"removed_samples={removed_samples} failed_samples={failed_samples} "
         f"max_groups={max_groups if max_groups is not None else 'disabled'} "
-        f"max_seconds={max_seconds if max_seconds is not None else 'disabled'}"
+        f"max_seconds={max_seconds if max_seconds is not None else 'disabled'} "
+        f"failed_group_abort_min_groups="
+        f"{failed_group_abort_min_groups if failed_group_abort_min_groups is not None else 'disabled'} "
+        f"failed_group_abort_ratio="
+        f"{failed_group_abort_ratio if failed_group_abort_ratio is not None else 'disabled'}"
     )
 
 
@@ -518,6 +567,8 @@ async def generate_rollout_async(
     target_data_size = args.rollout_batch_size
     max_groups = _dynamic_sampling_max_groups(args, target_data_size)
     max_seconds = _dynamic_sampling_max_seconds(args)
+    failed_group_abort_min_groups = _dynamic_sampling_failed_group_abort_min_groups(args, target_data_size)
+    failed_group_abort_ratio = _dynamic_sampling_failed_group_abort_ratio(args)
     deadline = time.monotonic() + max_seconds if max_seconds is not None else None
 
     data = []
@@ -528,6 +579,7 @@ async def generate_rollout_async(
     kept_groups = 0
     dropped_groups = 0
     removed_groups = 0
+    failed_groups = 0
     removed_samples = 0
     failed_samples = 0
     exhausted = False
@@ -558,11 +610,14 @@ async def generate_rollout_async(
                         kept_groups=kept_groups,
                         dropped_groups=dropped_groups,
                         removed_groups=removed_groups,
+                        failed_groups=failed_groups,
                         failed_samples=failed_samples,
                         removed_samples=removed_samples,
                         pending_groups=len(state.pendings),
                         max_groups=max_groups,
                         max_seconds=max_seconds,
+                        failed_group_abort_min_groups=failed_group_abort_min_groups,
+                        failed_group_abort_ratio=failed_group_abort_ratio,
                     )
                     raise RuntimeError(f"{reason}: {details}")
                 _annotate_rollout_groups(args, samples, rollout_id, evaluation=False)
@@ -582,11 +637,14 @@ async def generate_rollout_async(
                     kept_groups=kept_groups,
                     dropped_groups=dropped_groups,
                     removed_groups=removed_groups,
+                    failed_groups=failed_groups,
                     failed_samples=failed_samples,
                     removed_samples=removed_samples,
                     pending_groups=0,
                     max_groups=max_groups,
                     max_seconds=max_seconds,
+                    failed_group_abort_min_groups=failed_group_abort_min_groups,
+                    failed_group_abort_ratio=failed_group_abort_ratio,
                 )
                 raise RuntimeError(f"{reason}: {details}")
 
@@ -608,11 +666,14 @@ async def generate_rollout_async(
                     kept_groups=kept_groups,
                     dropped_groups=dropped_groups,
                     removed_groups=removed_groups,
+                    failed_groups=failed_groups,
                     failed_samples=failed_samples,
                     removed_samples=removed_samples,
                     pending_groups=len(state.pendings),
                     max_groups=max_groups,
                     max_seconds=max_seconds,
+                    failed_group_abort_min_groups=failed_group_abort_min_groups,
+                    failed_group_abort_ratio=failed_group_abort_ratio,
                 )
                 raise RuntimeError(f"{reason}: {details}")
 
@@ -629,6 +690,7 @@ async def generate_rollout_async(
 
                 stats = _group_sample_stats(group)
                 removed_groups += stats["all_removed"]
+                failed_groups += stats["all_failed"]
                 removed_samples += stats["removed"]
                 failed_samples += stats["failed"]
 
@@ -648,6 +710,33 @@ async def generate_rollout_async(
                     kept_groups += 1
                     pbar.update(args.n_samples_per_prompt)
 
+            if _should_abort_for_failed_rollout_groups(
+                completed_groups=completed_groups,
+                kept_groups=kept_groups,
+                failed_groups=failed_groups,
+                min_groups=failed_group_abort_min_groups,
+                ratio=failed_group_abort_ratio,
+            ):
+                reason = "dynamic sampling aborted after repeated all-failed rollout groups"
+                details = _format_dynamic_sampling_state(
+                    rollout_id=rollout_id,
+                    target_data_size=target_data_size,
+                    submitted_groups=submitted_groups,
+                    completed_groups=completed_groups,
+                    kept_groups=kept_groups,
+                    dropped_groups=dropped_groups,
+                    removed_groups=removed_groups,
+                    failed_groups=failed_groups,
+                    failed_samples=failed_samples,
+                    removed_samples=removed_samples,
+                    pending_groups=len(state.pendings),
+                    max_groups=max_groups,
+                    max_seconds=max_seconds,
+                    failed_group_abort_min_groups=failed_group_abort_min_groups,
+                    failed_group_abort_ratio=failed_group_abort_ratio,
+                )
+                raise RuntimeError(f"{reason}: {details}")
+
             if exhausted and len(data) < target_data_size and not state.pendings:
                 reason = "dynamic sampling reached max groups before collecting enough kept groups"
                 details = _format_dynamic_sampling_state(
@@ -658,11 +747,14 @@ async def generate_rollout_async(
                     kept_groups=kept_groups,
                     dropped_groups=dropped_groups,
                     removed_groups=removed_groups,
+                    failed_groups=failed_groups,
                     failed_samples=failed_samples,
                     removed_samples=removed_samples,
                     pending_groups=0,
                     max_groups=max_groups,
                     max_seconds=max_seconds,
+                    failed_group_abort_min_groups=failed_group_abort_min_groups,
+                    failed_group_abort_ratio=failed_group_abort_ratio,
                 )
                 raise RuntimeError(f"{reason}: {details}")
     except Exception:
@@ -704,10 +796,13 @@ async def generate_rollout_async(
             "rollout/dynamic_sampling/kept_groups": kept_groups,
             "rollout/dynamic_sampling/dropped_groups": dropped_groups,
             "rollout/dynamic_sampling/removed_groups": removed_groups,
+            "rollout/dynamic_sampling/failed_groups": failed_groups,
             "rollout/dynamic_sampling/removed_samples": removed_samples,
             "rollout/dynamic_sampling/failed_samples": failed_samples,
             "rollout/dynamic_sampling/max_groups": max_groups or 0,
             "rollout/dynamic_sampling/max_seconds": max_seconds or 0,
+            "rollout/dynamic_sampling/failed_group_abort_min_groups": failed_group_abort_min_groups or 0,
+            "rollout/dynamic_sampling/failed_group_abort_ratio": failed_group_abort_ratio,
         }
     )
 

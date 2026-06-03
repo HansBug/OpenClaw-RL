@@ -5,6 +5,7 @@ import concurrent.futures
 import json
 import logging
 import os
+import re
 import shlex
 import socket
 import sys
@@ -23,6 +24,29 @@ from inference_client import SGLangTurnClient
 logger = logging.getLogger(__name__)
 
 DEFAULT_A3S_CODE_TOOL_TIMEOUT_MS = 300_000
+
+_INTERACTIVE_SHELL_PATTERNS: tuple[tuple[re.Pattern[str], str], ...] = (
+    (
+        re.compile(r"(^|[;&|()\n]\s*)tmux\s+(?:a|attach|attach-session)\b"),
+        "tmux attach is interactive and can block the rollout",
+    ),
+    (
+        re.compile(r"(^|[;&|()\n]\s*)tmux\s+new(?:-session)?\b(?![^\n;&|]*\s-d(?:\s|$))"),
+        "tmux new-session without -d is interactive and can block the rollout",
+    ),
+    (
+        re.compile(r"(^|[;&|()\n]\s*)screen\s+-(?:r|R|x)\b"),
+        "screen attach is interactive and can block the rollout",
+    ),
+    (
+        re.compile(r"(^|[;&|()\n]\s*)(?:bash|sh|zsh|fish)\s+-i\b"),
+        "interactive shells are not allowed in rollout tool execution",
+    ),
+    (
+        re.compile(r"(^|[;&|()\n]\s*)(?:vim|vi|nano|emacs|less|more)\b"),
+        "interactive editors/pagers are not allowed in rollout tool execution",
+    ),
+)
 
 
 @dataclass
@@ -130,6 +154,9 @@ def _terminal_rl_prompt_extra(max_tool_rounds: int) -> str:
 - Long-running commands should be managed with non-blocking terminal execution
   if the exposed schema supports it; otherwise use explicit timeouts and write
   progress or logs to files that can be inspected later.
+- Do not attach to interactive terminal sessions or editors (`tmux attach`,
+  `screen -r`, interactive shells, vim/nano/less/more). Use non-interactive
+  commands and file outputs instead.
 - The session is limited to about {max_tool_rounds} A3S agent turns. Batch
   related inspection, implementation, and verification work so there is enough
   budget left to produce a final answer.
@@ -156,7 +183,7 @@ def _bootstrap_a3s_code() -> tuple[Any, Any, Any, Any]:
     repo_root = Path(
         os.getenv(
             "A3S_CODE_REPO_ROOT",
-            str(_repo_root().parent / "a3s-lab" / "Code"),
+            str(_repo_root().parent / "Code"),
         )
     )
     sdk_python = repo_root / "sdk" / "python"
@@ -513,6 +540,11 @@ class A3SCodeAgent:
         self._workspace = self._resolve_workspace()
         self._last_response: A3SCodeResponse | None = None
         self._tool_call_records: list[dict[str, Any]] = []
+        self._external_tool_errors_as_results = _env_flag(
+            "A3S_CODE_EXTERNAL_TOOL_ERRORS_AS_RESULTS", True
+        )
+        self._local_workspace_guard = _env_flag("A3S_CODE_LOCAL_WORKSPACE_GUARD", True)
+        self._workspace_baseline: dict[str, tuple[int, int]] = {}
 
     def set_max_parse_errors(self, max_parse_errors: int) -> None:
         self.max_parse_errors = max(1, int(max_parse_errors))
@@ -570,9 +602,21 @@ class A3SCodeAgent:
             raise TimeoutError(
                 f"a3s-code session.send timed out after {self._turn_timeout_sec:.0f}s"
             ) from exc
+        except Exception as exc:
+            try:
+                self._check_local_workspace_mutation()
+            except Exception as guard_exc:
+                self._close_session()
+                raise guard_exc from exc
+            raise
 
         interactions = self._bridge.interactions() if self._bridge is not None else []
         self._last_response = self._response_from_result(result)
+        try:
+            self._check_local_workspace_mutation()
+        except Exception:
+            self._close_session()
+            raise
         if not interactions:
             interactions = [self._fallback_interaction(turn_idx, self._last_response.msg)]
 
@@ -617,6 +661,43 @@ class A3SCodeAgent:
             path = root / f"a3s-code-{safe_task[:48]}-{uid}"
         path.mkdir(parents=True, exist_ok=True)
         return path
+
+    def _snapshot_workspace(self) -> dict[str, tuple[int, int]]:
+        snapshot: dict[str, tuple[int, int]] = {}
+        if not self._local_workspace_guard:
+            return snapshot
+        try:
+            for item in self._workspace.rglob("*"):
+                if not item.is_file():
+                    continue
+                rel = str(item.relative_to(self._workspace))
+                stat = item.stat()
+                snapshot[rel] = (int(stat.st_size), int(stat.st_mtime_ns))
+        except OSError as exc:
+            logger.warning("Failed to snapshot a3s-code workspace %s: %s", self._workspace, exc)
+        return snapshot
+
+    def _check_local_workspace_mutation(self) -> None:
+        if not self._local_workspace_guard:
+            return
+        before = self._workspace_baseline
+        after = self._snapshot_workspace()
+        changed = [
+            path
+            for path, stat in after.items()
+            if before.get(path) != stat
+        ]
+        deleted = [path for path in before if path not in after]
+        if not changed and not deleted:
+            return
+        preview = ", ".join((changed + deleted)[:8])
+        suffix = "" if len(changed) + len(deleted) <= 8 else ", ..."
+        raise RuntimeError(
+            "a3s-code local workspace mutation detected; tool execution likely "
+            "bypassed the terminal-rl Docker bridge. "
+            f"workspace={self._workspace} changed={len(changed)} "
+            f"deleted={len(deleted)} files=[{preview}{suffix}]"
+        )
 
     def _ensure_session(self, turn_idx: int = 0) -> None:
         if self._session is not None:
@@ -669,6 +750,7 @@ class A3SCodeAgent:
 
         self._agent = Agent.create(str(config_path))
         self._session = self._agent.session(str(self._workspace), opts)
+        self._workspace_baseline = self._snapshot_workspace()
 
     async def _run_send_thread(self, turn_idx: int) -> Any:
         loop = asyncio.get_running_loop()
@@ -757,9 +839,11 @@ class A3SCodeAgent:
             if payload is None:
                 payload = self._task_get(task, "args")
             args = payload if isinstance(payload, dict) else {}
-            mapped_name, mapped_args = self._map_tool_call(tool_name, args)
+            mapped_name = str(tool_name or "unknown")
+            mapped_args: dict[str, Any] = dict(args)
 
             try:
+                mapped_name, mapped_args = self._map_tool_call(tool_name, args)
                 output = self._exec_terminal_tool_on_loop(loop, mapped_name, mapped_args)
                 self._complete_external_task(
                     task_id,
@@ -783,11 +867,28 @@ class A3SCodeAgent:
                     }
                 )
             except Exception as exc:
+                error_output = (
+                    "[terminal-rl] Docker-bridged a3s-code tool execution failed: "
+                    f"{type(exc).__name__}: {exc}"
+                )
+                # The a3s-code core falls back to direct local execution when an
+                # external queue task is completed as failed. In terminal-rl that
+                # is unsafe: a failed Docker/env call must be surfaced to the
+                # model as a normal tool result, never retried on the GPU host.
+                complete_as_success = self._external_tool_errors_as_results
+                error_payload = {
+                    "output": error_output,
+                    "exit_code": 1,
+                    "metadata": {
+                        "terminal_rl_external_error": True,
+                        "error_type": type(exc).__name__,
+                    },
+                }
                 self._complete_external_task(
                     task_id,
-                    success=False,
-                    payload=None,
-                    error=str(exc),
+                    success=complete_as_success,
+                    payload=error_payload if complete_as_success else None,
+                    error=None if complete_as_success else error_output,
                 )
                 self._tool_call_records.append(
                     {
@@ -797,6 +898,9 @@ class A3SCodeAgent:
                         "args": mapped_args,
                         "sdk_args": args,
                         "error": f"{type(exc).__name__}: {exc}",
+                        "result": error_output[:4096],
+                        "exit_code": 1,
+                        "completed_as_result": complete_as_success,
                         "source": "a3s-code-sdk",
                     }
                 )
@@ -825,6 +929,16 @@ class A3SCodeAgent:
         if isinstance(task, dict):
             return task.get(key)
         return getattr(task, key, None)
+
+    @staticmethod
+    def _guard_shell_command(command: str) -> str:
+        command = str(command or "")
+        for pattern, reason in _INTERACTIVE_SHELL_PATTERNS:
+            if pattern.search(command):
+                raise RuntimeError(
+                    f"Refusing interactive shell command in a3s-code bridge: {reason}"
+                )
+        return command
 
     def _complete_external_task(
         self,
@@ -863,10 +977,16 @@ class A3SCodeAgent:
             "shell_write_to_process",
             "shell_write_content_to_file",
         }:
+            if tool_name == "shell_exec":
+                mapped_args = dict(args)
+                command = str(mapped_args.get("command") or mapped_args.get("cmd") or "")
+                mapped_args["command"] = A3SCodeAgent._guard_shell_command(command)
+                return tool_name, mapped_args
             return tool_name, args
 
         if tool_name in {"bash", "execute"}:
             command = str(args.get("command") or args.get("cmd") or "")
+            command = A3SCodeAgent._guard_shell_command(command)
             return "shell_exec", {"command": command}
 
         if tool_name == "read":

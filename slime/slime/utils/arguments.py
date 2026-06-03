@@ -415,6 +415,24 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 ),
             )
             parser.add_argument(
+                "--dynamic-sampling-failed-group-abort-min-groups",
+                type=int,
+                default=None,
+                help=(
+                    "Abort one dynamic-sampling rollout early when no group has been kept and at least this many "
+                    "completed prompt groups are entirely FAILED. Leave unset or use <=0 to disable."
+                ),
+            )
+            parser.add_argument(
+                "--dynamic-sampling-failed-group-abort-ratio",
+                type=float,
+                default=1.0,
+                help=(
+                    "Minimum all-FAILED completed-group ratio required by "
+                    "--dynamic-sampling-failed-group-abort-min-groups. Clamped to [0, 1]."
+                ),
+            )
+            parser.add_argument(
                 "--rollout-abort-wait-timeout",
                 type=float,
                 default=300.0,
@@ -536,6 +554,33 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 action="store_true",
                 default=False,
                 help="Whether to enable the fault tolerance function during rollout.",
+            )
+            parser.add_argument(
+                "--rollout-generation-max-retries",
+                type=int,
+                default=0,
+                help=(
+                    "How many times the train driver retries a failed rollout_manager.generate call. "
+                    "Use 0 to fail immediately and -1 to retry indefinitely."
+                ),
+            )
+            parser.add_argument(
+                "--rollout-generation-retry-initial-backoff",
+                type=float,
+                default=30.0,
+                help="Initial sleep seconds before retrying a failed rollout generation.",
+            )
+            parser.add_argument(
+                "--rollout-generation-retry-max-backoff",
+                type=float,
+                default=300.0,
+                help="Maximum sleep seconds between rollout generation retries.",
+            )
+            parser.add_argument(
+                "--rollout-generation-retry-backoff-multiplier",
+                type=float,
+                default=2.0,
+                help="Multiplier applied to rollout generation retry backoff after each failure.",
             )
             parser.add_argument(
                 "--rollout-health-check-interval",

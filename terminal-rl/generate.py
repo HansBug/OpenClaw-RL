@@ -2406,6 +2406,11 @@ async def generate(
             exc,
             exc_info=True,
         )
+        metadata = sample.metadata if isinstance(sample.metadata, dict) else {}
+        sample.metadata = dict(metadata)
+        sample.metadata["generate_failed"] = True
+        sample.metadata["generate_error_type"] = type(exc).__name__
+        sample.metadata["generate_error"] = str(exc)
         sample.status = Sample.Status.FAILED
         sample.remove_sample = True
         sample.reward = {"score": 0.0}
