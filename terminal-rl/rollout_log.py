@@ -77,7 +77,7 @@ _REWARD_DETAIL_NUMERIC_KEYS = (
 )
 _STRUCTURED_LOG_PREFIX = "TERMINAL_RL_METRIC_JSON"
 _STRUCTURED_SCHEMA = "terminal_rl.per_dataset_metrics.v1"
-_STRUCTURED_SCHEMA_VERSION = 2
+_STRUCTURED_SCHEMA_VERSION = 3
 _LAST_EVAL_BY_DATASET: dict[str, dict[str, Any]] = {}
 
 
@@ -262,6 +262,41 @@ def _mean_token_logprob(sample: Sample) -> float | None:
     return sum(nums) / len(nums)
 
 
+def _trajectory_uncertainty_summaries(samples: List[Sample]) -> list[dict[str, Any]]:
+    summaries: list[dict[str, Any]] = []
+    seen: set[tuple[Any, ...]] = set()
+    for sample in samples:
+        metadata = _as_dict(getattr(sample, "metadata", None))
+        summary = _as_dict(metadata.get("trajectory_uncertainty"))
+        if not summary:
+            continue
+        key = (
+            summary.get("uid"),
+            summary.get("group_index"),
+            summary.get("sample_index"),
+            summary.get("rollout_id"),
+        )
+        if not any(v is not None for v in key):
+            key = ("sample", id(sample))
+        if key in seen:
+            continue
+        seen.add(key)
+        summaries.append(summary)
+    return summaries
+
+
+def _trajectory_uncertainty_mean(samples: List[Sample], key: str) -> float | None:
+    values = [
+        v for v in (
+            _to_float(summary.get(key))
+            for summary in _trajectory_uncertainty_summaries(samples)
+        )
+        if v is not None
+    ]
+    stats = _stats(values)
+    return _stats_mean(stats)
+
+
 def _stats(values: List[float]) -> dict[str, float] | None:
     nums = []
     for value in values:
@@ -314,6 +349,55 @@ def _add_stats(
     for key in keys:
         log_dict[f"{prefix}/{key}"] = stats[key]
     return stats
+
+
+def _add_turn_uncertainty_metrics(
+    log_dict: Dict[str, Any],
+    prefix: str,
+    samples: List[Sample],
+) -> dict[str, dict[str, float]]:
+    summaries = _trajectory_uncertainty_summaries(samples)
+    out: dict[str, dict[str, float]] = {}
+    if not summaries:
+        return out
+
+    numeric_keys = {
+        "mean_turn_level_uncertainty": "mean_neg_logprob",
+        "mean_turn_level_score": "mean_score",
+        "mean_abs_score_delta": "mean_abs_score_delta",
+        "low_progress_fraction": "low_progress_fraction",
+        "available_turn_count": "available_turn_count",
+        "missing_turn_count": "missing_turn_count",
+    }
+    for source_key, metric_name in numeric_keys.items():
+        values = [
+            v for v in (_to_float(summary.get(source_key)) for summary in summaries)
+            if v is not None
+        ]
+        if not values:
+            continue
+        stats = _add_stats(
+            log_dict,
+            f"{prefix}/turn_uncertainty/{metric_name}",
+            values,
+        )
+        if stats:
+            out[source_key] = stats
+
+    low_counts = [
+        _to_float(summary.get("low_progress_turn_count")) for summary in summaries
+    ]
+    avail_counts = [
+        _to_float(summary.get("available_turn_count")) for summary in summaries
+    ]
+    low_total = sum(v for v in low_counts if v is not None)
+    avail_total = sum(v for v in avail_counts if v is not None)
+    if avail_total > 0:
+        log_dict[f"{prefix}/turn_uncertainty/low_progress_turn_ratio"] = (
+            low_total / avail_total
+        )
+
+    return out
 
 
 def _add_exploration_debug_metrics(
@@ -534,6 +618,18 @@ def _metric_record_from_samples(
     status_counts: dict[str, int] = defaultdict(int)
     for sample in samples:
         status_counts[_status_name(sample)] += 1
+    sample_count = len(samples)
+    truncated_count = int(status_counts.get(Sample.Status.TRUNCATED.value, 0))
+    turn_uncertainty_mean = _trajectory_uncertainty_mean(
+        samples, "mean_turn_level_uncertainty"
+    )
+    turn_score_mean = _trajectory_uncertainty_mean(samples, "mean_turn_level_score")
+    turn_score_delta_mean = _trajectory_uncertainty_mean(
+        samples, "mean_abs_score_delta"
+    )
+    low_progress_fraction = _trajectory_uncertainty_mean(
+        samples, "low_progress_fraction"
+    )
 
     # Exploration reward is additive reward shaping produced in generate.py:
     # count/signature novelty, optional LP-RND logprob surprise, optional CDE
@@ -550,10 +646,13 @@ def _metric_record_from_samples(
         "global_step": int(step),
         "epoch": _epoch(args),
         "rollout_id": int(rollout_id),
-        "sample_count": len(samples),
+        "sample_count": sample_count,
         "trainable_count": len(trainable),
         "completed": int(status_counts.get(Sample.Status.COMPLETED.value, 0)),
-        "truncated": int(status_counts.get(Sample.Status.TRUNCATED.value, 0)),
+        "truncated": truncated_count,
+        "truncated_fraction": (
+            truncated_count / sample_count if sample_count > 0 else None
+        ),
         "failed": int(status_counts.get(Sample.Status.FAILED.value, 0)),
         "aborted": int(status_counts.get(Sample.Status.ABORTED.value, 0)),
         "reward/total": _stats_mean(total_stats),
@@ -578,6 +677,10 @@ def _metric_record_from_samples(
         ),
         "kl": kl,
         "entropy": entropy,
+        "turn_uncertainty/mean_neg_logprob": turn_uncertainty_mean,
+        "turn_uncertainty/mean_score": turn_score_mean,
+        "turn_uncertainty/mean_abs_score_delta": turn_score_delta_mean,
+        "turn_uncertainty/low_progress_fraction": low_progress_fraction,
         "rollout_time_sec": rollout_time,
     }
 
@@ -610,6 +713,7 @@ def _metric_record_from_rewards(
         "trainable_count": len(rewards),
         "completed": None,
         "truncated": None,
+        "truncated_fraction": None,
         "failed": None,
         "aborted": None,
         "reward/total": _stats_mean(stats),
@@ -700,11 +804,16 @@ def _add_per_dataset_log_dict(log_dict: Dict[str, Any], records: list[dict[str, 
             "task_reward",
             "raw_reward",
             "exploration_reward",
+            "truncated_fraction",
             "test_acc",
             "reward_std",
             "response_length",
             "kl",
             "entropy",
+            "turn_uncertainty/mean_neg_logprob",
+            "turn_uncertainty/mean_score",
+            "turn_uncertainty/mean_abs_score_delta",
+            "turn_uncertainty/low_progress_fraction",
         ):
             value = record.get(key)
             if value is not None:
@@ -912,6 +1021,7 @@ def _dataset_metrics(
                     component_stats[reward_key] = stats
 
         explore_summary = _add_exploration_debug_metrics(log_dict, prefix, dataset_samples)
+        _add_turn_uncertainty_metrics(log_dict, prefix, dataset_samples)
 
         safety_values = [v for v in (_reward_value(s, "safety_score") for s in trainable) if v is not None]
         if safety_values:
@@ -1282,6 +1392,7 @@ def rollout_log(rollout_id, args, samples, rollout_extra_metrics, rollout_time):
     dataset_log_dict, dataset_rows, split_rows = _dataset_metrics(samples)
     log_dict.update(dataset_log_dict)
     _add_exploration_debug_metrics(log_dict, "terminal", samples)
+    _add_turn_uncertainty_metrics(log_dict, "terminal", samples)
 
     n_cs_calls = 0
     n_cs_errors = 0

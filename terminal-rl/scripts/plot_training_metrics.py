@@ -100,6 +100,8 @@ def _parse_log(log_path: Path) -> dict[str, Any]:
     reset500_per_min: Counter = Counter()
     structured_metrics: list[dict[str, Any]] = []
     reward_breakdown_records: list[dict[str, Any]] = []
+    error_events: list[dict[str, Any]] = []
+    pending_closes: list[dict[str, Any]] = []
     reward_table_rollout: int | None = None
     reward_table_step: int | None = None
 
@@ -107,6 +109,55 @@ def _parse_log(log_path: Path) -> dict[str, Any]:
     with log_path.open(errors="replace") as f:
         for line_no, line in enumerate(f, start=1):
             clean_line = _clean_log_payload(line)
+            ts_match = TIMESTAMP_RE.search(clean_line)
+            timestamp = ts_match.group(1) if ts_match else None
+            minute = timestamp[:16] if timestamp else None
+
+            def add_error_event(kind: str) -> None:
+                error_events.append(
+                    {
+                        "kind": kind,
+                        "timestamp": timestamp,
+                        "minute": minute,
+                        "line": line_no,
+                    }
+                )
+
+            if "Server error '503" in clean_line and "/allocate" in clean_line:
+                add_error_event("allocate_503")
+            if "WORKER_PENDING_CLOSES_PRESSURE" in clean_line:
+                add_error_event("pending_closes_pressure")
+            if "Server error '500" in clean_line and "/reset" in clean_line:
+                add_error_event("reset_500")
+            if "Server error '500" in clean_line and "/evaluate" in clean_line:
+                add_error_event("evaluate_500")
+            if "Server error '500" in clean_line and "/heartbeat" in clean_line:
+                add_error_event("heartbeat_500")
+            if "Unknown run lease id" in clean_line or "UNKNOWN_RUN_LEASE" in clean_line:
+                add_error_event("unknown_lease")
+            if "Generate failed" in clean_line:
+                add_error_event("generate_failed")
+            if "Max tool rounds" in clean_line:
+                add_error_event("max_tool_rounds")
+            if "a3s-code session.send timed out" in clean_line:
+                add_error_event("a3s_timeout")
+            m_pending = re.search(
+                r"pending_closes (\d+) >= allocate threshold (\d+)", clean_line
+            )
+            if m_pending:
+                attempt_match = re.search(r"attempt (\d+)/(\d+)", clean_line)
+                pending_closes.append(
+                    {
+                        "timestamp": timestamp,
+                        "minute": minute,
+                        "line": line_no,
+                        "value": int(m_pending.group(1)),
+                        "threshold": int(m_pending.group(2)),
+                        "attempt": int(attempt_match.group(1)) if attempt_match else None,
+                        "attempt_max": int(attempt_match.group(2)) if attempt_match else None,
+                    }
+                )
+
             m_table = REWARD_BREAKDOWN_RE.search(clean_line)
             if m_table:
                 reward_table_rollout = int(m_table.group(1))
@@ -215,6 +266,8 @@ def _parse_log(log_path: Path) -> dict[str, Any]:
         reset500_per_min=reset500_per_min,
         structured_metrics=structured_metrics,
         reward_breakdown_records=reward_breakdown_records,
+        error_events=error_events,
+        pending_closes=pending_closes,
     )
 
 
@@ -440,6 +493,44 @@ def _structured_series(
     return xs, ys
 
 
+def _structured_ratio_series(
+    records: list[dict[str, Any]],
+    dataset: str,
+    numerator_key: str,
+    denominator_key: str,
+    *,
+    ratio_key: str | None = None,
+    break_gaps: bool = True,
+) -> tuple[list[int], list[float]]:
+    points: list[tuple[int, float]] = []
+    for record in records:
+        if record.get("dataset") != dataset:
+            continue
+        value = _num(record.get(ratio_key)) if ratio_key else None
+        if value is None:
+            numerator = _num(record.get(numerator_key))
+            denominator = _num(record.get(denominator_key))
+            if numerator is None or denominator is None or denominator <= 0:
+                continue
+            value = numerator / denominator
+        points.append((_structured_axis(record), value))
+    points.sort(key=lambda item: item[0])
+    if not break_gaps or len(points) <= 1:
+        return [x for x, _ in points], [y for _, y in points]
+
+    xs: list[int] = []
+    ys: list[float] = []
+    last_x: int | None = None
+    for x, y in points:
+        if last_x is not None and x > last_x + 1:
+            xs.append(last_x + 1)
+            ys.append(float("nan"))
+        xs.append(x)
+        ys.append(y)
+        last_x = x
+    return xs, ys
+
+
 def _plot_structured_lines(
     ax: Any,
     records: list[dict[str, Any]],
@@ -483,6 +574,48 @@ def _plot_structured_lines(
     return plotted
 
 
+def _plot_truncated_fraction_by_dataset(
+    ax: Any,
+    records: list[dict[str, Any]],
+    *,
+    fallback: tuple[list[int], list[Any], str] | None = None,
+) -> bool:
+    plotted = False
+    for dataset in _structured_dataset_names(records, include_overall=True):
+        xs, ys = _structured_ratio_series(
+            records,
+            dataset,
+            "truncated",
+            "sample_count",
+            ratio_key="truncated_fraction",
+        )
+        if not ys:
+            continue
+        kwargs = {"label": dataset, "alpha": 0.8}
+        if dataset == "mixed-all":
+            kwargs.update({"color": "black", "lw": 2.0, "alpha": 0.9})
+        ax.plot(xs, ys, ".-", **kwargs)
+        plotted = True
+
+    if not plotted and fallback is not None:
+        xs, raw_ys, label = fallback
+        fallback_x, fallback_y = _numeric_points(xs, raw_ys)
+        if fallback_y:
+            ax.plot(fallback_x, fallback_y, ".-", label=label)
+            plotted = True
+
+    ax.set_title("truncated fraction by dataset")
+    ax.set_xlabel("rollout")
+    ax.set_ylabel("fraction")
+    ax.set_ylim(-0.03, 1.03)
+    ax.grid(alpha=0.3)
+    if plotted:
+        ax.legend(fontsize=8)
+    else:
+        ax.text(0.5, 0.5, "no compatible truncated fields", ha="center", va="center", transform=ax.transAxes)
+    return plotted
+
+
 def _structured_reward_summary(records: list[dict[str, Any]]) -> dict[str, Any]:
     summary: dict[str, Any] = {}
     for dataset in _structured_dataset_names(records, include_overall=True):
@@ -511,10 +644,20 @@ def _structured_reward_summary(records: list[dict[str, Any]]) -> dict[str, Any]:
             ("reward_std", "reward_std"),
             ("sample_count", "sample_count"),
             ("trainable_count", "trainable_count"),
+            ("truncated", "truncated_count"),
         ):
             _, values = _structured_series(records, dataset, key)
             if values:
                 item[label] = _stats(values, label)
+        _, trunc_frac_values = _structured_ratio_series(
+            records,
+            dataset,
+            "truncated",
+            "sample_count",
+            ratio_key="truncated_fraction",
+        )
+        if trunc_frac_values:
+            item["truncated_fraction"] = _stats(trunc_frac_values, "truncated_fraction")
         summary[dataset] = item
     return summary
 
@@ -652,6 +795,239 @@ def _plot_entropy_and_kl(
             [label for _, label in legend_items],
             fontsize=8,
         )
+
+
+def _load_trajectory_samples(out_dir: Path) -> tuple[list[dict[str, Any]], Counter]:
+    path = out_dir / "trajectory_classification.json"
+    if not path.is_file():
+        return [], Counter()
+    try:
+        payload = json.loads(path.read_text())
+    except Exception:
+        return [], Counter()
+
+    class_counts = Counter(payload.get("class_distribution") or {})
+    samples: list[dict[str, Any]] = []
+    for class_name, class_samples in (payload.get("samples_per_class") or {}).items():
+        if not isinstance(class_samples, list):
+            continue
+        for sample in class_samples:
+            if not isinstance(sample, dict):
+                continue
+            item = dict(sample)
+            item.setdefault("class", class_name)
+            samples.append(item)
+    if not class_counts and samples:
+        class_counts.update(str(s.get("class") or "unknown") for s in samples)
+    return samples, class_counts
+
+
+def _event_counts(parsed: dict[str, Any]) -> Counter:
+    return Counter(str(event.get("kind")) for event in parsed.get("error_events") or [])
+
+
+def _plot_counts_bar(ax: Any, counts: Counter, title: str, *, top_n: int = 12) -> None:
+    if not counts:
+        ax.text(0.5, 0.5, "no events parsed", ha="center", va="center", transform=ax.transAxes)
+        ax.set_title(title)
+        return
+    items = counts.most_common(top_n)
+    labels = [name for name, _ in items]
+    values = [value for _, value in items]
+    ax.barh(range(len(labels)), values, color="tab:red", alpha=0.75)
+    ax.set_yticks(range(len(labels)))
+    ax.set_yticklabels(labels)
+    ax.invert_yaxis()
+    ax.set_xlabel("log lines")
+    if max(values) > 100:
+        ax.set_xscale("log")
+        ax.set_xlabel("log lines (log scale)")
+    ax.grid(alpha=0.3, axis="x")
+    ax.set_title(title)
+
+
+def _plot_event_timeline(
+    ax: Any,
+    parsed: dict[str, Any],
+    *,
+    kinds: list[str] | None = None,
+    title: str = "error events by minute",
+) -> None:
+    events = [
+        event for event in (parsed.get("error_events") or [])
+        if event.get("minute") and (kinds is None or event.get("kind") in kinds)
+    ]
+    if not events:
+        ax.text(0.5, 0.5, "no timestamped events parsed", ha="center", va="center", transform=ax.transAxes)
+        ax.set_title(title)
+        return
+    minutes = sorted({str(event["minute"]) for event in events})
+    selected_kinds = kinds or [kind for kind, _ in Counter(str(e.get("kind")) for e in events).most_common(6)]
+    by_key = Counter((str(event["minute"]), str(event.get("kind"))) for event in events)
+    bottom = [0] * len(minutes)
+    xs = list(range(len(minutes)))
+    for kind in selected_kinds:
+        ys = [by_key[(minute, kind)] for minute in minutes]
+        if not any(ys):
+            continue
+        ax.bar(xs, ys, bottom=bottom, label=kind, alpha=0.75)
+        bottom = [a + b for a, b in zip(bottom, ys)]
+    step = max(1, len(minutes) // 8)
+    ax.set_xticks(xs[::step])
+    ax.set_xticklabels([minutes[i][11:] for i in xs[::step]], rotation=45, ha="right")
+    ax.set_xlabel("time (HH:MM)")
+    ax.set_ylabel("events/min")
+    ax.grid(alpha=0.3, axis="y")
+    ax.legend(fontsize=8)
+    ax.set_title(title)
+
+
+def _plot_pending_closes(ax: Any, pending: list[dict[str, Any]], title: str) -> None:
+    if not pending:
+        ax.text(0.5, 0.5, "no pending_closes samples parsed", ha="center", va="center", transform=ax.transAxes)
+        ax.set_title(title)
+        return
+    step = max(1, len(pending) // 4000)
+    sampled = pending[::step]
+    xs = [int(item.get("line") or i) for i, item in enumerate(sampled)]
+    ys = [int(item.get("value")) for item in sampled if item.get("value") is not None]
+    thresholds = [int(item.get("threshold")) for item in sampled if item.get("threshold") is not None]
+    xs = xs[: len(ys)]
+    ax.plot(xs, ys, ".", ms=2, alpha=0.45, label="pending_closes")
+    if thresholds:
+        ax.axhline(thresholds[-1], color="tab:red", ls="--", lw=1.2, label=f"threshold={thresholds[-1]}")
+    ax.set_xlabel("log line")
+    ax.set_ylabel("pending closes")
+    ax.grid(alpha=0.3)
+    ax.legend(fontsize=8)
+    ax.set_title(title)
+
+
+def _plot_no_data_text(ax: Any, title: str, lines: list[str]) -> None:
+    ax.axis("off")
+    ax.set_title(title)
+    ax.text(
+        0.02,
+        0.95,
+        "\n".join(lines),
+        va="top",
+        ha="left",
+        family="monospace",
+        fontsize=10,
+        transform=ax.transAxes,
+    )
+
+
+def _plot_no_training_diagnostics(parsed: dict[str, Any], out_dir: Path, run_name: str) -> None:
+    os.environ.setdefault("MPLCONFIGDIR", "/tmp/matplotlib")
+    Path(os.environ["MPLCONFIGDIR"]).mkdir(parents=True, exist_ok=True)
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    figs_dir = out_dir / "figs"
+    figs_dir.mkdir(parents=True, exist_ok=True)
+
+    event_counts = _event_counts(parsed)
+    pending = parsed.get("pending_closes") or []
+    samples, class_counts = _load_trajectory_samples(out_dir)
+
+    def fig_save(name: str) -> None:
+        plt.tight_layout()
+        plt.savefig(figs_dir / name, dpi=120)
+        plt.close()
+
+    print("[+] plotting no-training diagnostic overview.png")
+    fig, axes = plt.subplots(2, 2, figsize=(16, 10))
+    _plot_counts_bar(axes[0, 0], event_counts, "error/event counts")
+    _plot_pending_closes(axes[0, 1], pending, "remote env pending_closes pressure")
+    _plot_event_timeline(
+        axes[1, 0],
+        parsed,
+        kinds=["allocate_503", "pending_closes_pressure", "reset_500", "generate_failed"],
+        title="main failure events by minute",
+    )
+    _plot_counts_bar(axes[1, 1], class_counts, "saved trajectory classes")
+    fig.suptitle(f"No rollout/train metrics parsed: {run_name}", fontsize=13)
+    fig_save("overview.png")
+
+    print("[+] plotting no-training diagnostic reward_curve.png")
+    fig, ax = plt.subplots(1, 1, figsize=(12, 4.5))
+    if samples:
+        labels = [
+            f"t{sample.get('task_name')}\n{sample.get('uid')}"
+            for sample in samples
+        ]
+        raw_scores = [_num(sample.get("raw_score")) for sample in samples]
+        scores = [_num(sample.get("score")) for sample in samples]
+        xs = list(range(len(samples)))
+        if any(v is not None for v in raw_scores):
+            ax.plot(xs, [v if v is not None else float("nan") for v in raw_scores], "o-", label="raw_score")
+        if any(v is not None for v in scores):
+            ax.plot(xs, [v if v is not None else float("nan") for v in scores], "o-", label="score")
+        ax.set_xticks(xs)
+        ax.set_xticklabels(labels, rotation=0)
+        ax.axhline(0, color="gray", ls=":", lw=0.8)
+        ax.set_ylabel("trajectory score")
+        ax.legend(fontsize=8)
+        ax.grid(alpha=0.3)
+    else:
+        ax.text(0.5, 0.5, "no rollout rewards or saved trajectory scores", ha="center", va="center", transform=ax.transAxes)
+    ax.set_title("Reward diagnostics from saved trajectories")
+    fig_save("reward_curve.png")
+
+    print("[+] plotting no-training diagnostic response_length.png")
+    fig, axes = plt.subplots(1, 2, figsize=(13, 4.5))
+    if samples:
+        turns = [_num(sample.get("num_turns")) for sample in samples]
+        labels = [f"t{sample.get('task_name')}" for sample in samples]
+        xs = list(range(len(samples)))
+        axes[0].bar(xs, [v if v is not None else 0 for v in turns], color="tab:blue", alpha=0.75)
+        axes[0].set_xticks(xs)
+        axes[0].set_xticklabels(labels, rotation=30, ha="right")
+        axes[0].set_ylabel("turns")
+        axes[0].grid(alpha=0.3, axis="y")
+    else:
+        axes[0].text(0.5, 0.5, "no saved trajectories", ha="center", va="center", transform=axes[0].transAxes)
+    axes[0].set_title("turns per saved trajectory")
+    _plot_counts_bar(
+        axes[1],
+        Counter({k: event_counts[k] for k in ("max_tool_rounds", "a3s_timeout", "generate_failed") if event_counts.get(k)}),
+        "a3s-code generation events",
+    )
+    fig_save("response_length.png")
+
+    print("[+] plotting no-training diagnostic loss_curve.png")
+    fig, ax = plt.subplots(1, 1, figsize=(12, 4.5))
+    _plot_event_timeline(
+        ax,
+        parsed,
+        kinds=["generate_failed", "reset_500", "evaluate_500", "heartbeat_500", "unknown_lease"],
+        title="generation/reset/evaluate failures by minute",
+    )
+    fig_save("loss_curve.png")
+
+    print("[+] plotting no-training diagnostic grad_norm.png")
+    fig, ax = plt.subplots(1, 1, figsize=(12, 4.5))
+    _plot_pending_closes(ax, pending, "pending_closes samples during /allocate refusal")
+    fig_save("grad_norm.png")
+
+    print("[+] plotting no-training diagnostic kl_entropy.png")
+    fig, ax = plt.subplots(1, 1, figsize=(12, 4.5))
+    lines = [
+        "No train metrics were parsed, so entropy/KL curves are unavailable.",
+        "",
+        f"rollout metrics: {len(parsed.get('rollout_metrics') or {})}",
+        f"train metrics:   {len(parsed.get('train_metrics') or {})}",
+        f"trajectories:    {sum(class_counts.values()) if class_counts else 0}",
+        f"allocate_503:    {event_counts.get('allocate_503', 0)}",
+        f"pending pressure:{event_counts.get('pending_closes_pressure', 0)}",
+        f"reset_500:       {event_counts.get('reset_500', 0)}",
+        f"max_tool_rounds: {event_counts.get('max_tool_rounds', 0)}",
+        f"a3s timeouts:    {event_counts.get('a3s_timeout', 0)}",
+    ]
+    _plot_no_data_text(ax, "Entropy / KL unavailable", lines)
+    fig_save("kl_entropy.png")
 
 
 def _plot_all(
@@ -883,18 +1259,11 @@ def _plot_all(
     if axs[6].lines:
         axs[6].legend(fontsize=8)
 
-    axs[7].plot(r_ids, trunc, ".-", label="legacy/global")
-    if structured_records:
-        for dataset in _structured_dataset_names(structured_records, include_overall=True):
-            xs_trunc, ys_trunc = _structured_series(structured_records, dataset, "truncated")
-            if ys_trunc:
-                kwargs = {"label": dataset, "alpha": 0.75}
-                if dataset == "mixed-all":
-                    kwargs.update({"color": "black", "lw": 2.0, "alpha": 0.9})
-                axs[7].plot(xs_trunc, ys_trunc, ".-", **kwargs)
-    axs[7].set_title("truncated count/fraction")
-    axs[7].legend(fontsize=8)
-    axs[7].grid(alpha=0.3)
+    _plot_truncated_fraction_by_dataset(
+        axs[7],
+        structured_records,
+        fallback=(r_ids, trunc, "legacy/global fraction"),
+    )
 
     _plot_structured_lines(
         axs[8],
@@ -954,6 +1323,8 @@ def _build_summary(
     parse_errs = parsed["parse_errs"]
     reset500_per_min = parsed["reset500_per_min"]
     structured_records = _structured_train_records(parsed)
+    error_counts = _event_counts(parsed)
+    pending_closes = parsed.get("pending_closes") or []
 
     r_ids = sorted(rollout_metrics)
     t_ids, train_points, train_axis_label = _train_axis(parsed)
@@ -1027,6 +1398,21 @@ def _build_summary(
             else None
         ),
         "parse_error_total": int(sum(parse_errs)) if parse_errs else 0,
+        "no_training_diagnostics": {
+            "no_rollout_or_train_metrics": not rollout_metrics and not train_metrics,
+            "error_counts": dict(error_counts),
+            "pending_closes": (
+                {
+                    "n_samples": len(pending_closes),
+                    "min": min(int(item["value"]) for item in pending_closes),
+                    "max": max(int(item["value"]) for item in pending_closes),
+                    "last": int(pending_closes[-1]["value"]),
+                    "threshold_last": int(pending_closes[-1]["threshold"]),
+                }
+                if pending_closes
+                else None
+            ),
+        },
     }
     return summary
 
@@ -1056,7 +1442,13 @@ def plot_run(
 
     if not rollout_metrics and not train_metrics:
         print("[!] no rollouts or train steps parsed — empty log?")
-        return {}
+        summary = _build_summary(parsed, collapse=None, run_name=run_dir.name)
+        json_path = out_dir / "summary_stats.json"
+        json_path.write_text(json.dumps(summary, indent=2, default=str))
+        print(f"[+] wrote {json_path}")
+        if not no_figs:
+            _plot_no_training_diagnostics(parsed, out_dir=out_dir, run_name=run_dir.name)
+        return summary
 
     print(
         f"  rollouts: {len(rollout_metrics)} "

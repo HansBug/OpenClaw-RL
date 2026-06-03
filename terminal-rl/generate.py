@@ -108,6 +108,23 @@ _EXPLORE_LPRND_WARMUP = _env_int("EXPLORE_LPRND_WARMUP", 32)
 # Running stats for normalization (process-level, updated online).
 _LPRND_STATS = {"warmup": 0, "n": 0, "mean": 0.0, "m2": 0.0}
 
+# ── T2PO-style turn uncertainty diagnostics ─────────────────────────────────
+# Logging-only. This does not alter sampling or rewards. T2PO's original turn
+# score uses logits entropy + max-logprob during generation; OpenClaw currently
+# persists sampled-token log-probs, so this records a mean-logprob proxy.
+_TURN_UNCERTAINTY_SCHEMA = "openclaw.t2po_turn_uncertainty"
+_TURN_UNCERTAINTY_SCHEMA_VERSION = 1
+_TURN_UNCERTAINTY_ENABLED = _env_bool("T2PO_TURN_UNCERTAINTY_LOGGING", True)
+_TURN_UNCERTAINTY_WARMUP_TOKENS = max(
+    0, _env_int("T2PO_TURN_UNCERTAINTY_WARMUP_TOKENS", 0)
+)
+_TURN_UNCERTAINTY_FINGERPRINT_TOKENS = max(
+    1, _env_int("T2PO_TURN_UNCERTAINTY_FINGERPRINT_TOKENS", 32)
+)
+_TURN_LOW_PROGRESS_THRESHOLD = max(
+    0.0, _env_float("T2PO_TURN_LOW_PROGRESS_THRESHOLD", 0.3)
+)
+
 # ── Exploration: CDE actor curiosity bonus (RLVR PPL bonus) ──────────────────
 # Optional actor-side Curiosity-Driven Exploration bonus:
 #   B_actor(q,o) = -mean_t log pi(o_t | o_<t, q)
@@ -334,6 +351,205 @@ def _explore_lprnd_bonus(interactions) -> float:
     std = max(math.sqrt(var), 1e-6)
     z = (surprise - s["mean"]) / std
     return max(0.0, min(_EXPLORE_LPRND_CLIP, z))
+
+
+def _finite_float(value: Any) -> float | None:
+    try:
+        out = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(out):
+        return None
+    return out
+
+
+def _token_fingerprint(token_ids: list[int], limit: int) -> str | None:
+    if not token_ids:
+        return None
+    try:
+        payload = json.dumps(
+            [int(x) for x in token_ids[:limit]],
+            separators=(",", ":"),
+        ).encode("utf-8")
+    except Exception:
+        return None
+    return hashlib.sha256(payload).hexdigest()[:16]
+
+
+def _turn_uncertainty_metrics(
+    interaction: Interaction,
+    *,
+    previous_turn_score: float | None = None,
+) -> dict[str, Any]:
+    """Build T2PO-style turn diagnostics from sampled-token log-probs."""
+    if not _TURN_UNCERTAINTY_ENABLED:
+        return {}
+
+    output_ids = list(interaction.output_token_ids or [])
+    raw_logprobs = list(interaction.output_token_logprobs or [])
+    nums = [_finite_float(v) for v in raw_logprobs]
+    nums = [v for v in nums if v is not None]
+
+    record: dict[str, Any] = {
+        "schema": _TURN_UNCERTAINTY_SCHEMA,
+        "schema_version": _TURN_UNCERTAINTY_SCHEMA_VERSION,
+        "source": "rollout_logprobs",
+        "score_kind": "mean_sampled_token_logprob_proxy",
+        "turn_idx": int(interaction.turn_idx),
+        "available": False,
+        "n_input_tokens": len(interaction.input_ids or []),
+        "n_output_tokens": len(output_ids),
+        "n_logprob_tokens": len(nums),
+        "ignored_prefix_tokens": min(_TURN_UNCERTAINTY_WARMUP_TOKENS, len(nums)),
+        "fingerprint": _token_fingerprint(
+            output_ids, _TURN_UNCERTAINTY_FINGERPRINT_TOKENS
+        ),
+        "fingerprint_tokens": _TURN_UNCERTAINTY_FINGERPRINT_TOKENS,
+        "finish_reason": interaction.finish_reason,
+        "latency_ms": float(interaction.latency_ms or 0.0),
+        "low_progress_threshold": _TURN_LOW_PROGRESS_THRESHOLD,
+    }
+
+    if not nums:
+        record["missing_reason"] = "missing_output_token_logprobs"
+        return record
+
+    scored = nums[_TURN_UNCERTAINTY_WARMUP_TOKENS:]
+    if not scored:
+        record["missing_reason"] = "all_tokens_skipped_by_warmup"
+        return record
+
+    count = len(scored)
+    mean_logprob = sum(scored) / count
+    variance = sum((x - mean_logprob) ** 2 for x in scored) / count
+    mean_neg_logprob = -mean_logprob
+    turn_score = mean_logprob
+
+    record.update(
+        {
+            "available": True,
+            "n_scored_tokens": count,
+            "turn_level_score": turn_score,
+            "turn_level_uncertainty": mean_neg_logprob,
+            "mean_logprob": mean_logprob,
+            "std_logprob": math.sqrt(max(variance, 0.0)),
+            "min_logprob": min(scored),
+            "max_logprob": max(scored),
+            "mean_neg_logprob": mean_neg_logprob,
+            "sum_neg_logprob": -sum(scored),
+            "log_ppl": mean_neg_logprob,
+            "ppl": math.exp(min(mean_neg_logprob, 50.0)),
+            "first_scored_logprob": scored[0],
+            "last_scored_logprob": scored[-1],
+        }
+    )
+
+    if previous_turn_score is not None and math.isfinite(previous_turn_score):
+        delta = turn_score - previous_turn_score
+        abs_delta = abs(delta)
+        record["score_delta_from_prev"] = delta
+        record["abs_score_delta_from_prev"] = abs_delta
+        record["low_progress_from_prev"] = (
+            abs_delta > 0.0 and abs_delta < _TURN_LOW_PROGRESS_THRESHOLD
+        )
+    else:
+        record["score_delta_from_prev"] = None
+        record["abs_score_delta_from_prev"] = None
+        record["low_progress_from_prev"] = False
+
+    return record
+
+
+def _summarize_turn_uncertainty(
+    records: list[dict[str, Any]],
+    *,
+    run_ctx: RunContext,
+) -> dict[str, Any]:
+    if not _TURN_UNCERTAINTY_ENABLED:
+        return {}
+
+    all_records = [r for r in records if isinstance(r, dict) and r]
+    available = [r for r in all_records if r.get("available")]
+
+    def collect(key: str) -> list[float]:
+        vals: list[float] = []
+        for rec in available:
+            num = _finite_float(rec.get(key))
+            if num is not None:
+                vals.append(num)
+        return vals
+
+    def stats(values: list[float]) -> dict[str, float | int] | None:
+        if not values:
+            return None
+        mean = sum(values) / len(values)
+        var = sum((x - mean) ** 2 for x in values) / len(values)
+        return {
+            "count": len(values),
+            "mean": mean,
+            "std": math.sqrt(max(var, 0.0)),
+            "min": min(values),
+            "max": max(values),
+        }
+
+    scores = collect("turn_level_score")
+    uncertainties = collect("turn_level_uncertainty")
+    deltas = collect("abs_score_delta_from_prev")
+    score_stats = stats(scores)
+    uncertainty_stats = stats(uncertainties)
+    delta_stats = stats(deltas)
+    low_progress_count = sum(1 for r in available if r.get("low_progress_from_prev"))
+
+    summary: dict[str, Any] = {
+        "schema": _TURN_UNCERTAINTY_SCHEMA,
+        "schema_version": _TURN_UNCERTAINTY_SCHEMA_VERSION,
+        "source": "rollout_logprobs",
+        "score_kind": "mean_sampled_token_logprob_proxy",
+        "uid": run_ctx.uid,
+        "group_index": run_ctx.group_index,
+        "sample_index": run_ctx.sample_index,
+        "rollout_id": run_ctx.rollout_id,
+        "train_step": run_ctx.train_step,
+        "rollout_step": run_ctx.rollout_step,
+        "turn_count": len(all_records),
+        "available_turn_count": len(available),
+        "missing_turn_count": len(all_records) - len(available),
+        "warmup_tokens": _TURN_UNCERTAINTY_WARMUP_TOKENS,
+        "low_progress_threshold": _TURN_LOW_PROGRESS_THRESHOLD,
+        "low_progress_turn_count": low_progress_count,
+        "low_progress_fraction": (
+            low_progress_count / len(available) if available else None
+        ),
+    }
+
+    if score_stats:
+        summary.update(
+            {
+                "mean_turn_level_score": score_stats["mean"],
+                "std_turn_level_score": score_stats["std"],
+                "min_turn_level_score": score_stats["min"],
+                "max_turn_level_score": score_stats["max"],
+            }
+        )
+    if uncertainty_stats:
+        summary.update(
+            {
+                "mean_turn_level_uncertainty": uncertainty_stats["mean"],
+                "std_turn_level_uncertainty": uncertainty_stats["std"],
+                "min_turn_level_uncertainty": uncertainty_stats["min"],
+                "max_turn_level_uncertainty": uncertainty_stats["max"],
+            }
+        )
+    if delta_stats:
+        summary.update(
+            {
+                "mean_abs_score_delta": delta_stats["mean"],
+                "min_abs_score_delta": delta_stats["min"],
+                "max_abs_score_delta": delta_stats["max"],
+            }
+        )
+
+    return summary
 
 
 def _explore_schedule_multiplier(schedule: str, train_step: Any, decay_steps: int) -> float:
@@ -779,6 +995,9 @@ def _save_rollout_artifacts(
                 "eval_error": eval_error,
                 "safety_coef": safety_coef,
                 "prm_coef": prm_coef,
+                "trajectory_uncertainty": _jsonable(
+                    primary_metadata.get("trajectory_uncertainty")
+                ),
             },
             "turns": _jsonable(turn_records),
             "reward": _jsonable(reward_breakdown),
@@ -807,6 +1026,9 @@ def _save_rollout_artifacts(
             "safety_split": primary_metadata.get("safety_split"),
             "reward_details": _jsonable(primary_reward_details),
             "exploration": _jsonable(_exploration_audit_from_reward(reward_breakdown)),
+            "trajectory_uncertainty": _jsonable(
+                primary_metadata.get("trajectory_uncertainty")
+            ),
             "status": str(status),
             "raw_score": raw_score,
             "dataset": primary_metadata.get("data_source"),
@@ -1616,6 +1838,8 @@ async def generate(
         final_response = None
         reached_iteration_limit = False
         reached_parse_error_limit = False
+        previous_turn_uncertainty_score: float | None = None
+        turn_uncertainty_records: list[dict[str, Any]] = []
 
         while True:
             context_result: TurnContext = await agent_runner.get_turn_context()
@@ -1633,6 +1857,18 @@ async def generate(
             turn_interactions = (
                 getattr(turn_state, "interactions", None) or [turn_state.interaction]
             )
+            turn_uncertainties: list[dict[str, Any]] = []
+            for it in turn_interactions:
+                uncertainty = _turn_uncertainty_metrics(
+                    it,
+                    previous_turn_score=previous_turn_uncertainty_score,
+                )
+                if uncertainty:
+                    turn_uncertainties.append(uncertainty)
+                    score = _finite_float(uncertainty.get("turn_level_score"))
+                    if score is not None:
+                        previous_turn_uncertainty_score = score
+            turn_uncertainty_records.extend(turn_uncertainties)
             interaction = turn_interactions[-1]
             turn_idx = int(interaction.turn_idx)
             interactions.extend(turn_interactions)
@@ -1661,13 +1897,23 @@ async def generate(
                         "latency_ms": float(it.latency_ms),
                         "n_input_tokens": len(it.input_ids or []),
                         "n_output_tokens": len(it.output_token_ids or []),
+                        **(
+                            {"uncertainty": uncertainty}
+                            if uncertainty
+                            else {}
+                        ),
                     }
-                    for it in turn_interactions
+                    for it, uncertainty in zip(
+                        turn_interactions,
+                        turn_uncertainties or [{} for _ in turn_interactions],
+                    )
                 ],
                 "sdk_tool_calls": _jsonable(sdk_tool_calls) if sdk_tool_calls else [],
                 "sdk_tool_calls_count": int(sdk_tool_calls_count or 0),
                 "tool_calls": [],
             }
+            if turn_uncertainties:
+                current_turn_record["uncertainty"] = turn_uncertainties[-1]
             if sdk_tool_calls:
                 for call in _jsonable(sdk_tool_calls):
                     if isinstance(call, dict):
@@ -1891,6 +2137,28 @@ async def generate(
             _sync_reward_aliases(sample.reward)
             return [sample]
 
+        trajectory_uncertainty = _summarize_turn_uncertainty(
+            turn_uncertainty_records,
+            run_ctx=run_ctx,
+        )
+        if trajectory_uncertainty:
+            sample.metadata["trajectory_uncertainty"] = trajectory_uncertainty
+            mean_uncertainty = _finite_float(
+                trajectory_uncertainty.get("mean_turn_level_uncertainty")
+            )
+            mean_delta = _finite_float(trajectory_uncertainty.get("mean_abs_score_delta"))
+            logger.info(
+                "%s Turn uncertainty: available=%s/%s mean_nll=%s "
+                "mean_abs_delta=%s low_progress=%s/%s",
+                _log_tag,
+                trajectory_uncertainty.get("available_turn_count"),
+                trajectory_uncertainty.get("turn_count"),
+                f"{mean_uncertainty:.4f}" if mean_uncertainty is not None else "n/a",
+                f"{mean_delta:.4f}" if mean_delta is not None else "n/a",
+                trajectory_uncertainty.get("low_progress_turn_count"),
+                trajectory_uncertainty.get("available_turn_count"),
+            )
+
         if prm_agent is not None and prm_pending:
             for turn_idx, prm_task in prm_pending:
                 try:
@@ -2087,11 +2355,23 @@ async def generate(
                     s.reward.update(_explore_debug)
                     _sync_reward_aliases(s.reward)
 
+        turn_uncertainty_by_idx = {
+            int(r["turn_idx"]): r
+            for r in turn_uncertainty_records
+            if isinstance(r, dict) and r.get("turn_idx") is not None
+        }
         for s in samples:
             s.metadata["model_turn_count"] = agent_runner.model_turn_count
             s.metadata["parse_error_count"] = agent_runner.parse_error_count
             s.metadata["data_source"] = data_source or s.metadata.get("data_source")
             s.metadata["safety_split"] = _safety_split_from_meta(task_meta)
+            if trajectory_uncertainty:
+                s.metadata["trajectory_uncertainty"] = trajectory_uncertainty
+            turn_uncertainty = turn_uncertainty_by_idx.get(
+                int(s.metadata.get("turn_idx", -1))
+            )
+            if turn_uncertainty:
+                s.metadata["turn_uncertainty"] = turn_uncertainty
             if eval_details is not None:
                 s.metadata["reward_details"] = _jsonable(eval_details)
             if eval_error is not None:

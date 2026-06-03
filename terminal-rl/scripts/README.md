@@ -51,6 +51,8 @@ Key features:
   distant points with long straight lines.
 - Plots KL on a separate y-axis from entropy; when `train/kl_loss` is absent
   because KL loss is disabled, falls back to the logged `train/ppo_kl`.
+- Plots `truncated_fraction` as `truncated / sample_count` by dataset instead
+  of mixing legacy global fractions with structured truncated counts.
 - Counts `/reset 500` events bucketed per minute (signals CPU worker docker failure)
 - Counts ClawSentry pre_action fail-open events (rate-limit / offline)
 

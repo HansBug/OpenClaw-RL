@@ -349,9 +349,24 @@ if [ -d "${REPO_ROOT}/.venv" ]; then
     source .venv/bin/activate
 fi
 
+POOL_SERVER_PYTHON="${POOL_SERVER_PYTHON:-}"
+if [[ -z "${POOL_SERVER_PYTHON}" ]]; then
+    if [[ -x "${REPO_ROOT}/.venv/bin/python" ]]; then
+        POOL_SERVER_PYTHON="${REPO_ROOT}/.venv/bin/python"
+    else
+        POOL_SERVER_PYTHON="$(command -v python3 || command -v python)"
+    fi
+fi
+
+log "  pool_server python: ${POOL_SERVER_PYTHON}"
+"${POOL_SERVER_PYTHON}" - <<'PY'
+import sys
+print("  pool_server python version:", sys.version.replace("\n", " "))
+PY
+
 # Use stdbuf for line-buffered output (real-time log visibility)
 exec stdbuf -oL -eL \
-    python -m terminal-rl.remote.pool_server \
+    "${POOL_SERVER_PYTHON}" -m terminal-rl.remote.pool_server \
     --host 0.0.0.0 \
     --port "${ENV_SERVER_PORT}" \
     --max-tasks "${WORKER_MAX_TASKS}" \

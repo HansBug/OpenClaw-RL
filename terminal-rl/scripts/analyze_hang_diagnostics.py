@@ -106,6 +106,31 @@ def _extract_flags(line: str, flags: dict[str, str | bool]) -> None:
             flags[key] = value if value is not None else True
 
 
+def _truthy(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return False
+    return str(value).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _read_run_config_flags(run_dir: Path | None) -> dict[str, Any]:
+    if run_dir is None:
+        return {}
+    path = run_dir / "config" / "run_config.json"
+    if not path.exists():
+        return {}
+    try:
+        data = json.loads(path.read_text())
+    except Exception:
+        return {}
+    result: dict[str, Any] = {}
+    for key in ("dapo_dynamic_sampling", "dapo_dynamic_filter_path"):
+        if key in data:
+            result[key] = data.get(key)
+    return result
+
+
 def _classify_tail(line: str) -> str:
     if "GET /health HTTP/1.1" in line:
         return "health_check"
@@ -124,7 +149,7 @@ def _classify_tail(line: str) -> str:
     return "other"
 
 
-def analyze(log_path: Path, tail_lines: int) -> dict[str, Any]:
+def analyze(log_path: Path, tail_lines: int, run_dir: Path | None = None) -> dict[str, Any]:
     counts: Counter[str] = Counter()
     post_counts: Counter[str] = Counter()
     tail = deque(maxlen=tail_lines)
@@ -208,7 +233,13 @@ def analyze(log_path: Path, tail_lines: int) -> dict[str, Any]:
         tail_counts["health_check"] / len(tail_list) if tail_list else 0.0
     )
     post_reset_or_lease = post_counts["reset_500"] + post_counts["unknown_run_lease_id"]
-    dynamic_sampling_enabled = "dynamic-sampling-filter-path" in flags
+    run_config_flags = _read_run_config_flags(run_dir)
+    dynamic_sampling_sources = {
+        "cli_dynamic_sampling_filter_path": "dynamic-sampling-filter-path" in flags,
+        "run_config_dapo_dynamic_sampling": _truthy(run_config_flags.get("dapo_dynamic_sampling")),
+        "run_config_dapo_dynamic_filter_path": bool(run_config_flags.get("dapo_dynamic_filter_path")),
+    }
+    dynamic_sampling_enabled = any(dynamic_sampling_sources.values())
     post_started = post_counts["start_terminal_rollout"] > 0
     no_next_batch = bool(last_rollout and (counts["data_rollout"] == len(rollouts)))
     similar_reasons: list[str] = []
@@ -256,6 +287,8 @@ def analyze(log_path: Path, tail_lines: int) -> dict[str, Any]:
         "log_size_bytes": log_path.stat().st_size,
         "line_count": line_count,
         "flags": flags,
+        "run_config_flags": run_config_flags,
+        "dynamic_sampling_sources": dynamic_sampling_sources,
         "dynamic_sampling_enabled": dynamic_sampling_enabled,
         "rollout_count": len(rollouts),
         "max_rollout_id": max((r["id"] for r in rollouts), default=None),
@@ -363,7 +396,7 @@ def main() -> int:
     if not log_path.exists():
         raise SystemExit(f"log not found: {log_path}")
 
-    result = analyze(log_path, max(1, int(args.tail_lines)))
+    result = analyze(log_path, max(1, int(args.tail_lines)), run_dir=run_dir)
     result["run_dir"] = str(run_dir)
     _write_report(result, out_dir)
     assessment = result["assessment"]
