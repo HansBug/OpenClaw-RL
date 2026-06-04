@@ -132,10 +132,10 @@ case "${HARNESS_OPTION}" in
     exit 1
     ;;
 esac
-SETA_SAFETY="${SETA_SAFETY:-clawsentry}"
+SETA_SAFETY="${SETA_SAFETY:-none}"
 SAFETY_BENCH_REWARD="${SAFETY_BENCH_REWARD:-rule}"
 AGENTHARM_REWARD="${AGENTHARM_REWARD:-rule}"
-SAFETY_REWARD_COEF="${SAFETY_REWARD_COEF:-0.3}"
+SAFETY_REWARD_COEF="${SAFETY_REWARD_COEF:-0}"
 MAX_TURN="${MAX_TURN:-10}"
 DAPO_EPS_CLIP_HIGH="${DAPO_EPS_CLIP_HIGH:-0.28}"
 DAPO_CALCULATE_PER_TOKEN_LOSS="${DAPO_CALCULATE_PER_TOKEN_LOSS:-1}"
@@ -486,7 +486,7 @@ esac
 export ALGO
 
 DATASET="${DATASET:-seta}"
-SETA_SAFETY="${SETA_SAFETY:-clawsentry}"
+SETA_SAFETY="${SETA_SAFETY:-none}"
 SAFETY_BENCH_REWARD="${SAFETY_BENCH_REWARD:-rule}"
 AGENT_SAFETYBENCH_REMOTE_ENV="${AGENT_SAFETYBENCH_REMOTE_ENV:-0}"
 AGENT_SAFETYBENCH_ROOT="${AGENT_SAFETYBENCH_ROOT:-/mnt/shared-storage-user/puyuan/code/Agent-SafetyBench}"
@@ -704,12 +704,13 @@ CHECK_WAIT_SECS="${CHECK_WAIT_SECS:-60}"
 export ROUTER_FORWARD_TIMEOUT="${ROUTER_FORWARD_TIMEOUT:-900}"
 export ROUTER_FORWARD_RETRIES="${ROUTER_FORWARD_RETRIES:-3}"
 export ROUTER_FORWARD_RETRY_BACKOFF="${ROUTER_FORWARD_RETRY_BACKOFF:-1.0}"
+export ROUTER_PRESSURE_COOLDOWN="${ROUTER_PRESSURE_COOLDOWN:-60}"
 
 # ── ClawSentry safety reward (L1-only, reward-only, linear-fusion baseline) ──
 # Gateway runs on the same host as router_server (CPU master). All decisions
 # are reward-shaping signals; agent actions are never blocked.
 # ClawSentry is enabled only for the active dataset family.
-# SAFETY_REWARD_COEF controls the linear weight (default 0.3).
+# SAFETY_REWARD_COEF controls the linear weight (default 0 unless ClawSentry is explicitly enabled).
 CLAWSENTRY_NEEDED="0"
 if [[ "${INCLUDES_SETA}" == "1" && "${SETA_SAFETY}" == "clawsentry" ]]; then
   CLAWSENTRY_NEEDED="1"
@@ -720,7 +721,7 @@ fi
 if [[ "${INCLUDES_AGENTHARM}" == "1" && "${AGENTHARM_REWARD}" == "clawsentry" ]]; then
   CLAWSENTRY_NEEDED="1"
 fi
-export SAFETY_REWARD_COEF="${SAFETY_REWARD_COEF:-0.3}"
+export SAFETY_REWARD_COEF="${SAFETY_REWARD_COEF:-0}"
 export SAFETY_REWARD_SUMMARY_WEIGHT="${SAFETY_REWARD_SUMMARY_WEIGHT:-0.3}"
 export SAFETY_REWARD_TIMEOUT="${SAFETY_REWARD_TIMEOUT:-2.0}"
 export SAFETY_REWARD_ZERO_THRESHOLD="${SAFETY_REWARD_ZERO_THRESHOLD:-1.5}"
@@ -795,6 +796,7 @@ ROLLOUT_GENERATION_MAX_RETRIES="${ROLLOUT_GENERATION_MAX_RETRIES:--1}"
 ROLLOUT_GENERATION_RETRY_INITIAL_BACKOFF="${ROLLOUT_GENERATION_RETRY_INITIAL_BACKOFF:-60}"
 ROLLOUT_GENERATION_RETRY_MAX_BACKOFF="${ROLLOUT_GENERATION_RETRY_MAX_BACKOFF:-300}"
 ROLLOUT_GENERATION_RETRY_BACKOFF_MULTIPLIER="${ROLLOUT_GENERATION_RETRY_BACKOFF_MULTIPLIER:-2.0}"
+ROLLOUT_GENERATION_SKIP_ON_FAILURE="${ROLLOUT_GENERATION_SKIP_ON_FAILURE:-0}"
 
 ROLLOUT_ARGS=(
   --prompt-data "${ROLLOUT_PROMPT_DATA}"
@@ -814,6 +816,9 @@ ROLLOUT_ARGS=(
   --rollout-generation-retry-max-backoff "${ROLLOUT_GENERATION_RETRY_MAX_BACKOFF}"
   --rollout-generation-retry-backoff-multiplier "${ROLLOUT_GENERATION_RETRY_BACKOFF_MULTIPLIER}"
 )
+if [[ "${ROLLOUT_GENERATION_SKIP_ON_FAILURE}" == "1" ]]; then
+  ROLLOUT_ARGS+=(--rollout-generation-skip-on-failure)
+fi
 
 EVAL_ARGS=(
   --n-samples-per-eval-prompt 16
@@ -909,7 +914,7 @@ if [[ -n "${ALGO_EXTRA_ARGS// }" ]]; then
   ALGO_EXTRA_ARGS_ARRAY=(${ALGO_EXTRA_ARGS})
 fi
 log "Algorithm config: ALGO=${ALGO} args=${ALGO_ARGS[*]} extra=${ALGO_EXTRA_ARGS_ARRAY[*]:-<none>}"
-log "Rollout retry config: max_retries=${ROLLOUT_GENERATION_MAX_RETRIES} initial_backoff=${ROLLOUT_GENERATION_RETRY_INITIAL_BACKOFF}s max_backoff=${ROLLOUT_GENERATION_RETRY_MAX_BACKOFF}s multiplier=${ROLLOUT_GENERATION_RETRY_BACKOFF_MULTIPLIER}"
+log "Rollout retry config: max_retries=${ROLLOUT_GENERATION_MAX_RETRIES} initial_backoff=${ROLLOUT_GENERATION_RETRY_INITIAL_BACKOFF}s max_backoff=${ROLLOUT_GENERATION_RETRY_MAX_BACKOFF}s multiplier=${ROLLOUT_GENERATION_RETRY_BACKOFF_MULTIPLIER} skip_on_failure=${ROLLOUT_GENERATION_SKIP_ON_FAILURE}"
 log "Exploration config: profile=${EXPLORATION_PROFILE} entropy=${EXPLORE_ENTROPY_COEF} intrinsic=${EXPLORE_INTRINSIC_ENABLED}/${EXPLORE_INTRINSIC} coef=${EXPLORE_INTRINSIC_COEF} schedule=${EXPLORE_INTRINSIC_SCHEDULE}/${EXPLORE_INTRINSIC_DECAY_STEPS} granularity=${EXPLORE_INTRINSIC_GRANULARITY} scope=${EXPLORE_INTRINSIC_SCOPE} safety_filter=${EXPLORE_SAFETY_FILTER_ENABLED}/${EXPLORE_SAFETY_FILTER} lprnd=${EXPLORE_LPRND_ENABLED}/${EXPLORE_LPRND} coef=${EXPLORE_LPRND_COEF} schedule=${EXPLORE_LPRND_SCHEDULE}/${EXPLORE_LPRND_DECAY_STEPS} cde_actor=${EXPLORE_CDE_ACTOR_ENABLED}/${EXPLORE_CDE_ACTOR} omega=${EXPLORE_CDE_ACTOR_OMEGA} alpha=${EXPLORE_CDE_ACTOR_ALPHA} kappa=${EXPLORE_CDE_ACTOR_KAPPA} gate=${EXPLORE_CDE_ACTOR_REWARD_GATE} decay_steps=${EXPLORE_CDE_ACTOR_DECAY_STEPS} post_norm_bonus=${EXPLORE_ADVANTAGE_BONUS_ENABLED}/${EXPLORE_ADVANTAGE_BONUS} components=${EXPLORE_ADVANTAGE_BONUS_COMPONENTS} coef=${EXPLORE_ADVANTAGE_BONUS_COEF} clip=${EXPLORE_ADVANTAGE_BONUS_CLIP}"
 if [[ "${ALGO}" == "dapo" ]]; then
   log "DAPO knobs: clip_low=${DAPO_EPS_CLIP_LOW} clip_high=${DAPO_EPS_CLIP_HIGH} token_loss=${DAPO_CALCULATE_PER_TOKEN_LOSS} dynamic_sampling=${DAPO_DYNAMIC_SAMPLING} failed_group_abort=${DAPO_FAILED_GROUP_ABORT_MIN_GROUPS}/${DAPO_FAILED_GROUP_ABORT_RATIO} overlong=${DAPO_OVERLONG_BUFFER_ENABLE}/${DAPO_OVERLONG_BUFFER_LEN}/${DAPO_OVERLONG_PENALTY_FACTOR}"
@@ -1016,7 +1021,7 @@ ROUTER_LOG="${RUN_LOG_DIR}/router.log"
 require_cmd curl
 if [[ "${NEEDS_ENV_ROUTER}" == "1" ]]; then
   log "Starting router on ${ROUTER_HOST}:${ROUTER_PORT} -> ${WORKER_URLS} (python=${ROUTER_PYTHON})"
-  log "  forward_timeout=${ROUTER_FORWARD_TIMEOUT}s retries=${ROUTER_FORWARD_RETRIES} backoff=${ROUTER_FORWARD_RETRY_BACKOFF}s no_proxy=${NO_PROXY}"
+  log "  forward_timeout=${ROUTER_FORWARD_TIMEOUT}s retries=${ROUTER_FORWARD_RETRIES} backoff=${ROUTER_FORWARD_RETRY_BACKOFF}s pressure_cooldown=${ROUTER_PRESSURE_COOLDOWN}s no_proxy=${NO_PROXY}"
   (
     cd "${REPO_ROOT}"
     "${ROUTER_PYTHON}" -m terminal-rl.router_server \
@@ -1136,11 +1141,13 @@ cat > "${RUN_DIR}/config/run_config.json" <<CFGEOF
   "rollout_generation_max_retries": "${ROLLOUT_GENERATION_MAX_RETRIES}",
   "rollout_generation_retry_initial_backoff": "${ROLLOUT_GENERATION_RETRY_INITIAL_BACKOFF}",
   "rollout_generation_retry_max_backoff": "${ROLLOUT_GENERATION_RETRY_MAX_BACKOFF}",
+  "rollout_generation_skip_on_failure": "${ROLLOUT_GENERATION_SKIP_ON_FAILURE}",
   "rollout_generation_retry_backoff_multiplier": "${ROLLOUT_GENERATION_RETRY_BACKOFF_MULTIPLIER}",
   "max_tokens_per_gpu": ${MAX_TOKENS_PER_GPU},
   "worker_urls": "${WORKER_URLS}",
   "env_server_url": "${ENV_SERVER_URL}",
   "needs_env_router": "${NEEDS_ENV_ROUTER}",
+  "router_pressure_cooldown": "${ROUTER_PRESSURE_COOLDOWN}",
   "agent_safetybench_remote_env": "${AGENT_SAFETYBENCH_REMOTE_ENV}",
   "agentharm_remote_env": "${AGENTHARM_REMOTE_ENV}",
   "safety_reward_enable": "${CLAWSENTRY_NEEDED}",

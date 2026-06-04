@@ -4,6 +4,7 @@ import argparse
 import asyncio
 import logging
 import os
+import time
 from hashlib import sha1
 from typing import Any
 
@@ -16,6 +17,16 @@ from .request_utils import json_payload
 
 logger = logging.getLogger("terminal.env.router")
 app = FastAPI()
+
+RETRYABLE_ALLOCATE_CODES = {
+    "WORKER_PENDING_CLOSES_PRESSURE",
+    "WORKER_PIDS_PRESSURE",
+    "WORKER_SHIM_PRESSURE",
+    "WORKER_DOCKER_CLI_UNHEALTHY",
+    "WORKER_DOCKER_DISK_PRESSURE",
+    "TASK_SLOTS_EXHAUSTED",
+    "RUN_SLOTS_EXHAUSTED",
+}
 
 
 def _format_error(exc: BaseException) -> str:
@@ -32,6 +43,13 @@ def _status_from_payload(payload: dict[str, Any], default: int) -> int:
     return default
 
 
+def _retryable_allocate_failure(payload: dict[str, Any], status: int) -> bool:
+    code = str(payload.get("code", "") or "")
+    if code in RETRYABLE_ALLOCATE_CODES:
+        return True
+    return status in {429, 502, 503, 504}
+
+
 class Router:
     def __init__(
         self,
@@ -39,6 +57,7 @@ class Router:
         forward_timeout: float = 600.0,
         forward_retries: int = 1,
         forward_retry_backoff: float = 0.2,
+        pressure_cooldown: float = 60.0,
     ):
         if not worker_urls:
             raise ValueError("At least one worker URL is required")
@@ -46,6 +65,8 @@ class Router:
         self.forward_timeout = float(forward_timeout)
         self.forward_retries = max(0, int(forward_retries))
         self.forward_retry_backoff = max(0.0, float(forward_retry_backoff))
+        self.pressure_cooldown = max(0.0, float(pressure_cooldown))
+        self._unhealthy_until: dict[int, float] = {}
         self._session: aiohttp.ClientSession | None = None
 
     @property
@@ -83,13 +104,33 @@ class Router:
         return self.workers[worker_idx]
 
     def iter_worker_candidates(self, start_idx: int) -> list[tuple[int, str]]:
-        return [
+        candidates = [
             (
                 (start_idx + offset) % self.num_workers,
                 self.workers[(start_idx + offset) % self.num_workers],
             )
             for offset in range(self.num_workers)
         ]
+        now = time.monotonic()
+        healthy = [
+            item for item in candidates if self._unhealthy_until.get(item[0], 0.0) <= now
+        ]
+        unhealthy = [
+            item for item in candidates if self._unhealthy_until.get(item[0], 0.0) > now
+        ]
+        return healthy + unhealthy if healthy else candidates
+
+    def mark_worker_unhealthy(self, worker_idx: int, reason: str) -> None:
+        if self.pressure_cooldown <= 0:
+            return
+        until = time.monotonic() + self.pressure_cooldown
+        self._unhealthy_until[worker_idx] = until
+        logger.warning(
+            "Marked worker_idx=%d unhealthy for %.1fs due to %s",
+            worker_idx,
+            self.pressure_cooldown,
+            reason,
+        )
 
     async def _request(
         self,
@@ -251,23 +292,48 @@ async def allocate(request: Request) -> JSONResponse:
         for worker_idx, worker_url in ROUTER.iter_worker_candidates(primary_idx):
             try:
                 result, code = await ROUTER.forward(worker_url, "/allocate", payload)
-                if worker_idx != primary_idx:
-                    logger.warning(
-                        "Primary worker unreachable for /allocate task_key=%s; fallback worker_idx=%d url=%s",
-                        task_key,
-                        worker_idx,
-                        worker_url,
-                    )
                 if result.get("ok") and "lease_id" in result:
+                    if worker_idx != primary_idx:
+                        logger.warning(
+                            "Allocated on fallback worker for task_key=%s worker_idx=%d url=%s",
+                            task_key,
+                            worker_idx,
+                            worker_url,
+                        )
                     result["lease_id"] = Router.encode_lease(
                         worker_idx, str(result["lease_id"])
                     )
                     result["worker_idx"] = worker_idx
+                    return JSONResponse(
+                        result, status_code=_status_from_payload(result, code)
+                    )
 
-                return JSONResponse(
-                    result, status_code=_status_from_payload(result, code)
-                )
+                if _retryable_allocate_failure(result, code):
+                    retry_code = str(result.get("code", "") or f"HTTP_{code}")
+                    ROUTER.mark_worker_unhealthy(worker_idx, retry_code)
+                    logger.warning(
+                        "Worker pressure for /allocate task_key=%s worker_idx=%d url=%s status=%s code=%s; trying next worker",
+                        task_key,
+                        worker_idx,
+                        worker_url,
+                        code,
+                        retry_code,
+                    )
+                    upstream_errors.append(
+                        {
+                            "worker_idx": worker_idx,
+                            "worker_url": worker_url,
+                            "status": code,
+                            "code": result.get("code"),
+                            "error": result.get("error"),
+                            "details": result.get("details"),
+                        }
+                    )
+                    continue
+
+                return JSONResponse(result, status_code=_status_from_payload(result, code))
             except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
+                ROUTER.mark_worker_unhealthy(worker_idx, "unreachable")
                 logger.warning(
                     "Worker unreachable for /allocate task_key=%s worker_idx=%d url=%s err=%s",
                     task_key,
@@ -286,12 +352,13 @@ async def allocate(request: Request) -> JSONResponse:
         return JSONResponse(
             {
                 "ok": False,
-                "error": "Worker unreachable: all candidates failed for /allocate",
+                "error": "All worker candidates failed or were under pressure for /allocate",
+                "code": "ALL_WORKERS_UNAVAILABLE_OR_PRESSURED",
                 "task_key": task_key,
                 "primary_worker_idx": primary_idx,
                 "upstream_errors": upstream_errors,
             },
-            status_code=502,
+            status_code=503,
         )
     except Exception as exc:
         return JSONResponse({"ok": False, "error": str(exc)}, status_code=500)
@@ -403,6 +470,12 @@ def parse_args() -> argparse.Namespace:
         default=float(os.getenv("ROUTER_FORWARD_RETRY_BACKOFF", "0.2")),
         help="Linear backoff (seconds) between worker retries",
     )
+    parser.add_argument(
+        "--pressure-cooldown",
+        type=float,
+        default=float(os.getenv("ROUTER_PRESSURE_COOLDOWN", "60.0")),
+        help="Seconds to avoid a worker after pressure/unreachable allocate failures",
+    )
     return parser.parse_args()
 
 
@@ -425,15 +498,17 @@ def main() -> None:
         forward_timeout=args.forward_timeout,
         forward_retries=args.forward_retries,
         forward_retry_backoff=args.forward_retry_backoff,
+        pressure_cooldown=args.pressure_cooldown,
     )
     logger.info(
-        "Starting router on %s:%s  workers=%s  forward_timeout=%s  forward_retries=%s  forward_retry_backoff=%s",
+        "Starting router on %s:%s  workers=%s  forward_timeout=%s  forward_retries=%s  forward_retry_backoff=%s  pressure_cooldown=%s",
         args.host,
         args.port,
         worker_urls,
         args.forward_timeout,
         args.forward_retries,
         args.forward_retry_backoff,
+        args.pressure_cooldown,
     )
 
     uvicorn.run(app, host=args.host, port=args.port, log_level="info")

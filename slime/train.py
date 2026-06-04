@@ -10,6 +10,7 @@ from slime.utils.logging_utils import configure_logger, init_tracking
 from slime.utils.misc import should_run_periodic_action
 
 logger = logging.getLogger(__name__)
+_SKIPPED_ROLLOUT = object()
 
 
 def _relay_pending_metrics(result):
@@ -41,6 +42,16 @@ def _get_rollout_generation_result(args, rollout_manager, rollout_id):
         except Exception as exc:
             attempt += 1
             if max_retries >= 0 and attempt > max_retries:
+                if getattr(args, "rollout_generation_skip_on_failure", False):
+                    logger.error(
+                        "Rollout generation failed permanently; skipping rollout: "
+                        "rollout_id=%s attempts=%s max_retries=%s error=%r",
+                        rollout_id,
+                        attempt,
+                        max_retries,
+                        exc,
+                    )
+                    return _SKIPPED_ROLLOUT
                 logger.error(
                     "Rollout generation failed permanently: rollout_id=%s attempts=%s max_retries=%s error=%r",
                     rollout_id,
@@ -127,6 +138,9 @@ def train(args):
             _relay_pending_metrics(ray.get(rollout_manager.eval.remote(rollout_id)))
 
         gen_result = _get_rollout_generation_result(args, rollout_manager, rollout_id)
+        if gen_result is _SKIPPED_ROLLOUT:
+            logger.warning("Skipping training for failed rollout_id=%s", rollout_id)
+            continue
         if isinstance(gen_result, tuple):
             rollout_data_ref, pending = gen_result
             _relay_pending_metrics(pending)

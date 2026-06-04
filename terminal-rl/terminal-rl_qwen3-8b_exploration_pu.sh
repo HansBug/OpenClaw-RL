@@ -25,7 +25,7 @@
 #   MIX_SETA_RATIO           : mixed seta ratio
 #   MIX_SAFETY_RATIO         : mixed Agent-SafetyBench ratio
 #   MIX_AGENTHARM_RATIO      : mixed AgentHarm ratio
-#   SETA_SAFETY              : none|clawsentry (default clawsentry)
+#   SETA_SAFETY              : none|clawsentry (default none)
 #   SAFETY_BENCH_REWARD      : rule|dense_rule|clawsentry (default rule)
 #   AGENTHARM_REWARD         : rule|dense_rule|clawsentry (default rule)
 #   TERMINAL_STRUCTURED_METRICS: Emit per-dataset JSON reward breakdowns (default 1)
@@ -109,10 +109,10 @@ case "${HARNESS_OPTION}" in
     ;;
 esac
 export DATASET ALGO HARNESS_OPTION
-SETA_SAFETY="${SETA_SAFETY:-clawsentry}"
+SETA_SAFETY="${SETA_SAFETY:-none}"
 SAFETY_BENCH_REWARD="${SAFETY_BENCH_REWARD:-rule}"
 AGENTHARM_REWARD="${AGENTHARM_REWARD:-rule}"
-SAFETY_REWARD_COEF="${SAFETY_REWARD_COEF:-0.3}"
+SAFETY_REWARD_COEF="${SAFETY_REWARD_COEF:-0}"
 export SETA_SAFETY SAFETY_BENCH_REWARD AGENTHARM_REWARD SAFETY_REWARD_COEF
 
 # ── Exploration Options (all default OFF for baseline compatibility) ──

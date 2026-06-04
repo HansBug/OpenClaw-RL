@@ -583,6 +583,16 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 help="Multiplier applied to rollout generation retry backoff after each failure.",
             )
             parser.add_argument(
+                "--rollout-generation-skip-on-failure",
+                action="store_true",
+                default=False,
+                help=(
+                    "After rollout-generation-max-retries is exhausted, skip the failed rollout "
+                    "instead of terminating training. This is intended for transient environment "
+                    "pool outages; skipped rollouts are not sent to actor/critic training."
+                ),
+            )
+            parser.add_argument(
                 "--rollout-health-check-interval",
                 type=float,
                 default=30.0,

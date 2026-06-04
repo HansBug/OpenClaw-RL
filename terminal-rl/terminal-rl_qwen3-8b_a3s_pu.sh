@@ -20,8 +20,10 @@ export DATASET="${DATASET:-seta}"
 export ALGO="${ALGO:-dapo}"
 
 # ── DAPO SetA baseline knobs ─────────────────────────────────────────
-export SETA_SAFETY="${SETA_SAFETY:-clawsentry}"
-export SAFETY_REWARD_COEF="${SAFETY_REWARD_COEF:-0.3}"
+# Default to pure outcome reward. Enable ClawSentry explicitly with:
+#   SETA_SAFETY=clawsentry SAFETY_REWARD_COEF=0.3
+export SETA_SAFETY="${SETA_SAFETY:-none}"
+export SAFETY_REWARD_COEF="${SAFETY_REWARD_COEF:-0}"
 export MAX_TURN="${MAX_TURN:-10}"
 export DAPO_EPS_CLIP_LOW="${DAPO_EPS_CLIP_LOW:-0.2}"
 export DAPO_EPS_CLIP_HIGH="${DAPO_EPS_CLIP_HIGH:-0.28}"

@@ -67,15 +67,31 @@ def _representative_sample(sample_or_turns) -> Sample | None:
     return None
 
 
+def _is_trainable_sample(sample: Sample) -> bool:
+    if getattr(sample, "remove_sample", False):
+        return False
+    status = getattr(sample, "status", None)
+    status_value = getattr(status, "value", status)
+    return status_value not in {
+        Sample.Status.FAILED.value,
+        Sample.Status.ABORTED.value,
+        "FAILED",
+        "ABORTED",
+    }
+
+
 def check_reward_nonzero_std(args, samples: list[Sample], **kwargs):
     representatives = [_representative_sample(sample) for sample in samples]
     representatives = [sample for sample in representatives if sample is not None]
     if not representatives:
         return DynamicFilterOutput(keep=False, reason="empty_reward_group")
+    trainable = [sample for sample in representatives if _is_trainable_sample(sample)]
+    if not trainable:
+        return DynamicFilterOutput(keep=False, reason="all_non_trainable_group")
 
     rewards = [
         sample.get_reward_value(args) + _post_norm_bonus_for_filter(sample)
-        for sample in representatives
+        for sample in trainable
     ]
     keep = bool(torch.tensor(rewards, dtype=torch.float).std(unbiased=False) > 0.0)
     return DynamicFilterOutput(

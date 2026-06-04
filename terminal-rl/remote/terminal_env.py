@@ -4,6 +4,8 @@ import asyncio
 import json
 import logging
 import os
+import re
+import subprocess
 from functools import partial
 from pathlib import Path
 from typing import Any
@@ -23,6 +25,132 @@ from .agent_safetybench_env import AgentSafetyBenchEnv
 from .docker_compose_utils import compose_up_no_build, prepare_task_docker_image
 
 logger = logging.getLogger(__name__)
+
+
+def _env_bool(name: str, default: bool) -> bool:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() not in {"0", "false", "no", "off"}
+
+
+def _docker_name_variants(value: str | None) -> set[str]:
+    if not value:
+        return set()
+    raw = value.strip()
+    if not raw:
+        return set()
+    cleaned = re.sub(r"[^A-Za-z0-9_.-]+", "-", raw).strip("-_.")
+    variants = {
+        raw,
+        cleaned,
+        cleaned.replace(".", "-"),
+        cleaned.replace("_", "-"),
+        cleaned.replace(".", "_"),
+    }
+    return {v for v in variants if v and "slime-run" in v}
+
+
+def _matches_project_name(name: str, project_names: set[str], *, broad: bool) -> bool:
+    if not name:
+        return False
+    for project in project_names:
+        if name == project:
+            return True
+        if broad and (
+            name.startswith(f"{project}-")
+            or name.startswith(f"{project}_")
+            or name.startswith(project)
+        ):
+            return True
+    return False
+
+
+def _force_remove_docker_objects(
+    *,
+    trial_name: str,
+    client_container_name: str | None,
+    reason: str,
+) -> None:
+    if not _env_bool("TERMINAL_ENV_FORCE_DOCKER_CLEANUP", True):
+        return
+
+    timeout = float(os.getenv("TERMINAL_ENV_FORCE_DOCKER_CLEANUP_TIMEOUT", "20"))
+    broad = _env_bool("TERMINAL_ENV_FORCE_DOCKER_CLEANUP_BROAD", True)
+    project_names = _docker_name_variants(trial_name)
+    project_names.update(_docker_name_variants(client_container_name))
+    if not project_names:
+        return
+
+    def _run(cmd: list[str], *, check: bool = False) -> subprocess.CompletedProcess:
+        return subprocess.run(
+            cmd,
+            check=check,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+        )
+
+    try:
+        listed = _run(
+            ["docker", "ps", "-aq", "--format", "{{.ID}}\t{{.Names}}\t{{.Image}}"]
+        )
+    except Exception as exc:
+        logger.warning(
+            "Force cleanup could not list Docker containers for %s (%s): %s",
+            trial_name,
+            reason,
+            exc,
+        )
+        return
+
+    container_ids: list[str] = []
+    for line in listed.stdout.splitlines():
+        parts = line.split("\t")
+        if len(parts) < 2:
+            continue
+        container_id, name = parts[0], parts[1]
+        if _matches_project_name(name, project_names, broad=broad):
+            container_ids.append(container_id)
+
+    if container_ids:
+        logger.warning(
+            "Force removing %d Docker container(s) for TerminalEnv %s (%s)",
+            len(container_ids),
+            trial_name,
+            reason,
+        )
+        for start in range(0, len(container_ids), 20):
+            chunk = container_ids[start : start + 20]
+            try:
+                _run(["docker", "rm", "-f", *chunk])
+            except Exception as exc:
+                logger.warning(
+                    "Force docker rm failed for TerminalEnv %s ids=%s: %s",
+                    trial_name,
+                    ",".join(chunk),
+                    exc,
+                )
+
+    try:
+        networks = _run(["docker", "network", "ls", "--format", "{{.ID}}\t{{.Name}}"])
+    except Exception:
+        return
+
+    network_ids: list[str] = []
+    for line in networks.stdout.splitlines():
+        parts = line.split("\t")
+        if len(parts) < 2:
+            continue
+        net_id, name = parts[0], parts[1]
+        if _matches_project_name(name, project_names, broad=broad):
+            network_ids.append(net_id)
+
+    for net_id in network_ids:
+        try:
+            _run(["docker", "network", "rm", net_id])
+        except Exception:
+            pass
 
 
 def _stop_terminal_compat(terminal: Terminal, timeout: float) -> None:
@@ -86,6 +214,8 @@ class TerminalEnv:
         self._agent_safetybench_env: AgentSafetyBenchEnv | None = None
         self._agentharm_env: AgentHarmEnv | None = None
         self._eval_attempt = 0
+        self._last_trial_name: str | None = None
+        self._last_client_container_name: str | None = None
 
     async def reset(
         self,
@@ -137,6 +267,8 @@ class TerminalEnv:
                 input_path=task_path,
                 output_path=output_path,
             )
+            self._last_trial_name = self._trial_handler.trial_name
+            self._last_client_container_name = self._trial_handler.client_container_name
             task_config = self._trial_handler.task
             self._parser = ParserFactory.get_parser(task_config.parser_name)
             client_image_name = (
@@ -339,7 +471,12 @@ class TerminalEnv:
         trial_name = (
             self._trial_handler.trial_name
             if self._trial_handler is not None
-            else "unknown"
+            else self._last_trial_name or "unknown"
+        )
+        client_container_name = (
+            self._trial_handler.client_container_name
+            if self._trial_handler is not None
+            else self._last_client_container_name
         )
         if self._closed:
             logger.warning("TerminalEnv %s already closed", trial_name)
@@ -363,37 +500,75 @@ class TerminalEnv:
         self._agent_safetybench_env = None
         self._agentharm_env = None
 
-        if agent_safetybench_env is not None:
-            try:
-                await agent_safetybench_env.close()
-            except Exception:
-                logger.exception(
-                    "Failed to cleanup Agent-SafetyBench env for %s", trial_name
-                )
+        cleanup_completed = terminal is None
+        cleanup_error = False
+        try:
+            if agent_safetybench_env is not None:
+                try:
+                    await agent_safetybench_env.close()
+                except Exception:
+                    logger.exception(
+                        "Failed to cleanup Agent-SafetyBench env for %s", trial_name
+                    )
 
-        if agentharm_env is not None:
-            try:
-                await agentharm_env.close()
-            except Exception:
-                logger.exception("Failed to cleanup AgentHarm env for %s", trial_name)
+            if agentharm_env is not None:
+                try:
+                    await agentharm_env.close()
+                except Exception:
+                    logger.exception(
+                        "Failed to cleanup AgentHarm env for %s", trial_name
+                    )
 
-        if toolkit is not None:
-            try:
-                await asyncio.to_thread(toolkit.cleanup)
-            except Exception:
-                logger.exception(
-                    "Failed to cleanup terminal toolkit for %s", trial_name
-                )
-            try:
-                await asyncio.to_thread(_drain_toolkit_sessions, toolkit)
-            except Exception:
-                logger.exception("Failed to drain toolkit sessions for %s", trial_name)
+            if toolkit is not None:
+                try:
+                    await asyncio.to_thread(toolkit.cleanup)
+                except Exception:
+                    cleanup_error = True
+                    logger.exception(
+                        "Failed to cleanup terminal toolkit for %s", trial_name
+                    )
+                try:
+                    await asyncio.to_thread(_drain_toolkit_sessions, toolkit)
+                except Exception:
+                    cleanup_error = True
+                    logger.exception(
+                        "Failed to drain toolkit sessions for %s", trial_name
+                    )
 
-        if terminal is not None and timeouts is not None:
-            try:
-                await asyncio.to_thread(
-                    _stop_terminal_compat, terminal, timeouts.close_session
+            if terminal is not None and timeouts is not None:
+                try:
+                    await asyncio.to_thread(
+                        _stop_terminal_compat, terminal, timeouts.close_session
+                    )
+                    cleanup_completed = True
+                    logger.info("TerminalEnv %s closed", trial_name)
+                except Exception:
+                    cleanup_error = True
+                    logger.exception("Failed to stop terminal session during close")
+        finally:
+            force_always = _env_bool("TERMINAL_ENV_FORCE_DOCKER_CLEANUP_ALWAYS", False)
+            if terminal is not None and (force_always or cleanup_error or not cleanup_completed):
+                reason = (
+                    "always"
+                    if force_always and cleanup_completed and not cleanup_error
+                    else "close_incomplete"
                 )
-                logger.info("TerminalEnv %s closed", trial_name)
-            except Exception:
-                logger.exception("Failed to stop terminal session during close")
+                try:
+                    await asyncio.to_thread(
+                        _force_remove_docker_objects,
+                        trial_name=trial_name,
+                        client_container_name=client_container_name,
+                        reason=reason,
+                    )
+                except Exception:
+                    logger.exception(
+                        "Force Docker cleanup failed for TerminalEnv %s", trial_name
+                    )
+
+    async def force_cleanup(self, reason: str = "external") -> None:
+        await asyncio.to_thread(
+            _force_remove_docker_objects,
+            trial_name=self._last_trial_name or "unknown",
+            client_container_name=self._last_client_container_name,
+            reason=reason,
+        )

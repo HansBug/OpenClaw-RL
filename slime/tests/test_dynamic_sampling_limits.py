@@ -8,6 +8,7 @@ from slime.rollout.sglang_rollout import (
     _rollout_abort_wait_timeout,
     _should_abort_for_failed_rollout_groups,
 )
+from slime.rollout.filter_hub.dynamic_sampling_filters import check_reward_nonzero_std
 from slime.utils.types import Sample
 
 
@@ -104,3 +105,37 @@ def test_dynamic_sampling_failed_group_abort_config_and_trigger():
         min_groups=8,
         ratio=1.0,
     )
+
+
+def test_dynamic_sampling_filter_drops_all_non_trainable_group():
+    args = Namespace(reward_key="score")
+    failed_low = Sample(
+        reward={"score": -1.0},
+        remove_sample=True,
+        status=Sample.Status.FAILED,
+    )
+    failed_high = Sample(
+        reward={"score": 0.0},
+        remove_sample=True,
+        status=Sample.Status.FAILED,
+    )
+
+    out = check_reward_nonzero_std(args, [failed_low, failed_high])
+
+    assert not out.keep
+    assert out.reason == "all_non_trainable_group"
+
+
+def test_dynamic_sampling_filter_uses_trainable_rewards_only():
+    args = Namespace(reward_key="score")
+    failed = Sample(
+        reward={"score": -1.0},
+        remove_sample=True,
+        status=Sample.Status.FAILED,
+    )
+    kept_low = Sample(reward={"score": 0.0}, status=Sample.Status.COMPLETED)
+    kept_high = Sample(reward={"score": 1.0}, status=Sample.Status.COMPLETED)
+
+    out = check_reward_nonzero_std(args, [failed, kept_low, kept_high])
+
+    assert out.keep

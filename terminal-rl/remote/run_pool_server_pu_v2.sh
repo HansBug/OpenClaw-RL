@@ -52,6 +52,7 @@ WORKER_MAX_RUNS_PER_TASK="${WORKER_MAX_RUNS_PER_TASK:-16}"
 WORKER_MAX_CONCURRENT_CLOSES="${WORKER_MAX_CONCURRENT_CLOSES:-32}"
 ENV_SERVER_PORT="${ENV_SERVER_PORT:-18081}"
 SKIP_PREFLIGHT_CLEANUP="${SKIP_PREFLIGHT_CLEANUP:-0}"
+PREFLIGHT_KILL_ORPHAN_RUNNING="${PREFLIGHT_KILL_ORPHAN_RUNNING:-0}"
 PROXY_ENV_FILE="${PROXY_ENV_FILE:-/etc/seta_build_proxy.env}"
 SKIP_PROXY_ENV="${SKIP_PROXY_ENV:-0}"
 CLAWSENTRY_NEEDED="${CLAWSENTRY_NEEDED:-0}"
@@ -73,6 +74,10 @@ WORKER_PENDING_CLOSES_PAUSE_ALLOCATE="${WORKER_PENDING_CLOSES_PAUSE_ALLOCATE:-50
 WORKER_PENDING_CLOSES_REJECT_RESET="${WORKER_PENDING_CLOSES_REJECT_RESET:-100}"
 WORKER_DOCKER_CLI_TIMEOUT="${WORKER_DOCKER_CLI_TIMEOUT:-3}"
 WORKER_PRESSURE_CACHE_TTL="${WORKER_PRESSURE_CACHE_TTL:-5}"
+TERMINAL_ENV_FORCE_DOCKER_CLEANUP="${TERMINAL_ENV_FORCE_DOCKER_CLEANUP:-1}"
+TERMINAL_ENV_FORCE_DOCKER_CLEANUP_BROAD="${TERMINAL_ENV_FORCE_DOCKER_CLEANUP_BROAD:-1}"
+TERMINAL_ENV_FORCE_DOCKER_CLEANUP_ALWAYS="${TERMINAL_ENV_FORCE_DOCKER_CLEANUP_ALWAYS:-0}"
+TERMINAL_ENV_FORCE_DOCKER_CLEANUP_TIMEOUT="${TERMINAL_ENV_FORCE_DOCKER_CLEANUP_TIMEOUT:-20}"
 
 log "=== pool_server_pu_v2 starting ==="
 log "  max_tasks=${WORKER_MAX_TASKS}  max_runs_per_task=${WORKER_MAX_RUNS_PER_TASK}"
@@ -80,10 +85,12 @@ log "  max_concurrent_closes=${WORKER_MAX_CONCURRENT_CLOSES}"
 log "  max_concurrent_builds=${WORKER_MAX_CONCURRENT_BUILDS}"
 log "  close_task_timeout=${WORKER_CLOSE_TASK_TIMEOUT}"
 log "  port=${ENV_SERVER_PORT}  skip_cleanup=${SKIP_PREFLIGHT_CLEANUP}"
+log "  preflight_kill_orphan_running=${PREFLIGHT_KILL_ORPHAN_RUNNING}"
 log "  total_capacity=$((WORKER_MAX_TASKS * WORKER_MAX_RUNS_PER_TASK)) slots"
 log "  docker_data_root=${DOCKER_DATA_ROOT} disk_guard=${WORKER_DISK_GUARD_ENABLED}"
 log "  pressure_guard=${WORKER_PRESSURE_GUARD_ENABLED} pids_pause=${WORKER_PIDS_PAUSE_ALLOCATE_PCT}% pids_reset=${WORKER_PIDS_REJECT_RESET_PCT}%"
 log "  pressure_guard shim_pause=${WORKER_SHIM_PAUSE_ALLOCATE} shim_reset=${WORKER_SHIM_REJECT_RESET} pending_pause=${WORKER_PENDING_CLOSES_PAUSE_ALLOCATE} pending_reset=${WORKER_PENDING_CLOSES_REJECT_RESET}"
+log "  force_cleanup=${TERMINAL_ENV_FORCE_DOCKER_CLEANUP} broad=${TERMINAL_ENV_FORCE_DOCKER_CLEANUP_BROAD} always=${TERMINAL_ENV_FORCE_DOCKER_CLEANUP_ALWAYS} timeout=${TERMINAL_ENV_FORCE_DOCKER_CLEANUP_TIMEOUT}s"
 
 if [[ "${SKIP_PROXY_ENV}" != "1" && -f "${PROXY_ENV_FILE}" ]]; then
     # shellcheck disable=SC1090
@@ -250,13 +257,23 @@ if [[ "${SKIP_PREFLIGHT_CLEANUP}" != "1" ]]; then
         log "  ✅ Pruned networks"
     fi
 
-    # Check for running task containers from previous pool (pattern: <number>-<name>-<project>)
+    # Check for running task containers from previous pool.
     # These are containers whose compose project died but containers are still up
-    ORPHAN_RUNNING=$(docker ps --format '{{.Names}}' 2>/dev/null \
-        | grep -E '^[0-9]+-.*_(client|helper)-[0-9]+$' | wc -l || true)
+    ORPHAN_PATTERN='^[0-9]+[-_].*(slime[-_]?run|client|helper).*$'
+    ORPHAN_NAMES=$(docker ps --format '{{.Names}}' 2>/dev/null \
+        | grep -E "${ORPHAN_PATTERN}" || true)
+    ORPHAN_RUNNING=$(printf '%s\n' "${ORPHAN_NAMES}" | sed '/^$/d' | wc -l || true)
     if [[ "${ORPHAN_RUNNING}" -gt 0 ]]; then
-        log "  ⚠️  ${ORPHAN_RUNNING} orphan task containers still running — consider manual cleanup:"
-        log "     docker ps --format '{{.Names}}' | grep -E '^[0-9]+-' | xargs docker rm -f"
+        log "  ⚠️  ${ORPHAN_RUNNING} orphan task containers still running"
+        if [[ "${PREFLIGHT_KILL_ORPHAN_RUNNING}" == "1" ]]; then
+            log "  Removing orphan running task containers before starting pool_server..."
+            printf '%s\n' "${ORPHAN_NAMES}" | xargs -r docker rm -f >/dev/null 2>&1 || true
+            log "  ✅ Removed orphan running task containers"
+        else
+            log "     Inspect: docker ps --format '{{.Names}}' | grep -E '${ORPHAN_PATTERN}'"
+            log "     Cleanup: docker ps --format '{{.Names}}' | grep -E '${ORPHAN_PATTERN}' | xargs -r docker rm -f"
+            log "     Or set PREFLIGHT_KILL_ORPHAN_RUNNING=1 when no active training uses this worker."
+        fi
     fi
 else
     log "  ⏭  Skipped (SKIP_PREFLIGHT_CLEANUP=1)"
@@ -347,6 +364,10 @@ export WORKER_PENDING_CLOSES_PAUSE_ALLOCATE
 export WORKER_PENDING_CLOSES_REJECT_RESET
 export WORKER_DOCKER_CLI_TIMEOUT
 export WORKER_PRESSURE_CACHE_TTL
+export TERMINAL_ENV_FORCE_DOCKER_CLEANUP
+export TERMINAL_ENV_FORCE_DOCKER_CLEANUP_BROAD
+export TERMINAL_ENV_FORCE_DOCKER_CLEANUP_ALWAYS
+export TERMINAL_ENV_FORCE_DOCKER_CLEANUP_TIMEOUT
 
 if [ -d "${REPO_ROOT}/.venv" ]; then
     source .venv/bin/activate

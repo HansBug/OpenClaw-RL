@@ -424,8 +424,22 @@ class WorkerPool:
                         run_lease_id,
                         self.close_task_timeout,
                     )
+                    try:
+                        await run_slot.env.force_cleanup(reason="close_timeout")
+                    except Exception:
+                        logger.exception(
+                            "Force cleanup failed after close timeout for run session %s",
+                            run_lease_id,
+                        )
                 except Exception:
                     logger.exception("Failed to close run session %s", run_lease_id)
+                    try:
+                        await run_slot.env.force_cleanup(reason="close_exception")
+                    except Exception:
+                        logger.exception(
+                            "Force cleanup failed after close exception for run session %s",
+                            run_lease_id,
+                        )
 
     def _schedule_close(
         self, task_key: str, run_lease_id: str, run_slot: RunSlot, *, reason: str

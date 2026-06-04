@@ -72,11 +72,17 @@ REPAIR_COOLDOWN_S="${REPAIR_COOLDOWN_S:-300}"
 POOL_HOST="${POOL_HOST:-127.0.0.1}"
 POOL_PORT="${POOL_PORT:-18081}"
 POOL_PENDING_CLOSES_WARN="${POOL_PENDING_CLOSES_WARN:-50}"
+POOL_PENDING_CLOSES_REPAIR="${POOL_PENDING_CLOSES_REPAIR:-1}"
+POOL_PENDING_CLOSES_REPAIR_THRESHOLD="${POOL_PENDING_CLOSES_REPAIR_THRESHOLD:-${POOL_PENDING_CLOSES_WARN}}"
+POOL_PENDING_CLOSES_STUCK_CHECKS="${POOL_PENDING_CLOSES_STUCK_CHECKS:-5}"
+POOL_PENDING_CLOSES_ACTIVE_MAX="${POOL_PENDING_CLOSES_ACTIVE_MAX:-8}"
+POOL_PENDING_CLOSES_REAP_LIMIT="${POOL_PENDING_CLOSES_REAP_LIMIT:-0}"
+POOL_PENDING_CLOSES_REPAIR_COOLDOWN_S="${POOL_PENDING_CLOSES_REPAIR_COOLDOWN_S:-300}"
 BRIDGE_NETS_WARN="${BRIDGE_NETS_WARN:-200}"
 EMERGENCY_COOLDOWN_S="${EMERGENCY_COOLDOWN_S:-60}"
 POOL_SERVER_NAME_REGEX="${POOL_SERVER_NAME_REGEX:-openclaw_pool_server}"
-TASK_CONTAINER_REGEX="${TASK_CONTAINER_REGEX:-^[0-9]+-.*([-_](client|helper)([-_][0-9]+)?|-slime-run)$}"
-TASK_IMAGE_REGEX="${TASK_IMAGE_REGEX:-^tb__[0-9]+__(client|helper)(:|$)}"
+TASK_CONTAINER_REGEX="${TASK_CONTAINER_REGEX:-^[0-9]+[-_].*(slime[-_]?run|client|helper).*$}"
+TASK_IMAGE_REGEX="${TASK_IMAGE_REGEX:-^tb__[0-9]+__.*(:|$)}"
 HEARTBEAT_INTERVAL="${HEARTBEAT_INTERVAL:-600}"  # "I'm alive" line every 10 min
 
 DISK_CHECK_INTERVAL="${DISK_CHECK_INTERVAL:-60}"
@@ -105,6 +111,8 @@ LAST_POOL_STOP_TS=0
 LAST_REPAIR_TS=0
 LAST_PROC_WARN_TS=0
 LAST_PIDS_RELIEF_TS=0
+LAST_POOL_PENDING_REPAIR_TS=0
+POOL_PENDING_HIGH_COUNT=0
 
 # ── namespace 检测 ────────────────────────────────────────────────────
 HOST_PID_NS=0
@@ -301,8 +309,8 @@ kill_task_containers_for_pressure() {
     fi
 
     n="$(printf '%s\n' "${ids}" | wc -l)"
-    log "PRESSURE: killing ${n} task containers (reason=${reason})"
-    printf '%s\n' "${ids}" | xargs -r -n 10 timeout 30 docker kill >/dev/null 2>&1 || true
+    log "PRESSURE: removing ${n} task containers (reason=${reason})"
+    printf '%s\n' "${ids}" | xargs -r -n 10 timeout 30 docker rm -f >/dev/null 2>&1 || true
     return 0
 }
 
@@ -320,6 +328,26 @@ pids_pressure_relief() {
     repair_snapshot
     stop_pool_server_for_pressure "${reason}"
     kill_task_containers_for_pressure "${reason}" 0 || true
+}
+
+repair_stuck_pool_pending_closes() {
+    local pending="$1"
+    local active="$2"
+    local now reason
+
+    [ "${POOL_PENDING_CLOSES_REPAIR}" = "1" ] || return 0
+    now=$(date +%s)
+    if [ $((now - LAST_POOL_PENDING_REPAIR_TS)) -lt "${POOL_PENDING_CLOSES_REPAIR_COOLDOWN_S}" ]; then
+        log "POOL_REPAIR suppressed (cooldown ${POOL_PENDING_CLOSES_REPAIR_COOLDOWN_S}s active): pending_closes=${pending} active=${active}"
+        return 0
+    fi
+    LAST_POOL_PENDING_REPAIR_TS="$now"
+
+    reason="stuck pool pending_closes=${pending} active=${active} high_count=${POOL_PENDING_HIGH_COUNT}"
+    log "POOL_REPAIR: ${reason}; reaping task containers with broad matcher"
+    kill_task_containers_for_pressure "${reason}" "${POOL_PENDING_CLOSES_REAP_LIMIT}" || true
+    timeout 30 docker container prune -f --filter "until=0s" >/dev/null 2>&1 || true
+    timeout 30 docker network prune -f >/dev/null 2>&1 || true
 }
 
 # ── 紧急泄压（带冷却 + foreground + timeout）─────────────────────────
@@ -628,8 +656,16 @@ except Exception:
         LAST_POOL_PENDING="$pending"
         LAST_POOL_ACTIVE="$active"
         if [ "$pending" -gt "$POOL_PENDING_CLOSES_WARN" ] 2>/dev/null; then
-            log "WARN: pool_server pending_closes=${pending} (active=${active}); pruning networks"
-            timeout 30 docker network prune -f >/dev/null 2>&1 || true
+            POOL_PENDING_HIGH_COUNT=$((POOL_PENDING_HIGH_COUNT + 1))
+            log "WARN: pool_server pending_closes=${pending} (active=${active}, high_count=${POOL_PENDING_HIGH_COUNT}/${POOL_PENDING_CLOSES_STUCK_CHECKS})"
+            if [ "$pending" -ge "$POOL_PENDING_CLOSES_REPAIR_THRESHOLD" ] 2>/dev/null \
+               && [ "$POOL_PENDING_HIGH_COUNT" -ge "$POOL_PENDING_CLOSES_STUCK_CHECKS" ] 2>/dev/null \
+               && [ "$active" -le "$POOL_PENDING_CLOSES_ACTIVE_MAX" ] 2>/dev/null; then
+                repair_stuck_pool_pending_closes "$pending" "$active"
+                POOL_PENDING_HIGH_COUNT=0
+            fi
+        else
+            POOL_PENDING_HIGH_COUNT=0
         fi
     fi
 
@@ -927,6 +963,7 @@ log "  proc emerg: docker_related=${DOCKER_PROC_EMERGENCY} shim=${SHIM_PROC_EMER
 log "  docker_down_shim_relief=${DOCKER_DOWN_SHIM_RELIEF} kill_shims_on_docker_down=${WATCHDOG_KILL_SHIMS_ON_DOCKER_DOWN}"
 log "  Mem  warn=${MEM_WARN_PCT}% emerg=${MEM_EMERGENCY_PCT}%"
 log "  pool=${POOL_HOST}:${POOL_PORT}  pool_server_regex=${POOL_SERVER_NAME_REGEX}"
+log "  pool_pending repair=${POOL_PENDING_CLOSES_REPAIR} warn=${POOL_PENDING_CLOSES_WARN} threshold=${POOL_PENDING_CLOSES_REPAIR_THRESHOLD} stuck_checks=${POOL_PENDING_CLOSES_STUCK_CHECKS} active_max=${POOL_PENDING_CLOSES_ACTIVE_MAX} reap_limit=${POOL_PENDING_CLOSES_REAP_LIMIT} cooldown=${POOL_PENDING_CLOSES_REPAIR_COOLDOWN_S}s"
 log "  task_container_regex=${TASK_CONTAINER_REGEX}"
 log "  task_image_regex=${TASK_IMAGE_REGEX}"
 log "  docker_data_root=${DOCKER_DATA_ROOT}  proxy_url=${PROXY_URL}  proxy_env_file=${PROXY_ENV_FILE}"

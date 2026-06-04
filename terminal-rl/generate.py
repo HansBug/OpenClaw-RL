@@ -1628,7 +1628,7 @@ async def generate(
     if not isinstance(sample.metadata, dict):
         sample.metadata = {}
     data_source = str(task_meta.get("data_source", ""))
-    seta_safety_mode = os.getenv("SETA_SAFETY", "clawsentry")
+    seta_safety_mode = os.getenv("SETA_SAFETY", "none")
     safety_bench_reward_mode = os.getenv("SAFETY_BENCH_REWARD", "rule")
     agentharm_reward_mode = os.getenv("AGENTHARM_REWARD", "rule")
     uid = (sample.metadata or {}).get("uid") or uuid.uuid4().hex[:8]
