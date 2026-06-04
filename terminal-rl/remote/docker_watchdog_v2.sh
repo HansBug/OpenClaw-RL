@@ -78,6 +78,9 @@ POOL_PENDING_CLOSES_STUCK_CHECKS="${POOL_PENDING_CLOSES_STUCK_CHECKS:-5}"
 POOL_PENDING_CLOSES_ACTIVE_MAX="${POOL_PENDING_CLOSES_ACTIVE_MAX:-8}"
 POOL_PENDING_CLOSES_REAP_LIMIT="${POOL_PENDING_CLOSES_REAP_LIMIT:-0}"
 POOL_PENDING_CLOSES_REPAIR_COOLDOWN_S="${POOL_PENDING_CLOSES_REPAIR_COOLDOWN_S:-300}"
+POOL_PENDING_CLOSES_CANCEL_API="${POOL_PENDING_CLOSES_CANCEL_API:-1}"
+POOL_PENDING_CLOSES_CANCEL_TIMEOUT="${POOL_PENDING_CLOSES_CANCEL_TIMEOUT:-5}"
+POOL_PENDING_CLOSES_CANCEL_MIN_AGE="${POOL_PENDING_CLOSES_CANCEL_MIN_AGE:-90}"
 BRIDGE_NETS_WARN="${BRIDGE_NETS_WARN:-200}"
 EMERGENCY_COOLDOWN_S="${EMERGENCY_COOLDOWN_S:-60}"
 POOL_SERVER_NAME_REGEX="${POOL_SERVER_NAME_REGEX:-openclaw_pool_server}"
@@ -147,6 +150,39 @@ log() {
     echo "$(date '+%F %T') ${LOG_PREFIX} $*"
     rotate_log_if_big
 }
+
+positive_int_or_default() {
+    local name="$1"
+    local value="$2"
+    local default="$3"
+    if [[ "${value}" =~ ^[0-9]+$ ]] && [ "${value}" -gt 0 ] 2>/dev/null; then
+        printf '%s' "${value}"
+    else
+        echo "$(date '+%F %T') ${LOG_PREFIX} WARN: invalid ${name}=${value}; using ${default}" >&2
+        printf '%s' "${default}"
+    fi
+}
+
+nonnegative_int_or_default() {
+    local name="$1"
+    local value="$2"
+    local default="$3"
+    if [[ "${value}" =~ ^[0-9]+$ ]]; then
+        printf '%s' "${value}"
+    else
+        echo "$(date '+%F %T') ${LOG_PREFIX} WARN: invalid ${name}=${value}; using ${default}" >&2
+        printf '%s' "${default}"
+    fi
+}
+
+POOL_PENDING_CLOSES_WARN="$(positive_int_or_default POOL_PENDING_CLOSES_WARN "${POOL_PENDING_CLOSES_WARN}" 50)"
+POOL_PENDING_CLOSES_REPAIR_THRESHOLD="$(positive_int_or_default POOL_PENDING_CLOSES_REPAIR_THRESHOLD "${POOL_PENDING_CLOSES_REPAIR_THRESHOLD}" "${POOL_PENDING_CLOSES_WARN}")"
+POOL_PENDING_CLOSES_STUCK_CHECKS="$(positive_int_or_default POOL_PENDING_CLOSES_STUCK_CHECKS "${POOL_PENDING_CLOSES_STUCK_CHECKS}" 5)"
+POOL_PENDING_CLOSES_ACTIVE_MAX="$(nonnegative_int_or_default POOL_PENDING_CLOSES_ACTIVE_MAX "${POOL_PENDING_CLOSES_ACTIVE_MAX}" 64)"
+POOL_PENDING_CLOSES_REAP_LIMIT="$(nonnegative_int_or_default POOL_PENDING_CLOSES_REAP_LIMIT "${POOL_PENDING_CLOSES_REAP_LIMIT}" 0)"
+POOL_PENDING_CLOSES_REPAIR_COOLDOWN_S="$(nonnegative_int_or_default POOL_PENDING_CLOSES_REPAIR_COOLDOWN_S "${POOL_PENDING_CLOSES_REPAIR_COOLDOWN_S}" 300)"
+POOL_PENDING_CLOSES_CANCEL_TIMEOUT="$(positive_int_or_default POOL_PENDING_CLOSES_CANCEL_TIMEOUT "${POOL_PENDING_CLOSES_CANCEL_TIMEOUT}" 5)"
+POOL_PENDING_CLOSES_CANCEL_MIN_AGE="$(nonnegative_int_or_default POOL_PENDING_CLOSES_CANCEL_MIN_AGE "${POOL_PENDING_CLOSES_CANCEL_MIN_AGE}" 90)"
 
 docker_alive() {
     timeout 3 curl -fsS --max-time 2 \
@@ -333,7 +369,7 @@ pids_pressure_relief() {
 repair_stuck_pool_pending_closes() {
     local pending="$1"
     local active="$2"
-    local now reason
+    local now reason matched repair_tmp repair_code
 
     [ "${POOL_PENDING_CLOSES_REPAIR}" = "1" ] || return 0
     now=$(date +%s)
@@ -345,9 +381,27 @@ repair_stuck_pool_pending_closes() {
 
     reason="stuck pool pending_closes=${pending} active=${active} high_count=${POOL_PENDING_HIGH_COUNT}"
     log "POOL_REPAIR: ${reason}; reaping task containers with broad matcher"
-    kill_task_containers_for_pressure "${reason}" "${POOL_PENDING_CLOSES_REAP_LIMIT}" || true
+    matched=1
+    kill_task_containers_for_pressure "${reason}" "${POOL_PENDING_CLOSES_REAP_LIMIT}" || matched=0
     timeout 30 docker container prune -f --filter "until=0s" >/dev/null 2>&1 || true
     timeout 30 docker network prune -f >/dev/null 2>&1 || true
+
+    if [ "${POOL_PENDING_CLOSES_CANCEL_API}" = "1" ]; then
+        repair_tmp="$(mktemp /tmp/pool_pending_repair.XXXXXX 2>/dev/null || echo /tmp/pool_pending_repair.$$)"
+        repair_code=$(timeout 10 curl -sS --noproxy '*' -o "${repair_tmp}" -w '%{http_code}' \
+            -X POST -H 'Content-Type: application/json' \
+            --data "{\"reason\":\"watchdog_pending_closes_repair\",\"max_active_runs\":${POOL_PENDING_CLOSES_ACTIVE_MAX},\"cancel_timeout\":${POOL_PENDING_CLOSES_CANCEL_TIMEOUT},\"min_age\":${POOL_PENDING_CLOSES_CANCEL_MIN_AGE}}" \
+            "http://${POOL_HOST}:${POOL_PORT}/repair/pending_closes" 2>/dev/null || echo "000")
+        if [ "${repair_code}" = "200" ]; then
+            log "POOL_REPAIR: pending-close API response: $(head -c 300 "${repair_tmp}" 2>/dev/null)"
+        else
+            log "POOL_REPAIR: pending-close API failed HTTP ${repair_code}: $(head -c 300 "${repair_tmp}" 2>/dev/null)"
+            if [ "${matched}" = "0" ] && [ "${active}" -eq 0 ] 2>/dev/null; then
+                log "POOL_REPAIR: no task containers matched and active=0; stop/restart pool_server manually if pending_closes remains high"
+            fi
+        fi
+        rm -f "${repair_tmp}" 2>/dev/null || true
+    fi
 }
 
 # ── 紧急泄压（带冷却 + foreground + timeout）─────────────────────────
@@ -635,7 +689,7 @@ check_pool_server() {
     fi
     rm -f "$health_tmp" 2>/dev/null || true
 
-    local body pending=0 active=0
+    local body pending=0 active=0 active_tasks=0 active_runs=0
     body=$(timeout 3 curl -fsS --noproxy '*' "http://${POOL_HOST}:${POOL_PORT}/status" 2>/dev/null)
     if [ -n "$body" ]; then
         # 合并到 1 个 python 调用减少 fork 开销
@@ -645,19 +699,22 @@ import json, sys
 try:
     d = json.load(sys.stdin)
     p = d.get("pool", d)
-    print(p.get("pending_closes", 0), p.get("active_tasks", p.get("total_active_runs", 0)))
+    print(p.get("pending_closes", 0), p.get("active_tasks", 0), p.get("total_active_runs", 0))
 except Exception:
-    print("0 0")
+    print("0 0 0")
 ' 2>/dev/null)
-        pending="${parsed% *}"
-        active="${parsed#* }"
+        set -- ${parsed}
+        pending="${1:-0}"
+        active_tasks="${2:-0}"
+        active_runs="${3:-0}"
+        active="${active_runs}"
         pending="${pending:-0}"
         active="${active:-0}"
         LAST_POOL_PENDING="$pending"
         LAST_POOL_ACTIVE="$active"
         if [ "$pending" -gt "$POOL_PENDING_CLOSES_WARN" ] 2>/dev/null; then
             POOL_PENDING_HIGH_COUNT=$((POOL_PENDING_HIGH_COUNT + 1))
-            log "WARN: pool_server pending_closes=${pending} (active=${active}, high_count=${POOL_PENDING_HIGH_COUNT}/${POOL_PENDING_CLOSES_STUCK_CHECKS})"
+            log "WARN: pool_server pending_closes=${pending} (active_runs=${active_runs}, active_tasks=${active_tasks}, high_count=${POOL_PENDING_HIGH_COUNT}/${POOL_PENDING_CLOSES_STUCK_CHECKS})"
             if [ "$pending" -ge "$POOL_PENDING_CLOSES_REPAIR_THRESHOLD" ] 2>/dev/null \
                && [ "$POOL_PENDING_HIGH_COUNT" -ge "$POOL_PENDING_CLOSES_STUCK_CHECKS" ] 2>/dev/null \
                && [ "$active" -le "$POOL_PENDING_CLOSES_ACTIVE_MAX" ] 2>/dev/null; then
@@ -963,7 +1020,7 @@ log "  proc emerg: docker_related=${DOCKER_PROC_EMERGENCY} shim=${SHIM_PROC_EMER
 log "  docker_down_shim_relief=${DOCKER_DOWN_SHIM_RELIEF} kill_shims_on_docker_down=${WATCHDOG_KILL_SHIMS_ON_DOCKER_DOWN}"
 log "  Mem  warn=${MEM_WARN_PCT}% emerg=${MEM_EMERGENCY_PCT}%"
 log "  pool=${POOL_HOST}:${POOL_PORT}  pool_server_regex=${POOL_SERVER_NAME_REGEX}"
-log "  pool_pending repair=${POOL_PENDING_CLOSES_REPAIR} warn=${POOL_PENDING_CLOSES_WARN} threshold=${POOL_PENDING_CLOSES_REPAIR_THRESHOLD} stuck_checks=${POOL_PENDING_CLOSES_STUCK_CHECKS} active_max=${POOL_PENDING_CLOSES_ACTIVE_MAX} reap_limit=${POOL_PENDING_CLOSES_REAP_LIMIT} cooldown=${POOL_PENDING_CLOSES_REPAIR_COOLDOWN_S}s"
+log "  pool_pending repair=${POOL_PENDING_CLOSES_REPAIR} warn=${POOL_PENDING_CLOSES_WARN} threshold=${POOL_PENDING_CLOSES_REPAIR_THRESHOLD} stuck_checks=${POOL_PENDING_CLOSES_STUCK_CHECKS} active_max=${POOL_PENDING_CLOSES_ACTIVE_MAX} reap_limit=${POOL_PENDING_CLOSES_REAP_LIMIT} cooldown=${POOL_PENDING_CLOSES_REPAIR_COOLDOWN_S}s cancel_api=${POOL_PENDING_CLOSES_CANCEL_API} cancel_timeout=${POOL_PENDING_CLOSES_CANCEL_TIMEOUT}s"
 log "  task_container_regex=${TASK_CONTAINER_REGEX}"
 log "  task_image_regex=${TASK_IMAGE_REGEX}"
 log "  docker_data_root=${DOCKER_DATA_ROOT}  proxy_url=${PROXY_URL}  proxy_env_file=${PROXY_ENV_FILE}"

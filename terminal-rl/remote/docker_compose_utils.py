@@ -14,6 +14,8 @@ from terminal_bench.handlers.trial_handler import TrialHandler
 from terminal_bench.terminal.docker_compose_manager import DockerComposeManager
 from terminal_bench.terminal.terminal import Terminal
 
+logger = logging.getLogger(__name__)
+
 
 @dataclass(frozen=True)
 class ImagePreparationResult:
@@ -34,6 +36,9 @@ def _env_int(name: str, default: int) -> int:
 
 _MAX_CONCURRENT_BUILDS = _env_int("WORKER_MAX_CONCURRENT_BUILDS", 4)
 _BUILD_SEMAPHORE = threading.BoundedSemaphore(_MAX_CONCURRENT_BUILDS)
+_BUILD_LOCKS_GUARD = threading.Lock()
+_BUILD_LOCKS: dict[str, threading.Lock] = {}
+_BUILD_DONE: set[str] = set()
 
 
 def _safe_project_component(value: str, fallback: str = "task") -> str:
@@ -126,6 +131,22 @@ def _compose_plugin_maybe_missing(stderr: str | None) -> bool:
     )
 
 
+def _env_bool(name: str, default: bool) -> bool:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() not in {"0", "false", "no", "off"}
+
+
+def _lock_for_build_key(key: str) -> threading.Lock:
+    with _BUILD_LOCKS_GUARD:
+        lock = _BUILD_LOCKS.get(key)
+        if lock is None:
+            lock = threading.Lock()
+            _BUILD_LOCKS[key] = lock
+        return lock
+
+
 def build_docker_image(task: dict[str, Any], timeout: float = 1200.0) -> None:
     dataset_dir = str(os.getenv("DATASET_DIR", "")).strip()
     if not dataset_dir:
@@ -149,12 +170,28 @@ def build_docker_image(task: dict[str, Any], timeout: float = 1200.0) -> None:
         sessions_logs_path=trial_handler.trial_paths.sessions_path,
         agent_logs_path=trial_handler.trial_paths.agent_logging_dir,
     )
-    with _BUILD_SEMAPHORE:
-        import inspect
-        if "timeout" in inspect.signature(compose_manager.build).parameters:
-            compose_manager.build(timeout=timeout)
-        else:
-            compose_manager.build()
+    build_key = trial_handler.client_image_name
+    build_dedup = _env_bool("WORKER_DOCKER_BUILD_DEDUP", True)
+    skip_existing = _env_bool("WORKER_DOCKER_BUILD_SKIP_EXISTING", True)
+    build_lock = _lock_for_build_key(build_key) if build_dedup else threading.Lock()
+
+    with build_lock:
+        if build_key in _BUILD_DONE:
+            return
+        if skip_existing and _docker_image_exists_locally(build_key):
+            logger.debug("Docker image already exists locally; skip build: %s", build_key)
+            _BUILD_DONE.add(build_key)
+            return
+
+        with _BUILD_SEMAPHORE:
+            import inspect
+
+            logger.info("Building Docker image for task=%s image=%s", task_name, build_key)
+            if "timeout" in inspect.signature(compose_manager.build).parameters:
+                compose_manager.build(timeout=timeout)
+            else:
+                compose_manager.build()
+            _BUILD_DONE.add(build_key)
 
 
 def _resolve_pull_image(task: dict[str, Any]) -> str:

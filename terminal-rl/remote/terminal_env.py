@@ -6,6 +6,7 @@ import logging
 import os
 import re
 import subprocess
+import inspect
 from functools import partial
 from pathlib import Path
 from typing import Any
@@ -66,10 +67,25 @@ def _matches_project_name(name: str, project_names: set[str], *, broad: bool) ->
     return False
 
 
+def _docker_image_prefixes(*values: str | None) -> set[str]:
+    prefixes: set[str] = set()
+    for value in values:
+        if not value:
+            continue
+        raw = value.strip()
+        if raw:
+            prefixes.add(raw)
+        task_match = re.match(r"^([0-9]+)[-_.]", raw)
+        if task_match:
+            prefixes.add(f"tb__{task_match.group(1)}__")
+    return {prefix for prefix in prefixes if prefix.startswith("tb__")}
+
+
 def _force_remove_docker_objects(
     *,
     trial_name: str,
     client_container_name: str | None,
+    docker_image_name_prefix: str | None = None,
     reason: str,
 ) -> None:
     if not _env_bool("TERMINAL_ENV_FORCE_DOCKER_CLEANUP", True):
@@ -79,7 +95,12 @@ def _force_remove_docker_objects(
     broad = _env_bool("TERMINAL_ENV_FORCE_DOCKER_CLEANUP_BROAD", True)
     project_names = _docker_name_variants(trial_name)
     project_names.update(_docker_name_variants(client_container_name))
-    if not project_names:
+    image_prefixes = _docker_image_prefixes(
+        docker_image_name_prefix,
+        trial_name,
+        client_container_name,
+    )
+    if not project_names and not image_prefixes:
         return
 
     def _run(cmd: list[str], *, check: bool = False) -> subprocess.CompletedProcess:
@@ -110,7 +131,10 @@ def _force_remove_docker_objects(
         if len(parts) < 2:
             continue
         container_id, name = parts[0], parts[1]
-        if _matches_project_name(name, project_names, broad=broad):
+        image = parts[2] if len(parts) > 2 else ""
+        if _matches_project_name(name, project_names, broad=broad) or any(
+            image.startswith(prefix) for prefix in image_prefixes
+        ):
             container_ids.append(container_id)
 
     if container_ids:
@@ -154,14 +178,9 @@ def _force_remove_docker_objects(
 
 
 def _stop_terminal_compat(terminal: Terminal, timeout: float) -> None:
-    try:
+    if "timeout" in inspect.signature(terminal.stop).parameters:
         terminal.stop(timeout=timeout)
-    except TypeError as exc:
-        if "unexpected keyword argument 'timeout'" not in str(exc):
-            raise
-        logger.warning(
-            "Terminal.stop(timeout=...) is unsupported; retrying with Terminal.stop()."
-        )
+    else:
         terminal.stop()
 
 
@@ -216,6 +235,7 @@ class TerminalEnv:
         self._eval_attempt = 0
         self._last_trial_name: str | None = None
         self._last_client_container_name: str | None = None
+        self._last_docker_image_name_prefix: str | None = None
 
     async def reset(
         self,
@@ -269,6 +289,9 @@ class TerminalEnv:
             )
             self._last_trial_name = self._trial_handler.trial_name
             self._last_client_container_name = self._trial_handler.client_container_name
+            self._last_docker_image_name_prefix = (
+                self._trial_handler.docker_image_name_prefix
+            )
             task_config = self._trial_handler.task
             self._parser = ParserFactory.get_parser(task_config.parser_name)
             client_image_name = (
@@ -478,6 +501,11 @@ class TerminalEnv:
             if self._trial_handler is not None
             else self._last_client_container_name
         )
+        docker_image_name_prefix = (
+            self._trial_handler.docker_image_name_prefix
+            if self._trial_handler is not None
+            else self._last_docker_image_name_prefix
+        )
         if self._closed:
             logger.warning("TerminalEnv %s already closed", trial_name)
             return
@@ -558,6 +586,7 @@ class TerminalEnv:
                         _force_remove_docker_objects,
                         trial_name=trial_name,
                         client_container_name=client_container_name,
+                        docker_image_name_prefix=docker_image_name_prefix,
                         reason=reason,
                     )
                 except Exception:
@@ -570,5 +599,6 @@ class TerminalEnv:
             _force_remove_docker_objects,
             trial_name=self._last_trial_name or "unknown",
             client_container_name=self._last_client_container_name,
+            docker_image_name_prefix=self._last_docker_image_name_prefix,
             reason=reason,
         )

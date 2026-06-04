@@ -402,44 +402,59 @@ class WorkerPool:
 
         self._close_sem = asyncio.Semaphore(max_concurrent_closes)
         self._closing_tasks: set[asyncio.Task] = set()
+        self._closing_task_started: dict[asyncio.Task, float] = {}
+        self._closing_task_labels: dict[asyncio.Task, str] = {}
 
     def _new_env(self) -> TerminalEnv:
         return TerminalEnv()
+
+    async def _close_run_slot_under_lock(self, run_slot: RunSlot) -> None:
+        async with run_slot.lock:
+            await run_slot.env.close()
+
+    def _prune_done_closing_tasks(self) -> int:
+        done = {task for task in self._closing_tasks if task.done()}
+        self._closing_tasks.difference_update(done)
+        for task in done:
+            self._closing_task_started.pop(task, None)
+            self._closing_task_labels.pop(task, None)
+        return len(done)
 
     async def _close_run_slot(
         self, task_key: str, run_lease_id: str, run_slot: RunSlot, *, reason: str
     ) -> None:
         logger.warning("%s %s (task=%s)", reason, run_lease_id, task_key)
         async with self._close_sem:
-            async with run_slot.lock:
+            try:
+                await asyncio.wait_for(
+                    self._close_run_slot_under_lock(run_slot),
+                    timeout=self.close_task_timeout,
+                )
+            except asyncio.TimeoutError:
+                logger.warning(
+                    "Timed out closing run session %s after %.1fs while waiting for "
+                    "the run lock and/or env.close(); dropping it from the pool so "
+                    "the close backlog can drain. Watchdog/preflight cleanup will "
+                    "remove any orphan Docker objects.",
+                    run_lease_id,
+                    self.close_task_timeout,
+                )
                 try:
-                    await asyncio.wait_for(
-                        run_slot.env.close(), timeout=self.close_task_timeout
-                    )
-                except asyncio.TimeoutError:
-                    logger.warning(
-                        "Timed out closing run session %s after %.1fs; dropping it from "
-                        "the pool so close backlog can drain. Watchdog/preflight cleanup "
-                        "will remove any orphan Docker objects.",
-                        run_lease_id,
-                        self.close_task_timeout,
-                    )
-                    try:
-                        await run_slot.env.force_cleanup(reason="close_timeout")
-                    except Exception:
-                        logger.exception(
-                            "Force cleanup failed after close timeout for run session %s",
-                            run_lease_id,
-                        )
+                    await run_slot.env.force_cleanup(reason="close_timeout")
                 except Exception:
-                    logger.exception("Failed to close run session %s", run_lease_id)
-                    try:
-                        await run_slot.env.force_cleanup(reason="close_exception")
-                    except Exception:
-                        logger.exception(
-                            "Force cleanup failed after close exception for run session %s",
-                            run_lease_id,
-                        )
+                    logger.exception(
+                        "Force cleanup failed after close timeout for run session %s",
+                        run_lease_id,
+                    )
+            except Exception:
+                logger.exception("Failed to close run session %s", run_lease_id)
+                try:
+                    await run_slot.env.force_cleanup(reason="close_exception")
+                except Exception:
+                    logger.exception(
+                        "Force cleanup failed after close exception for run session %s",
+                        run_lease_id,
+                    )
 
     def _schedule_close(
         self, task_key: str, run_lease_id: str, run_slot: RunSlot, *, reason: str
@@ -448,7 +463,15 @@ class WorkerPool:
             self._close_run_slot(task_key, run_lease_id, run_slot, reason=reason)
         )
         self._closing_tasks.add(task)
-        task.add_done_callback(self._closing_tasks.discard)
+        self._closing_task_started[task] = time.time()
+        self._closing_task_labels[task] = f"{reason} {run_lease_id} task={task_key}"
+
+        def _on_done(done_task: asyncio.Task) -> None:
+            self._closing_tasks.discard(done_task)
+            self._closing_task_started.pop(done_task, None)
+            self._closing_task_labels.pop(done_task, None)
+
+        task.add_done_callback(_on_done)
 
     def _reap_idle_locked(self) -> list[tuple[str, str, RunSlot]]:
         now = time.time()
@@ -619,6 +642,7 @@ class WorkerPool:
 
     async def status(self) -> dict[str, Any]:
         async with self._lock:
+            self._prune_done_closing_tasks()
             tasks_info: dict[str, Any] = {}
             total_runs = 0
             for tk, ts in self._tasks.items():
@@ -633,6 +657,89 @@ class WorkerPool:
                 "pending_closes": len(self._closing_tasks),
                 "tasks": tasks_info,
             }
+
+    async def repair_pending_closes(
+        self,
+        *,
+        reason: str,
+        max_active_runs: int = 0,
+        cancel_timeout: float = 5.0,
+        min_age: float | None = None,
+    ) -> dict[str, Any]:
+        now = time.time()
+        if min_age is None:
+            min_age = max(0.0, self.close_task_timeout + 5.0)
+        async with self._lock:
+            pruned_done = self._prune_done_closing_tasks()
+            active_runs = sum(len(ts.runs) for ts in self._tasks.values())
+            pending_before_cancel = len(self._closing_tasks)
+            if active_runs > max_active_runs:
+                return {
+                    "repaired": False,
+                    "reason": "active_runs_above_limit",
+                    "active_runs": active_runs,
+                    "max_active_runs": max_active_runs,
+                    "pending_closes": pending_before_cancel,
+                    "pruned_done": pruned_done,
+                }
+            tasks_to_cancel = [
+                task
+                for task in self._closing_tasks
+                if now - self._closing_task_started.get(task, now) >= min_age
+            ]
+            skipped_young = pending_before_cancel - len(tasks_to_cancel)
+
+        cancelled = 0
+        for task in tasks_to_cancel:
+            if not task.done():
+                task.cancel()
+                cancelled += 1
+
+        if tasks_to_cancel:
+            try:
+                await asyncio.wait_for(
+                    asyncio.gather(*tasks_to_cancel, return_exceptions=True),
+                    timeout=max(0.1, cancel_timeout),
+                )
+            except asyncio.TimeoutError:
+                logger.warning(
+                    "Timed out waiting for pending close task cancellation: "
+                    "reason=%s pending=%d timeout=%.1fs",
+                    reason,
+                    len(tasks_to_cancel),
+                    cancel_timeout,
+                )
+
+        async with self._lock:
+            pruned_after_cancel = self._prune_done_closing_tasks()
+            pending_after = len(self._closing_tasks)
+
+        logger.warning(
+            "Repaired pending close tasks: reason=%s active_runs=%d "
+            "min_age=%.1fs pruned_done=%d cancelled=%d skipped_young=%d "
+            "pruned_after_cancel=%d pending_after=%d",
+            reason,
+            active_runs,
+            min_age,
+            pruned_done,
+            cancelled,
+            skipped_young,
+            pruned_after_cancel,
+            pending_after,
+        )
+        return {
+            "repaired": True,
+            "reason": reason,
+            "active_runs": active_runs,
+            "max_active_runs": max_active_runs,
+            "min_age": min_age,
+            "pending_before_cancel": pending_before_cancel,
+            "pruned_done": pruned_done,
+            "cancelled": cancelled,
+            "skipped_young": skipped_young,
+            "pruned_after_cancel": pruned_after_cancel,
+            "pending_after": pending_after,
+        }
 
     async def periodic_reap(self, interval: float = 60.0) -> None:
         while True:
@@ -739,6 +846,55 @@ async def status() -> JSONResponse:
             "admission_error": disk_error,
         }
     )
+
+
+@app.post("/repair/pending_closes")
+async def repair_pending_closes(request: Request) -> JSONResponse:
+    if POOL is None:
+        return JSONResponse(
+            {"ok": False, "error": "Pool is not initialized"}, status_code=500
+        )
+    if os.getenv("WORKER_REPAIR_PENDING_CLOSES", "1") != "1":
+        return JSONResponse(
+            {
+                "ok": False,
+                "error": "Pending-close repair endpoint is disabled",
+                "code": "REPAIR_DISABLED",
+            },
+            status_code=403,
+        )
+
+    data = await json_payload(request)
+    reason = str(data.get("reason") or "manual")
+    max_active_runs = _env_int("WORKER_REPAIR_PENDING_CLOSES_MAX_ACTIVE_RUNS", 0)
+    cancel_timeout = _env_float("WORKER_REPAIR_PENDING_CLOSES_CANCEL_TIMEOUT", 5.0)
+    min_age = _env_float(
+        "WORKER_REPAIR_PENDING_CLOSES_MIN_AGE",
+        max(0.0, POOL.close_task_timeout + 5.0),
+    )
+    try:
+        if "max_active_runs" in data:
+            max_active_runs = int(data["max_active_runs"])
+    except (TypeError, ValueError):
+        pass
+    try:
+        if "cancel_timeout" in data:
+            cancel_timeout = float(data["cancel_timeout"])
+    except (TypeError, ValueError):
+        pass
+    try:
+        if "min_age" in data:
+            min_age = float(data["min_age"])
+    except (TypeError, ValueError):
+        pass
+
+    result = await POOL.repair_pending_closes(
+        reason=reason,
+        max_active_runs=max_active_runs,
+        cancel_timeout=cancel_timeout,
+        min_age=min_age,
+    )
+    return JSONResponse({"ok": True, **result})
 
 
 @app.post("/allocate")
@@ -850,6 +1006,11 @@ async def reset(request: Request) -> JSONResponse:
             status_code=503,
         )
     except Exception as exc:
+        logger.exception("Reset failed for lease_id=%s", lease_id)
+        try:
+            await POOL.close_run(str(lease_id))
+        except Exception:
+            logger.exception("Failed to schedule cleanup after reset failure for %s", lease_id)
         return JSONResponse({"ok": False, "error": str(exc)}, status_code=500)
 
 

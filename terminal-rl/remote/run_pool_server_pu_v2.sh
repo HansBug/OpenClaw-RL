@@ -78,6 +78,12 @@ TERMINAL_ENV_FORCE_DOCKER_CLEANUP="${TERMINAL_ENV_FORCE_DOCKER_CLEANUP:-1}"
 TERMINAL_ENV_FORCE_DOCKER_CLEANUP_BROAD="${TERMINAL_ENV_FORCE_DOCKER_CLEANUP_BROAD:-1}"
 TERMINAL_ENV_FORCE_DOCKER_CLEANUP_ALWAYS="${TERMINAL_ENV_FORCE_DOCKER_CLEANUP_ALWAYS:-0}"
 TERMINAL_ENV_FORCE_DOCKER_CLEANUP_TIMEOUT="${TERMINAL_ENV_FORCE_DOCKER_CLEANUP_TIMEOUT:-20}"
+WORKER_REPAIR_PENDING_CLOSES="${WORKER_REPAIR_PENDING_CLOSES:-1}"
+WORKER_REPAIR_PENDING_CLOSES_MAX_ACTIVE_RUNS="${WORKER_REPAIR_PENDING_CLOSES_MAX_ACTIVE_RUNS:-64}"
+WORKER_REPAIR_PENDING_CLOSES_CANCEL_TIMEOUT="${WORKER_REPAIR_PENDING_CLOSES_CANCEL_TIMEOUT:-5}"
+WORKER_REPAIR_PENDING_CLOSES_MIN_AGE="${WORKER_REPAIR_PENDING_CLOSES_MIN_AGE:-90}"
+WORKER_DOCKER_BUILD_DEDUP="${WORKER_DOCKER_BUILD_DEDUP:-1}"
+WORKER_DOCKER_BUILD_SKIP_EXISTING="${WORKER_DOCKER_BUILD_SKIP_EXISTING:-1}"
 
 log "=== pool_server_pu_v2 starting ==="
 log "  max_tasks=${WORKER_MAX_TASKS}  max_runs_per_task=${WORKER_MAX_RUNS_PER_TASK}"
@@ -91,6 +97,8 @@ log "  docker_data_root=${DOCKER_DATA_ROOT} disk_guard=${WORKER_DISK_GUARD_ENABL
 log "  pressure_guard=${WORKER_PRESSURE_GUARD_ENABLED} pids_pause=${WORKER_PIDS_PAUSE_ALLOCATE_PCT}% pids_reset=${WORKER_PIDS_REJECT_RESET_PCT}%"
 log "  pressure_guard shim_pause=${WORKER_SHIM_PAUSE_ALLOCATE} shim_reset=${WORKER_SHIM_REJECT_RESET} pending_pause=${WORKER_PENDING_CLOSES_PAUSE_ALLOCATE} pending_reset=${WORKER_PENDING_CLOSES_REJECT_RESET}"
 log "  force_cleanup=${TERMINAL_ENV_FORCE_DOCKER_CLEANUP} broad=${TERMINAL_ENV_FORCE_DOCKER_CLEANUP_BROAD} always=${TERMINAL_ENV_FORCE_DOCKER_CLEANUP_ALWAYS} timeout=${TERMINAL_ENV_FORCE_DOCKER_CLEANUP_TIMEOUT}s"
+log "  pending_close_repair=${WORKER_REPAIR_PENDING_CLOSES} max_active=${WORKER_REPAIR_PENDING_CLOSES_MAX_ACTIVE_RUNS} cancel_timeout=${WORKER_REPAIR_PENDING_CLOSES_CANCEL_TIMEOUT}s min_age=${WORKER_REPAIR_PENDING_CLOSES_MIN_AGE}s"
+log "  docker_build_dedup=${WORKER_DOCKER_BUILD_DEDUP} skip_existing=${WORKER_DOCKER_BUILD_SKIP_EXISTING}"
 
 if [[ "${SKIP_PROXY_ENV}" != "1" && -f "${PROXY_ENV_FILE}" ]]; then
     # shellcheck disable=SC1090
@@ -257,21 +265,25 @@ if [[ "${SKIP_PREFLIGHT_CLEANUP}" != "1" ]]; then
         log "  ✅ Pruned networks"
     fi
 
-    # Check for running task containers from previous pool.
-    # These are containers whose compose project died but containers are still up
+    # Check for running task containers from previous pool. Match both the
+    # slime-run compose project names and multi-service task images such as
+    # tb__890__staging-server.
     ORPHAN_PATTERN='^[0-9]+[-_].*(slime[-_]?run|client|helper).*$'
-    ORPHAN_NAMES=$(docker ps --format '{{.Names}}' 2>/dev/null \
-        | grep -E "${ORPHAN_PATTERN}" || true)
-    ORPHAN_RUNNING=$(printf '%s\n' "${ORPHAN_NAMES}" | sed '/^$/d' | wc -l || true)
+    ORPHAN_IMAGE_PATTERN='^tb__[0-9]+__.*(:|$)'
+    ORPHAN_LINES=$(docker ps --format '{{.ID}}\t{{.Names}}\t{{.Image}}' 2>/dev/null \
+        | awk -F '\t' -v name_re="${ORPHAN_PATTERN}" -v image_re="${ORPHAN_IMAGE_PATTERN}" \
+            '$2 ~ name_re || $3 ~ image_re {print $0}' || true)
+    ORPHAN_IDS=$(printf '%s\n' "${ORPHAN_LINES}" | awk -F '\t' 'NF >= 1 {print $1}' | sed '/^$/d' || true)
+    ORPHAN_RUNNING=$(printf '%s\n' "${ORPHAN_IDS}" | sed '/^$/d' | wc -l || true)
     if [[ "${ORPHAN_RUNNING}" -gt 0 ]]; then
         log "  ⚠️  ${ORPHAN_RUNNING} orphan task containers still running"
         if [[ "${PREFLIGHT_KILL_ORPHAN_RUNNING}" == "1" ]]; then
             log "  Removing orphan running task containers before starting pool_server..."
-            printf '%s\n' "${ORPHAN_NAMES}" | xargs -r docker rm -f >/dev/null 2>&1 || true
+            printf '%s\n' "${ORPHAN_IDS}" | xargs -r docker rm -f >/dev/null 2>&1 || true
             log "  ✅ Removed orphan running task containers"
         else
-            log "     Inspect: docker ps --format '{{.Names}}' | grep -E '${ORPHAN_PATTERN}'"
-            log "     Cleanup: docker ps --format '{{.Names}}' | grep -E '${ORPHAN_PATTERN}' | xargs -r docker rm -f"
+            log "     Inspect: docker ps --format '{{.ID}} {{.Names}} {{.Image}}' | grep -E '${ORPHAN_PATTERN}|${ORPHAN_IMAGE_PATTERN}'"
+            log "     Cleanup: docker ps --format '{{.ID}} {{.Names}} {{.Image}}' | awk '/${ORPHAN_PATTERN}|${ORPHAN_IMAGE_PATTERN}/ {print \$1}' | xargs -r docker rm -f"
             log "     Or set PREFLIGHT_KILL_ORPHAN_RUNNING=1 when no active training uses this worker."
         fi
     fi
@@ -368,6 +380,12 @@ export TERMINAL_ENV_FORCE_DOCKER_CLEANUP
 export TERMINAL_ENV_FORCE_DOCKER_CLEANUP_BROAD
 export TERMINAL_ENV_FORCE_DOCKER_CLEANUP_ALWAYS
 export TERMINAL_ENV_FORCE_DOCKER_CLEANUP_TIMEOUT
+export WORKER_REPAIR_PENDING_CLOSES
+export WORKER_REPAIR_PENDING_CLOSES_MAX_ACTIVE_RUNS
+export WORKER_REPAIR_PENDING_CLOSES_CANCEL_TIMEOUT
+export WORKER_REPAIR_PENDING_CLOSES_MIN_AGE
+export WORKER_DOCKER_BUILD_DEDUP
+export WORKER_DOCKER_BUILD_SKIP_EXISTING
 
 if [ -d "${REPO_ROOT}/.venv" ]; then
     source .venv/bin/activate
