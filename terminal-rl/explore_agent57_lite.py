@@ -13,6 +13,10 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable
 
+import numpy as np
+
+from agent57_episodic_memory import resolve_episodic_backend_name
+
 
 def _env_bool(name: str, default: bool = False) -> bool:
     raw = os.getenv(name)
@@ -29,6 +33,16 @@ def _env_int(name: str, default: int) -> int:
         return int(raw)
     except ValueError:
         return default
+
+
+def _env_optional_int(name: str) -> int | None:
+    raw = os.getenv(name)
+    if raw is None or raw.strip() == "":
+        return None
+    try:
+        return int(raw)
+    except ValueError:
+        return None
 
 
 def _env_float(name: str, default: float) -> float:
@@ -88,6 +102,7 @@ class Agent57LiteConfig:
     combine_mode: str
     ngu_mod_clip: float
     ngu_episodic_source: str
+    episodic_backend: str
     max_bonus: float
     controller: str
     ucb_c: float
@@ -96,6 +111,7 @@ class Agent57LiteConfig:
     ucb_min_per_arm: int
     ucb_value: str
     ucb_dataset_aware: bool
+    ucb_random_seed: int | None
     keep_baseline: bool
     lifelong_enabled: bool
     lifelong_coef: float
@@ -169,6 +185,11 @@ def config_from_env() -> Agent57LiteConfig:
         combine_mode=combine_mode,
         ngu_mod_clip=max(1.0, _env_float("EXPLORE_AGENT57_NGU_MOD_CLIP", 5.0)),
         ngu_episodic_source=ngu_episodic_source,
+        episodic_backend=resolve_episodic_backend_name(
+            os.getenv("EXPLORE_AGENT57_EPISODIC_BACKEND")
+            or os.getenv("EPISODIC_MEMORY_BACKEND")
+            or "legacy"
+        ),
         max_bonus=max(0.0, _env_float("EXPLORE_AGENT57_MAX_BONUS", 0.0)),
         controller=controller,
         ucb_c=max(0.0, _env_float("EXPLORE_AGENT57_UCB_C", 0.5)),
@@ -180,6 +201,11 @@ def config_from_env() -> Agent57LiteConfig:
         ucb_min_per_arm=max(0, _env_int("EXPLORE_AGENT57_UCB_MIN_PER_ARM", 0)),
         ucb_value=ucb_value,
         ucb_dataset_aware=_env_bool("EXPLORE_AGENT57_UCB_DATASET_AWARE", False),
+        ucb_random_seed=(
+            _env_optional_int("EXPLORE_AGENT57_UCB_RANDOM_SEED")
+            if os.getenv("EXPLORE_AGENT57_UCB_RANDOM_SEED") is not None
+            else _env_optional_int("EXPLORE_RANDOM_SEED")
+        ),
         keep_baseline=_env_bool("EXPLORE_AGENT57_KEEP_BASELINE", True),
         lifelong_enabled=lifelong_enabled,
         lifelong_coef=max(0.0, _env_float("EXPLORE_AGENT57_LIFELONG_COEF", 0.01)),
@@ -207,6 +233,9 @@ _LOCAL_TRAJ_SEEN = 0
 _LOCAL_ARM_EVENTS: list[dict[str, Any]] = []
 _SQLITE_SCHEMA_LOCK = threading.Lock()
 _SQLITE_SCHEMA_INITIALIZED: set[str] = set()
+_UCB_RNG_LOCK = threading.Lock()
+_UCB_RNG_SEED: int | None = None
+_UCB_RNG: np.random.Generator | None = None
 
 
 def _normalize_dataset(value: Any) -> str:
@@ -659,6 +688,7 @@ def compute_lifelong_bonus(
         "explore_agent57_beta": float(beta),
         "explore_agent57_combine_mode": config.combine_mode,
         "explore_agent57_max_bonus": float(config.max_bonus),
+        "explore_agent57_episodic_backend": config.episodic_backend,
         "explore_agent57_controller": config.controller,
         "explore_agent57_ucb_c": float(config.ucb_c),
         "explore_agent57_ucb_window": int(config.ucb_window),
@@ -666,6 +696,9 @@ def compute_lifelong_bonus(
         "explore_agent57_ucb_min_per_arm": int(config.ucb_min_per_arm),
         "explore_agent57_ucb_value": config.ucb_value,
         "explore_agent57_ucb_dataset_aware": bool(config.ucb_dataset_aware),
+        "explore_agent57_ucb_random_seed": (
+            -1 if config.ucb_random_seed is None else int(config.ucb_random_seed)
+        ),
         "explore_agent57_lifelong_enabled": bool(config.lifelong_enabled),
         "explore_agent57_lifelong_backend": config.lifelong_backend,
         "explore_agent57_lifelong_state_path": config.state_path,
@@ -864,6 +897,65 @@ def _aggregate_arm_stats(
     return stats
 
 
+def _reset_ucb_rng_for_tests() -> None:
+    global _UCB_RNG, _UCB_RNG_SEED
+    with _UCB_RNG_LOCK:
+        _UCB_RNG = None
+        _UCB_RNG_SEED = None
+
+
+def _ucb_seeded(config: Agent57LiteConfig) -> bool:
+    return config.ucb_random_seed is not None
+
+
+def _ucb_rng(config: Agent57LiteConfig) -> np.random.Generator:
+    global _UCB_RNG, _UCB_RNG_SEED
+    seed = int(config.ucb_random_seed or 0)
+    if _UCB_RNG is None or _UCB_RNG_SEED != seed:
+        _UCB_RNG = np.random.default_rng(seed)
+        _UCB_RNG_SEED = seed
+    return _UCB_RNG
+
+
+def _ucb_random(config: Agent57LiteConfig) -> float:
+    if not _ucb_seeded(config):
+        return random.random()
+    with _UCB_RNG_LOCK:
+        return float(_ucb_rng(config).random())
+
+
+def _ucb_randrange(config: Agent57LiteConfig, start: int, stop: int) -> int:
+    if stop <= start:
+        return start
+    if not _ucb_seeded(config):
+        return random.randrange(start, stop)
+    with _UCB_RNG_LOCK:
+        return int(_ucb_rng(config).integers(start, stop))
+
+
+def _rank_ucb_scores(
+    config: Agent57LiteConfig,
+    scored: list[tuple[float, int]],
+) -> list[tuple[float, int]]:
+    if not _ucb_seeded(config):
+        return sorted(scored, key=lambda item: (-item[0], item[1]))
+
+    groups: dict[float, list[int]] = {}
+    for score, arm_id in scored:
+        groups.setdefault(score, []).append(arm_id)
+
+    ranked: list[tuple[float, int]] = []
+    for score in sorted(groups.keys(), reverse=True):
+        arms = list(groups[score])
+        if len(arms) > 1:
+            with _UCB_RNG_LOCK:
+                arms = [int(arm) for arm in _ucb_rng(config).permutation(arms).tolist()]
+        else:
+            arms.sort()
+        ranked.extend((score, arm_id) for arm_id in arms)
+    return ranked
+
+
 def _ucb_scores(
     config: Agent57LiteConfig,
     *,
@@ -900,8 +992,7 @@ def _ucb_scores(
                 value = mean_success + 0.25 * mean_base - 0.5 * parse_rate - 0.5 * trunc_rate
             score = value + config.ucb_c * math.sqrt(math.log(total + 1.0) / n)
         scored.append((score, arm_id))
-    scored.sort(key=lambda item: (-item[0], item[1]))
-    return scored
+    return _rank_ucb_scores(config, scored)
 
 
 def assign_group_arms(
@@ -927,11 +1018,11 @@ def assign_group_arms(
                 ranked = [arm for arm in range(config.k) if arm != 0] or [0]
         cursor = 0
         while len(arms) < group_size:
-            if config.ucb_epsilon > 0.0 and random.random() < config.ucb_epsilon:
+            if config.ucb_epsilon > 0.0 and _ucb_random(config) < config.ucb_epsilon:
                 if config.keep_baseline and group_size > 1 and config.k > 1:
-                    arms.append(random.randrange(1, config.k))
+                    arms.append(_ucb_randrange(config, 1, config.k))
                 else:
-                    arms.append(random.randrange(0, config.k))
+                    arms.append(_ucb_randrange(config, 0, config.k))
             else:
                 arms.append(ranked[cursor % len(ranked)] if ranked else len(arms) % config.k)
             cursor += 1

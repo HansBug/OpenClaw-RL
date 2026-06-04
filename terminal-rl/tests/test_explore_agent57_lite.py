@@ -18,6 +18,7 @@ def _reset_local_agent57_state():
     a57._LOCAL_COUNTS.clear()
     a57._LOCAL_ARM_EVENTS.clear()
     a57._LOCAL_TRAJ_SEEN = 0
+    a57._reset_ucb_rng_for_tests()
 
 
 def test_agent57_config_defaults_preserve_additive_mode(monkeypatch):
@@ -139,6 +140,30 @@ def test_ucb_dataset_aware_uses_normalized_base_reward(monkeypatch):
 
     assert a57.assign_group_arms(1, dataset="seta") == [1]
     assert a57.assign_group_arms(1, dataset="agentharm") == [2]
+
+
+def test_ucb_random_seed_reproduces_tie_break_and_epsilon(monkeypatch):
+    _reset_local_agent57_state()
+    monkeypatch.setenv("EXPLORE_AGENT57_LITE", "1")
+    monkeypatch.setenv("EXPLORE_AGENT57_CONTROLLER", "ucb")
+    monkeypatch.setenv("EXPLORE_AGENT57_K", "6")
+    monkeypatch.setenv("EXPLORE_AGENT57_LIFELONG_BACKEND", "local")
+    monkeypatch.setenv("EXPLORE_AGENT57_KEEP_BASELINE", "0")
+    monkeypatch.setenv("EXPLORE_AGENT57_UCB_EPSILON", "0.5")
+    monkeypatch.setenv("EXPLORE_AGENT57_UCB_RANDOM_SEED", "123")
+
+    first = [a57.assign_group_arms(6, dataset="seta") for _ in range(4)]
+
+    a57._reset_ucb_rng_for_tests()
+    second = [a57.assign_group_arms(6, dataset="seta") for _ in range(4)]
+
+    assert first == second
+
+    monkeypatch.setenv("EXPLORE_AGENT57_UCB_RANDOM_SEED", "456")
+    a57._reset_ucb_rng_for_tests()
+    third = [a57.assign_group_arms(6, dataset="seta") for _ in range(4)]
+
+    assert third != first
 
 
 def test_lifelong_key_v1_ignores_context_metadata(monkeypatch):
