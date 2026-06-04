@@ -277,13 +277,42 @@ def _apply_agent57_sampling_params(sample: Sample, sampling_params: dict[str, An
         sampling_params["top_k"] = int(top_k)
 
 
-def _assign_agent57_arms(group_size: int, *, evaluation: bool) -> list[int]:
+def _agent57_dataset_context(group: list[Sample]) -> str | None:
+    if not group:
+        return None
+    sample = group[0]
+    metadata = sample.metadata if isinstance(sample.metadata, dict) else {}
+    prompt = sample.prompt if isinstance(sample.prompt, dict) else {}
+    task_meta = metadata.get("task_meta") if isinstance(metadata.get("task_meta"), dict) else {}
+    raw = (
+        metadata.get("data_source")
+        or task_meta.get("data_source")
+        or prompt.get("data_source")
+    )
+    if raw:
+        return str(raw)
+    task_path = str(metadata.get("task_path") or task_meta.get("task_path") or "")
+    if task_path.startswith("agent_safetybench/"):
+        return "agent_safetybench"
+    if task_path.startswith("seta_env/") or "seta" in task_path:
+        return "seta"
+    if task_path.startswith("agentharm/") or "agentharm" in task_path:
+        return "agentharm"
+    return None
+
+
+def _assign_agent57_arms(
+    group_size: int,
+    *,
+    evaluation: bool,
+    dataset: str | None = None,
+) -> list[int]:
     if evaluation or not _agent57_lite_enabled():
         return []
     try:
         from explore_agent57_lite import assign_group_arms
 
-        return assign_group_arms(group_size, evaluation=evaluation)
+        return assign_group_arms(group_size, evaluation=evaluation, dataset=dataset)
     except Exception as exc:
         logger.warning("Agent57-lite arm assignment fallback: %s", exc)
         return _fallback_agent57_arms(group_size)
@@ -302,13 +331,20 @@ def _annotate_rollout_groups(
     args: Namespace, samples: list[list[Sample]], rollout_id: int, *, evaluation: bool
 ) -> None:
     for group in samples:
-        agent57_arms = _assign_agent57_arms(len(group), evaluation=evaluation)
+        agent57_dataset = _agent57_dataset_context(group)
+        agent57_arms = _assign_agent57_arms(
+            len(group),
+            evaluation=evaluation,
+            dataset=agent57_dataset,
+        )
         for idx, sample in enumerate(group):
             _annotate_rollout_sample(args, sample, rollout_id, evaluation=evaluation)
             if agent57_arms:
                 sample.metadata["agent57_lite_enabled"] = True
                 sample.metadata["agent57_arm_id"] = int(agent57_arms[idx])
                 sample.metadata["agent57_group_position"] = int(idx)
+                if agent57_dataset:
+                    sample.metadata["agent57_dataset"] = agent57_dataset
 
 
 class GenerateState(metaclass=SingletonMeta):

@@ -951,6 +951,10 @@ def _exploration_audit_from_reward(reward: Dict[str, Any]) -> Dict[str, Any]:
         "explore_agent57_beta",
         "explore_agent57_combine_mode",
         "explore_agent57_controller",
+        "explore_agent57_ucb_epsilon",
+        "explore_agent57_ucb_min_per_arm",
+        "explore_agent57_ucb_value",
+        "explore_agent57_ucb_dataset_aware",
         "explore_agent57_lifelong_enabled",
         "explore_agent57_lifelong_raw",
         "explore_agent57_lifelong_bonus",
@@ -1052,6 +1056,11 @@ def _save_rollout_artifacts(
                 "explore_agent57_arm_id", "explore_agent57_k",
                 "explore_agent57_beta", "explore_agent57_controller",
                 "explore_agent57_combine_mode", "explore_agent57_max_bonus",
+                "explore_agent57_ucb_c", "explore_agent57_ucb_window",
+                "explore_agent57_ucb_epsilon",
+                "explore_agent57_ucb_min_per_arm",
+                "explore_agent57_ucb_value",
+                "explore_agent57_ucb_dataset_aware",
                 "explore_agent57_lifelong_enabled",
                 "explore_agent57_lifelong_backend",
                 "explore_agent57_lifelong_state_path",
@@ -2542,6 +2551,7 @@ async def generate(
                 status=status,
                 parse_error_count=agent_runner.parse_error_count,
                 bonus=_agent57_bonus,
+                dataset=data_source,
             )
             for s in samples:
                 if isinstance(s.reward, dict) and "score" in s.reward:

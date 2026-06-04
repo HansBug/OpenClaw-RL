@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import math
 import os
+import random
 import re
 import sqlite3
 import threading
@@ -90,6 +91,10 @@ class Agent57LiteConfig:
     controller: str
     ucb_c: float
     ucb_window: int
+    ucb_epsilon: float
+    ucb_min_per_arm: int
+    ucb_value: str
+    ucb_dataset_aware: bool
     keep_baseline: bool
     lifelong_enabled: bool
     lifelong_coef: float
@@ -144,6 +149,9 @@ def config_from_env() -> Agent57LiteConfig:
     )
     if ngu_episodic_source not in {"signature_intrinsic", "intrinsic"}:
         ngu_episodic_source = "signature_intrinsic"
+    ucb_value = os.getenv("EXPLORE_AGENT57_UCB_VALUE", "legacy").strip().lower()
+    if ucb_value not in {"legacy", "success", "base", "normalized_base"}:
+        ucb_value = "legacy"
     return Agent57LiteConfig(
         enabled=enabled,
         k=k,
@@ -155,6 +163,13 @@ def config_from_env() -> Agent57LiteConfig:
         controller=controller,
         ucb_c=max(0.0, _env_float("EXPLORE_AGENT57_UCB_C", 0.5)),
         ucb_window=max(1, _env_int("EXPLORE_AGENT57_UCB_WINDOW", 256)),
+        ucb_epsilon=min(
+            1.0,
+            max(0.0, _env_float("EXPLORE_AGENT57_UCB_EPSILON", 0.0)),
+        ),
+        ucb_min_per_arm=max(0, _env_int("EXPLORE_AGENT57_UCB_MIN_PER_ARM", 0)),
+        ucb_value=ucb_value,
+        ucb_dataset_aware=_env_bool("EXPLORE_AGENT57_UCB_DATASET_AWARE", False),
         keep_baseline=_env_bool("EXPLORE_AGENT57_KEEP_BASELINE", True),
         lifelong_enabled=lifelong_enabled,
         lifelong_coef=max(0.0, _env_float("EXPLORE_AGENT57_LIFELONG_COEF", 0.01)),
@@ -172,6 +187,18 @@ _LOCAL_TRAJ_SEEN = 0
 _LOCAL_ARM_EVENTS: list[dict[str, float]] = []
 _SQLITE_SCHEMA_LOCK = threading.Lock()
 _SQLITE_SCHEMA_INITIALIZED: set[str] = set()
+
+
+def _normalize_dataset(value: Any) -> str:
+    text = str(value or "").strip().lower()
+    text = re.sub(r"[^a-z0-9_.-]+", "_", text).strip("._-")
+    if text in {"", "terminal_bench", "seta_env"}:
+        return "seta"
+    if text in {"agent-safety-bench", "agent_safety_bench", "asb", "safety"}:
+        return "agent_safetybench"
+    if text in {"agent_harm", "ah"}:
+        return "agentharm"
+    return text or "unknown"
 
 
 def _connect(path: str) -> sqlite3.Connection:
@@ -199,6 +226,20 @@ def _connect(path: str) -> sqlite3.Connection:
                     "parse_error INTEGER NOT NULL, truncated INTEGER NOT NULL, "
                     "bonus REAL NOT NULL)"
                 )
+                columns = {
+                    str(row[1])
+                    for row in conn.execute("PRAGMA table_info(arm_events)").fetchall()
+                }
+                if "dataset" not in columns:
+                    conn.execute(
+                        "ALTER TABLE arm_events "
+                        "ADD COLUMN dataset TEXT NOT NULL DEFAULT ''"
+                    )
+                if "normalized_base_score" not in columns:
+                    conn.execute(
+                        "ALTER TABLE arm_events "
+                        "ADD COLUMN normalized_base_score REAL NOT NULL DEFAULT 0.0"
+                    )
                 _SQLITE_SCHEMA_INITIALIZED.add(path_key)
     return conn
 
@@ -269,6 +310,16 @@ def _finite_float(value: Any, default: float = 0.0) -> float:
     except (TypeError, ValueError):
         return default
     return num if math.isfinite(num) else default
+
+
+def _normalized_base_score(base_score: float, dataset: str) -> float:
+    dataset_name = _normalize_dataset(dataset)
+    base = _finite_float(base_score)
+    if dataset_name == "seta":
+        return min(1.0, max(0.0, base))
+    if dataset_name in {"agent_safetybench", "agentharm"}:
+        return (min(1.0, max(-1.0, base)) + 1.0) / 2.0
+    return min(1.0, max(0.0, base))
 
 
 def _clamp_bonus(value: float, max_abs: float) -> tuple[float, bool]:
@@ -404,6 +455,12 @@ def compute_lifelong_bonus(
         "explore_agent57_combine_mode": config.combine_mode,
         "explore_agent57_max_bonus": float(config.max_bonus),
         "explore_agent57_controller": config.controller,
+        "explore_agent57_ucb_c": float(config.ucb_c),
+        "explore_agent57_ucb_window": int(config.ucb_window),
+        "explore_agent57_ucb_epsilon": float(config.ucb_epsilon),
+        "explore_agent57_ucb_min_per_arm": int(config.ucb_min_per_arm),
+        "explore_agent57_ucb_value": config.ucb_value,
+        "explore_agent57_ucb_dataset_aware": bool(config.ucb_dataset_aware),
         "explore_agent57_lifelong_enabled": bool(config.lifelong_enabled),
         "explore_agent57_lifelong_backend": config.lifelong_backend,
         "explore_agent57_lifelong_state_path": config.state_path,
@@ -515,79 +572,135 @@ def compute_ngu_lite_bonus(
     return metrics
 
 
-def _local_arm_stats(k: int, window: int) -> list[dict[str, float]]:
+def _local_arm_stats(
+    k: int,
+    window: int,
+    *,
+    dataset: str | None = None,
+) -> list[dict[str, float]]:
     with _LOCAL_LOCK:
         events = list(_LOCAL_ARM_EVENTS[-window:])
-    return _aggregate_arm_stats(k, events)
+    return _aggregate_arm_stats(k, events, dataset=dataset)
 
 
-def _sqlite_arm_stats(config: Agent57LiteConfig) -> list[dict[str, float]]:
+def _sqlite_arm_stats(
+    config: Agent57LiteConfig,
+    *,
+    dataset: str | None = None,
+) -> list[dict[str, float]]:
     conn = _connect(config.state_path)
     try:
-        rows = conn.execute(
-            "SELECT arm_id, base_score, success, parse_error, truncated "
-            "FROM arm_events ORDER BY id DESC LIMIT ?",
-            (config.ucb_window,),
-        ).fetchall()
+        if dataset:
+            rows = conn.execute(
+                "SELECT arm_id, base_score, normalized_base_score, success, "
+                "parse_error, truncated, dataset FROM arm_events "
+                "WHERE dataset=? ORDER BY id DESC LIMIT ?",
+                (_normalize_dataset(dataset), config.ucb_window),
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                "SELECT arm_id, base_score, normalized_base_score, success, "
+                "parse_error, truncated, dataset FROM arm_events "
+                "ORDER BY id DESC LIMIT ?",
+                (config.ucb_window,),
+            ).fetchall()
     finally:
         conn.close()
     events = [
         {
             "arm_id": int(row[0]),
             "base_score": float(row[1]),
-            "success": float(row[2]),
-            "parse_error": float(row[3]),
-            "truncated": float(row[4]),
+            "normalized_base_score": float(row[2]),
+            "success": float(row[3]),
+            "parse_error": float(row[4]),
+            "truncated": float(row[5]),
+            "dataset": str(row[6] or ""),
         }
         for row in rows
     ]
-    return _aggregate_arm_stats(config.k, events)
+    return _aggregate_arm_stats(config.k, events, dataset=dataset)
 
 
-def _aggregate_arm_stats(k: int, events: list[dict[str, float]]) -> list[dict[str, float]]:
+def _aggregate_arm_stats(
+    k: int,
+    events: list[dict[str, float]],
+    *,
+    dataset: str | None = None,
+) -> list[dict[str, float]]:
+    target_dataset = _normalize_dataset(dataset) if dataset else ""
     stats = [
-        {"n": 0.0, "base_sum": 0.0, "success_sum": 0.0, "parse_sum": 0.0, "trunc_sum": 0.0}
+        {
+            "n": 0.0,
+            "base_sum": 0.0,
+            "normalized_base_sum": 0.0,
+            "success_sum": 0.0,
+            "parse_sum": 0.0,
+            "trunc_sum": 0.0,
+        }
         for _ in range(k)
     ]
     for event in events:
+        if target_dataset and _normalize_dataset(event.get("dataset")) != target_dataset:
+            continue
         arm_id = int(event.get("arm_id", 0)) % k
         row = stats[arm_id]
         row["n"] += 1.0
         row["base_sum"] += _finite_float(event.get("base_score", 0.0))
+        row["normalized_base_sum"] += _finite_float(
+            event.get("normalized_base_score", 0.0)
+        )
         row["success_sum"] += _finite_float(event.get("success", 0.0))
         row["parse_sum"] += _finite_float(event.get("parse_error", 0.0))
         row["trunc_sum"] += _finite_float(event.get("truncated", 0.0))
     return stats
 
 
-def _ucb_scores(config: Agent57LiteConfig) -> list[tuple[float, int]]:
+def _ucb_scores(
+    config: Agent57LiteConfig,
+    *,
+    dataset: str | None = None,
+) -> list[tuple[float, int]]:
+    target_dataset = _normalize_dataset(dataset) if config.ucb_dataset_aware and dataset else None
     try:
         stats = (
-            _sqlite_arm_stats(config)
+            _sqlite_arm_stats(config, dataset=target_dataset)
             if config.lifelong_backend == "sqlite"
-            else _local_arm_stats(config.k, config.ucb_window)
+            else _local_arm_stats(config.k, config.ucb_window, dataset=target_dataset)
         )
     except Exception:
-        stats = _aggregate_arm_stats(config.k, [])
+        stats = _aggregate_arm_stats(config.k, [], dataset=target_dataset)
     total = max(1.0, sum(row["n"] for row in stats))
     scored: list[tuple[float, int]] = []
     for arm_id, row in enumerate(stats):
         n = row["n"]
-        if n <= 0:
+        if n <= 0 or n < config.ucb_min_per_arm:
             score = float("inf")
         else:
             mean_success = row["success_sum"] / n
             mean_base = row["base_sum"] / n
+            mean_normalized_base = row["normalized_base_sum"] / n
             parse_rate = row["parse_sum"] / n
             trunc_rate = row["trunc_sum"] / n
-            value = mean_success + 0.25 * mean_base - 0.5 * parse_rate - 0.5 * trunc_rate
+            if config.ucb_value == "success":
+                value = mean_success - 0.5 * parse_rate - 0.5 * trunc_rate
+            elif config.ucb_value == "base":
+                value = mean_base - 0.5 * parse_rate - 0.5 * trunc_rate
+            elif config.ucb_value == "normalized_base":
+                value = mean_normalized_base - 0.5 * parse_rate - 0.5 * trunc_rate
+            else:
+                value = mean_success + 0.25 * mean_base - 0.5 * parse_rate - 0.5 * trunc_rate
             score = value + config.ucb_c * math.sqrt(math.log(total + 1.0) / n)
         scored.append((score, arm_id))
     scored.sort(key=lambda item: (-item[0], item[1]))
     return scored
 
 
-def assign_group_arms(group_size: int, *, evaluation: bool = False) -> list[int]:
+def assign_group_arms(
+    group_size: int,
+    *,
+    evaluation: bool = False,
+    dataset: str | None = None,
+) -> list[int]:
     config = config_from_env()
     if evaluation or not config.active:
         return [0 for _ in range(max(0, group_size))]
@@ -598,14 +711,20 @@ def assign_group_arms(group_size: int, *, evaluation: bool = False) -> list[int]
         arms: list[int] = []
         if config.keep_baseline:
             arms.append(0)
-        ranked = [arm for _, arm in _ucb_scores(config)]
+        ranked = [arm for _, arm in _ucb_scores(config, dataset=dataset)]
         if config.keep_baseline and group_size > 1:
             ranked = [arm for arm in ranked if arm != 0]
             if not ranked:
                 ranked = [arm for arm in range(config.k) if arm != 0] or [0]
         cursor = 0
         while len(arms) < group_size:
-            arms.append(ranked[cursor % len(ranked)] if ranked else len(arms) % config.k)
+            if config.ucb_epsilon > 0.0 and random.random() < config.ucb_epsilon:
+                if config.keep_baseline and group_size > 1 and config.k > 1:
+                    arms.append(random.randrange(1, config.k))
+                else:
+                    arms.append(random.randrange(0, config.k))
+            else:
+                arms.append(ranked[cursor % len(ranked)] if ranked else len(arms) % config.k)
             cursor += 1
         return arms[:group_size]
     return [idx % config.k for idx in range(group_size)]
@@ -620,6 +739,7 @@ def record_arm_event(
     status: Any,
     parse_error_count: int,
     bonus: float,
+    dataset: str | None = None,
 ) -> None:
     if not config.active:
         return
@@ -628,15 +748,19 @@ def record_arm_event(
     base = _finite_float(base_score)
     final = _finite_float(final_score, base)
     shaped_bonus = _finite_float(bonus)
+    dataset_name = _normalize_dataset(dataset)
+    normalized_base = _normalized_base_score(base, dataset_name)
     success = 1 if base > config.success_threshold else 0
     event = {
         "arm_id": float(int(arm_id) % max(1, config.k)),
         "base_score": base,
+        "normalized_base_score": normalized_base,
         "final_score": final,
         "success": float(success),
         "parse_error": float(1 if parse_error_count > 0 else 0),
         "truncated": float(truncated),
         "bonus": shaped_bonus,
+        "dataset": dataset_name,
     }
     if config.lifelong_backend == "sqlite":
         try:
@@ -644,17 +768,20 @@ def record_arm_event(
             try:
                 conn.execute(
                     "INSERT INTO arm_events"
-                    "(ts, arm_id, base_score, final_score, success, parse_error, truncated, bonus) "
-                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                    "(ts, arm_id, base_score, normalized_base_score, final_score, "
+                    "success, parse_error, truncated, bonus, dataset) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                     (
                         time.time(),
                         int(event["arm_id"]),
                         event["base_score"],
+                        event["normalized_base_score"],
                         event["final_score"],
                         int(event["success"]),
                         int(event["parse_error"]),
                         int(event["truncated"]),
                         event["bonus"],
+                        event["dataset"],
                     ),
                 )
             finally:
