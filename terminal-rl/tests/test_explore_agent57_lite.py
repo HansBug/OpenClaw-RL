@@ -138,3 +138,87 @@ def test_ucb_dataset_aware_uses_normalized_base_reward(monkeypatch):
 
     assert a57.assign_group_arms(1, dataset="seta") == [1]
     assert a57.assign_group_arms(1, dataset="agentharm") == [2]
+
+
+def test_lifelong_key_v1_ignores_context_metadata(monkeypatch):
+    monkeypatch.setenv("EXPLORE_AGENT57_LIFELONG_KEY_VERSION", "v1")
+    config = a57.config_from_env()
+    actions = [{"tool_name": "shell", "signature": "shell|pytest", "raw": "pytest"}]
+    turns = [{"turn_idx": 0, "command": "pytest", "result": {"exit_code": 0}}]
+
+    seta_key = a57.lifelong_keys(
+        actions,
+        turns,
+        config=config,
+        metadata={"data_source": "seta", "task_path": "seta_env/1"},
+    )
+    safety_key = a57.lifelong_keys(
+        actions,
+        turns,
+        config=config,
+        metadata={"data_source": "agent_safetybench", "task_path": "asb/9"},
+    )
+
+    assert seta_key == safety_key
+
+
+def test_lifelong_key_v2_includes_dataset_by_default(monkeypatch):
+    monkeypatch.setenv("EXPLORE_AGENT57_LIFELONG_KEY_VERSION", "v2")
+    monkeypatch.setenv("EXPLORE_AGENT57_LIFELONG_INCLUDE_DATASET", "1")
+    config = a57.config_from_env()
+    actions = [{"tool_name": "shell", "signature": "shell|pytest", "raw": "pytest"}]
+    turns = [{"turn_idx": 0, "command": "pytest", "result": {"exit_code": 0}}]
+
+    seta_key = a57.lifelong_keys(
+        actions,
+        turns,
+        config=config,
+        metadata={"data_source": "seta", "task_path": "seta_env/1"},
+    )
+    safety_key = a57.lifelong_keys(
+        actions,
+        turns,
+        config=config,
+        metadata={"data_source": "agent_safetybench", "task_path": "asb/9"},
+    )
+
+    assert seta_key != safety_key
+
+
+def test_lifelong_key_v2_task_bucket_is_opt_in(monkeypatch):
+    actions = [{"tool_name": "shell", "signature": "shell|pytest", "raw": "pytest"}]
+    turns = [{"turn_idx": 0, "command": "pytest", "result": {"exit_code": 0}}]
+    monkeypatch.setenv("EXPLORE_AGENT57_LIFELONG_KEY_VERSION", "v2")
+    monkeypatch.setenv("EXPLORE_AGENT57_LIFELONG_INCLUDE_DATASET", "1")
+    monkeypatch.setenv("EXPLORE_AGENT57_LIFELONG_INCLUDE_TASK", "0")
+    config = a57.config_from_env()
+
+    task_a_key = a57.lifelong_keys(
+        actions,
+        turns,
+        config=config,
+        metadata={"data_source": "seta", "task_path": "seta_env/1"},
+    )
+    task_b_key = a57.lifelong_keys(
+        actions,
+        turns,
+        config=config,
+        metadata={"data_source": "seta", "task_path": "seta_env/2"},
+    )
+    assert task_a_key == task_b_key
+
+    monkeypatch.setenv("EXPLORE_AGENT57_LIFELONG_INCLUDE_TASK", "1")
+    config = a57.config_from_env()
+    task_a_key = a57.lifelong_keys(
+        actions,
+        turns,
+        config=config,
+        metadata={"data_source": "seta", "task_path": "seta_env/1"},
+    )
+    task_b_key = a57.lifelong_keys(
+        actions,
+        turns,
+        config=config,
+        metadata={"data_source": "seta", "task_path": "seta_env/2"},
+    )
+    assert task_a_key != task_b_key

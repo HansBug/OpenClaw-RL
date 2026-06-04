@@ -220,6 +220,7 @@ def _iter_explore_actions(turn_records: List[Dict[str, Any]]) -> List[Dict[str, 
     """
     actions: List[Dict[str, str]] = []
     for tr in turn_records or []:
+        turn_idx = tr.get("turn_idx")
         legacy_cmd = str(tr.get("command", "") or "").strip()
         if legacy_cmd:
             actions.append(
@@ -228,6 +229,7 @@ def _iter_explore_actions(turn_records: List[Dict[str, Any]]) -> List[Dict[str, 
                     "raw": legacy_cmd,
                     "signature": f"shell|{_cmd_signature(legacy_cmd)}",
                     "danger_text": legacy_cmd,
+                    "turn_idx": str(turn_idx) if turn_idx is not None else "",
                 }
             )
 
@@ -261,6 +263,7 @@ def _iter_explore_actions(turn_records: List[Dict[str, Any]]) -> List[Dict[str, 
                     "raw": raw,
                     "signature": signature,
                     "danger_text": command_text or args_text,
+                    "turn_idx": str(turn_idx) if turn_idx is not None else "",
                 }
             )
     return actions
@@ -956,6 +959,10 @@ def _exploration_audit_from_reward(reward: Dict[str, Any]) -> Dict[str, Any]:
         "explore_agent57_ucb_value",
         "explore_agent57_ucb_dataset_aware",
         "explore_agent57_lifelong_enabled",
+        "explore_agent57_lifelong_key_version",
+        "explore_agent57_lifelong_include_dataset",
+        "explore_agent57_lifelong_include_task",
+        "explore_agent57_lifelong_include_turn",
         "explore_agent57_lifelong_raw",
         "explore_agent57_lifelong_bonus",
         "explore_agent57_lifelong_bonus_unclipped",
@@ -1067,6 +1074,10 @@ def _save_rollout_artifacts(
                 "explore_agent57_lifelong_coef",
                 "explore_agent57_lifelong_clip",
                 "explore_agent57_lifelong_warmup",
+                "explore_agent57_lifelong_key_version",
+                "explore_agent57_lifelong_include_dataset",
+                "explore_agent57_lifelong_include_task",
+                "explore_agent57_lifelong_include_turn",
                 "explore_agent57_lifelong_raw",
                 "explore_agent57_lifelong_bonus",
                 "explore_agent57_lifelong_bonus_unclipped",
@@ -2457,6 +2468,8 @@ async def generate(
                 )
             except (TypeError, ValueError):
                 _agent57_arm_id = 0
+            _agent57_lifelong_metadata = dict(sample.metadata or {})
+            _agent57_lifelong_metadata.setdefault("data_source", data_source)
             _agent57_metrics = _agent57_compute_lifelong_bonus(
                 config=_AGENT57_CONFIG,
                 arm_id=_agent57_arm_id,
@@ -2464,6 +2477,7 @@ async def generate(
                 turn_records=turn_records,
                 status=status,
                 parse_error_count=agent_runner.parse_error_count,
+                metadata=_agent57_lifelong_metadata,
             )
             _agent57_bonus = float(
                 _agent57_metrics.get("explore_agent57_lifelong_bonus", 0.0) or 0.0
@@ -2587,6 +2601,7 @@ async def generate(
                             "combine_mode": _AGENT57_CONFIG.combine_mode,
                             "lifelong_enabled": bool(_AGENT57_CONFIG.lifelong_enabled),
                             "lifelong_backend": _AGENT57_CONFIG.lifelong_backend,
+                            "lifelong_key_version": _AGENT57_CONFIG.lifelong_key_version,
                             "bonus": _agent57_bonus,
                             "lifelong_bonus": _agent57_metrics.get(
                                 "explore_agent57_lifelong_bonus", 0.0

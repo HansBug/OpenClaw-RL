@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from abc import ABC, abstractmethod
 import hashlib
 import math
 import os
@@ -101,6 +102,10 @@ class Agent57LiteConfig:
     lifelong_clip: float
     lifelong_warmup: int
     lifelong_backend: str
+    lifelong_key_version: str
+    lifelong_include_dataset: bool
+    lifelong_include_task: bool
+    lifelong_include_turn: bool
     state_path: str
     success_threshold: float
 
@@ -152,6 +157,11 @@ def config_from_env() -> Agent57LiteConfig:
     ucb_value = os.getenv("EXPLORE_AGENT57_UCB_VALUE", "legacy").strip().lower()
     if ucb_value not in {"legacy", "success", "base", "normalized_base"}:
         ucb_value = "legacy"
+    key_version = (
+        os.getenv("EXPLORE_AGENT57_LIFELONG_KEY_VERSION", "v1").strip().lower()
+    )
+    if key_version not in {"v1", "v2"}:
+        key_version = "v1"
     return Agent57LiteConfig(
         enabled=enabled,
         k=k,
@@ -176,6 +186,16 @@ def config_from_env() -> Agent57LiteConfig:
         lifelong_clip=max(0.0, _env_float("EXPLORE_AGENT57_LIFELONG_CLIP", 2.0)),
         lifelong_warmup=max(0, _env_int("EXPLORE_AGENT57_LIFELONG_WARMUP", 64)),
         lifelong_backend=backend,
+        lifelong_key_version=key_version,
+        lifelong_include_dataset=_env_bool(
+            "EXPLORE_AGENT57_LIFELONG_INCLUDE_DATASET", True
+        ),
+        lifelong_include_task=_env_bool(
+            "EXPLORE_AGENT57_LIFELONG_INCLUDE_TASK", False
+        ),
+        lifelong_include_turn=_env_bool(
+            "EXPLORE_AGENT57_LIFELONG_INCLUDE_TURN", False
+        ),
         state_path=_default_state_path(),
         success_threshold=_env_float("EXPLORE_AGENT57_SUCCESS_THRESHOLD", 0.0),
     )
@@ -304,6 +324,15 @@ def _stable_hash(text: str, n: int = 12) -> str:
     return hashlib.md5(text.encode("utf-8", errors="ignore")).hexdigest()[:n]
 
 
+def _metadata_value(metadata: dict[str, Any] | None, *keys: str) -> Any:
+    current: Any = metadata if isinstance(metadata, dict) else {}
+    for key in keys:
+        if not isinstance(current, dict):
+            return None
+        current = current.get(key)
+    return current
+
+
 def _finite_float(value: Any, default: float = 0.0) -> float:
     try:
         num = float(value)
@@ -416,20 +445,186 @@ def _turn_result_fingerprints(turn_records: list[dict[str, Any]]) -> list[tuple[
     return results
 
 
+class LifelongKeyBuilder(ABC):
+    """Build stable count keys for Agent57-lite lifelong novelty."""
+
+    @abstractmethod
+    def keys(
+        self,
+        actions: list[dict[str, Any]],
+        turn_records: list[dict[str, Any]],
+        metadata: dict[str, Any] | None,
+    ) -> list[str]:
+        raise NotImplementedError
+
+
+class V1LifelongKeyBuilder(LifelongKeyBuilder):
+    """Original key: action signature + coarse observation + exit-code bucket."""
+
+    def keys(
+        self,
+        actions: list[dict[str, Any]],
+        turn_records: list[dict[str, Any]],
+        metadata: dict[str, Any] | None = None,
+    ) -> list[str]:
+        del metadata
+        result_fps = _turn_result_fingerprints(turn_records)
+        keys: list[str] = []
+        for idx, action in enumerate(actions or []):
+            signature = str(action.get("signature") or action.get("raw") or "unknown")
+            if idx < len(result_fps):
+                obs_fp, exit_fp = result_fps[idx]
+            else:
+                obs_fp, exit_fp = "no_result", "exit_unknown"
+            keys.append(_stable_hash(f"{signature}\n{obs_fp}\n{exit_fp}", 16))
+        return keys
+
+
+def _command_family(action: dict[str, Any]) -> str:
+    tool = str(action.get("tool_name") or "tool").strip().lower() or "tool"
+    signature = str(action.get("signature") or action.get("raw") or "")
+    parts = [part for part in signature.split("|") if part]
+    if len(parts) >= 2:
+        return re.sub(r"[^a-z0-9_.-]+", "_", f"{tool}:{parts[1].lower()}")[:80]
+    raw = str(action.get("raw") or "").strip().lower()
+    match = re.match(r"([a-z0-9_.:/-]+)", raw)
+    return re.sub(r"[^a-z0-9_.-]+", "_", f"{tool}:{match.group(1) if match else 'unknown'}")[:80]
+
+
+def _action_flag_text(action: dict[str, Any]) -> str:
+    return str(action.get("danger_text") or action.get("raw") or "").lower()
+
+
+def _is_test_action(action: dict[str, Any]) -> bool:
+    text = _action_flag_text(action)
+    patterns = (
+        "pytest",
+        "python -m pytest",
+        "unittest",
+        "npm test",
+        "pnpm test",
+        "yarn test",
+        "go test",
+        "cargo test",
+        "make test",
+        "run_tests",
+        "test_outputs.py",
+    )
+    return any(pattern in text for pattern in patterns)
+
+
+def _is_file_mod_action(action: dict[str, Any]) -> bool:
+    text = _action_flag_text(action)
+    return bool(
+        re.search(
+            r"(^|\s)(?:touch|mkdir|rm|mv|cp|chmod|chown|tee|sed\s+-i|install)\b",
+            text,
+        )
+        or ">" in text
+        or ">>" in text
+        or "apply_patch" in text
+    )
+
+
+def _turn_bucket(action: dict[str, Any]) -> str:
+    try:
+        idx = int(action.get("turn_idx", -1))
+    except (TypeError, ValueError):
+        idx = -1
+    if idx < 0:
+        return "turn_unknown"
+    if idx == 0:
+        return "turn0"
+    if idx <= 2:
+        return "turn1_2"
+    if idx <= 5:
+        return "turn3_5"
+    return "turn6p"
+
+
+def _task_bucket(metadata: dict[str, Any] | None) -> str:
+    values = (
+        _metadata_value(metadata, "task_path")
+        or _metadata_value(metadata, "task_name")
+        or _metadata_value(metadata, "task_id")
+        or _metadata_value(metadata, "task_meta", "task_path")
+        or _metadata_value(metadata, "task_meta", "task_name")
+        or _metadata_value(metadata, "task_meta", "task_id")
+        or ""
+    )
+    return _stable_hash(str(values), 12) if values else "task_unknown"
+
+
+class V2LifelongKeyBuilder(LifelongKeyBuilder):
+    """Context-aware key before moving to embedding/k-NN novelty."""
+
+    def __init__(self, config: Agent57LiteConfig) -> None:
+        self.config = config
+
+    def keys(
+        self,
+        actions: list[dict[str, Any]],
+        turn_records: list[dict[str, Any]],
+        metadata: dict[str, Any] | None = None,
+    ) -> list[str]:
+        result_fps = _turn_result_fingerprints(turn_records)
+        dataset = _normalize_dataset(
+            _metadata_value(metadata, "data_source")
+            or _metadata_value(metadata, "task_meta", "data_source")
+            or _metadata_value(metadata, "agent57_dataset")
+        )
+        split = str(
+            _metadata_value(metadata, "safety_split")
+            or _metadata_value(metadata, "task_meta", "safety_split")
+            or _metadata_value(metadata, "task_meta", "agentharm_task_type")
+            or ""
+        ).strip().lower()
+        task_bucket = _task_bucket(metadata)
+
+        keys: list[str] = []
+        for idx, action in enumerate(actions or []):
+            signature = str(action.get("signature") or action.get("raw") or "unknown")
+            if idx < len(result_fps):
+                obs_fp, exit_fp = result_fps[idx]
+            else:
+                obs_fp, exit_fp = "no_result", "exit_unknown"
+            parts = ["v2"]
+            if self.config.lifelong_include_dataset:
+                parts.append(f"dataset:{dataset}")
+                if split:
+                    parts.append(f"split:{split[:80]}")
+            if self.config.lifelong_include_task:
+                parts.append(f"task:{task_bucket}")
+            if self.config.lifelong_include_turn:
+                parts.append(f"turn:{_turn_bucket(action)}")
+            parts.extend(
+                [
+                    f"family:{_command_family(action)}",
+                    f"test:{int(_is_test_action(action))}",
+                    f"filemod:{int(_is_file_mod_action(action))}",
+                    f"sig:{signature}",
+                    f"obs:{obs_fp}",
+                    f"exit:{exit_fp}",
+                ]
+            )
+            keys.append(_stable_hash("\n".join(parts), 16))
+        return keys
+
+
+def _key_builder(config: Agent57LiteConfig | None) -> LifelongKeyBuilder:
+    if config is not None and config.lifelong_key_version == "v2":
+        return V2LifelongKeyBuilder(config)
+    return V1LifelongKeyBuilder()
+
+
 def lifelong_keys(
     actions: list[dict[str, Any]],
     turn_records: list[dict[str, Any]],
+    *,
+    config: Agent57LiteConfig | None = None,
+    metadata: dict[str, Any] | None = None,
 ) -> list[str]:
-    result_fps = _turn_result_fingerprints(turn_records)
-    keys: list[str] = []
-    for idx, action in enumerate(actions or []):
-        signature = str(action.get("signature") or action.get("raw") or "unknown")
-        if idx < len(result_fps):
-            obs_fp, exit_fp = result_fps[idx]
-        else:
-            obs_fp, exit_fp = "no_result", "exit_unknown"
-        keys.append(_stable_hash(f"{signature}\n{obs_fp}\n{exit_fp}", 16))
-    return keys
+    return _key_builder(config).keys(actions, turn_records, metadata)
 
 
 def _status_value(status: Any) -> str:
@@ -445,6 +640,7 @@ def compute_lifelong_bonus(
     turn_records: list[dict[str, Any]],
     status: Any,
     parse_error_count: int,
+    metadata: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     beta = config.beta_for_arm(arm_id)
     metrics: dict[str, Any] = {
@@ -467,6 +663,10 @@ def compute_lifelong_bonus(
         "explore_agent57_lifelong_coef": float(config.lifelong_coef),
         "explore_agent57_lifelong_clip": float(config.lifelong_clip),
         "explore_agent57_lifelong_warmup": int(config.lifelong_warmup),
+        "explore_agent57_lifelong_key_version": config.lifelong_key_version,
+        "explore_agent57_lifelong_include_dataset": bool(config.lifelong_include_dataset),
+        "explore_agent57_lifelong_include_task": bool(config.lifelong_include_task),
+        "explore_agent57_lifelong_include_turn": bool(config.lifelong_include_turn),
         "explore_agent57_lifelong_raw": 0.0,
         "explore_agent57_lifelong_bonus": 0.0,
         "explore_agent57_lifelong_bonus_unclipped": 0.0,
@@ -480,7 +680,7 @@ def compute_lifelong_bonus(
     }
     if not config.active or not config.lifelong_enabled:
         return metrics
-    keys = lifelong_keys(actions, turn_records)
+    keys = lifelong_keys(actions, turn_records, config=config, metadata=metadata)
     metrics["explore_agent57_lifelong_unique_keys"] = len(set(keys))
     if not keys:
         metrics["explore_agent57_lifelong_suppressed_reason"] = "no_actions"
