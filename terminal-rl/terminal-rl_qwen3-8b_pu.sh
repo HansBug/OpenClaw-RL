@@ -323,11 +323,29 @@ a3s_code_print_cache_hint() {
 #     - Lowering to 10 trims tail-latency rollouts ≈ 33%, saving ~3 hours / 78 rollouts at 14h
 #     - For exploratory runs needing more turns, override with MAX_TURN=15 or higher.
 MAX_TURN="${MAX_TURN:-10}"
-# TRAJECTORY_SAVE_INTERVAL controls full trajectory artifact storage.
+# TRAJECTORY_SAVE_INTERVAL controls full trajectory artifact storage globally.
+# Per-dataset knobs override the global value and keep eval/training metrics
+# unchanged; they only throttle full traj.json/meta.json artifact writes.
 #   unset / config value 1: save every rollout step (backward compatible)
 #   N>1: save only when train_step % N == 0
 #   0: disable trajectory artifact writes even when TERMINAL_SAVE_TRAJ_DIR is set
 TRAJECTORY_SAVE_INTERVAL="${TRAJECTORY_SAVE_INTERVAL:-}"
+if [[ -n "${TRAJECTORY_SAVE_INTERVAL}" ]]; then
+  DEFAULT_TRAJECTORY_SAVE_INTERVAL_SETA=""
+  DEFAULT_TRAJECTORY_SAVE_INTERVAL_AGENT_SAFETYBENCH=""
+  DEFAULT_TRAJECTORY_SAVE_INTERVAL_AGENTHARM=""
+elif [[ "${DEBUG_MODE}" == "1" ]]; then
+  DEFAULT_TRAJECTORY_SAVE_INTERVAL_SETA="1"
+  DEFAULT_TRAJECTORY_SAVE_INTERVAL_AGENT_SAFETYBENCH="1"
+  DEFAULT_TRAJECTORY_SAVE_INTERVAL_AGENTHARM="1"
+else
+  DEFAULT_TRAJECTORY_SAVE_INTERVAL_SETA="5"
+  DEFAULT_TRAJECTORY_SAVE_INTERVAL_AGENT_SAFETYBENCH="5"
+  DEFAULT_TRAJECTORY_SAVE_INTERVAL_AGENTHARM="10"
+fi
+TRAJECTORY_SAVE_INTERVAL_SETA="${TRAJECTORY_SAVE_INTERVAL_SETA:-${SAVE_INTERVAL_SETA:-${DEFAULT_TRAJECTORY_SAVE_INTERVAL_SETA}}}"
+TRAJECTORY_SAVE_INTERVAL_AGENT_SAFETYBENCH="${TRAJECTORY_SAVE_INTERVAL_AGENT_SAFETYBENCH:-${TRAJECTORY_SAVE_INTERVAL_ASB:-${SAVE_INTERVAL_AGENT_SAFETYBENCH:-${SAVE_INTERVAL_ASB:-${DEFAULT_TRAJECTORY_SAVE_INTERVAL_AGENT_SAFETYBENCH}}}}}"
+TRAJECTORY_SAVE_INTERVAL_AGENTHARM="${TRAJECTORY_SAVE_INTERVAL_AGENTHARM:-${SAVE_INTERVAL_AGENTHARM:-${DEFAULT_TRAJECTORY_SAVE_INTERVAL_AGENTHARM}}}"
 
 # Generate a per-run yaml that overlays MAX_TURN onto the base CUSTOM_CONFIG_PATH.
 # This is cleaner than mutating the base yaml — different concurrent runs can pick
@@ -336,23 +354,47 @@ BASE_CUSTOM_CONFIG_PATH="${CUSTOM_CONFIG_PATH}"
 RUN_CUSTOM_CONFIG_PATH="${RUN_DIR}/config/rollout_config.yaml"
 mkdir -p "$(dirname "${RUN_CUSTOM_CONFIG_PATH}")"
 if [[ -f "${BASE_CUSTOM_CONFIG_PATH}" ]]; then
-  python3 - "$BASE_CUSTOM_CONFIG_PATH" "$RUN_CUSTOM_CONFIG_PATH" "$MAX_TURN" "$TRAJECTORY_SAVE_INTERVAL" "$HARNESS_OPTION" <<'PY'
+  python3 - "$BASE_CUSTOM_CONFIG_PATH" "$RUN_CUSTOM_CONFIG_PATH" "$MAX_TURN" "$TRAJECTORY_SAVE_INTERVAL" "$HARNESS_OPTION" "$TRAJECTORY_SAVE_INTERVAL_SETA" "$TRAJECTORY_SAVE_INTERVAL_AGENT_SAFETYBENCH" "$TRAJECTORY_SAVE_INTERVAL_AGENTHARM" <<'PY'
 import sys, yaml
-src, dst, max_turn, traj_interval, harness_option = sys.argv[1], sys.argv[2], int(sys.argv[3]), sys.argv[4].strip(), sys.argv[5].strip()
+(
+    src,
+    dst,
+    max_turn,
+    traj_interval,
+    harness_option,
+    traj_seta,
+    traj_asb,
+    traj_agentharm,
+) = (
+    sys.argv[1],
+    sys.argv[2],
+    int(sys.argv[3]),
+    sys.argv[4].strip(),
+    sys.argv[5].strip(),
+    sys.argv[6].strip(),
+    sys.argv[7].strip(),
+    sys.argv[8].strip(),
+)
 with open(src) as f:
     cfg = yaml.safe_load(f) or {}
 cfg["max_iteration"] = max_turn
 cfg["harness_option"] = harness_option
 if traj_interval:
     cfg["trajectory_save_interval"] = int(traj_interval)
+if traj_seta:
+    cfg["trajectory_save_interval_seta"] = int(traj_seta)
+if traj_asb:
+    cfg["trajectory_save_interval_agent_safetybench"] = int(traj_asb)
+if traj_agentharm:
+    cfg["trajectory_save_interval_agentharm"] = int(traj_agentharm)
 with open(dst, "w") as f:
     yaml.safe_dump(cfg, f, sort_keys=True)
 PY
   CUSTOM_CONFIG_PATH="${RUN_CUSTOM_CONFIG_PATH}"
   if [[ -n "${TRAJECTORY_SAVE_INTERVAL}" ]]; then
-    echo "[config] rollout yaml -> ${RUN_CUSTOM_CONFIG_PATH} (max_iteration=${MAX_TURN}, harness_option=${HARNESS_OPTION}, trajectory_save_interval=${TRAJECTORY_SAVE_INTERVAL})"
+    echo "[config] rollout yaml -> ${RUN_CUSTOM_CONFIG_PATH} (max_iteration=${MAX_TURN}, harness_option=${HARNESS_OPTION}, trajectory_save_interval=${TRAJECTORY_SAVE_INTERVAL}, per_dataset=seta:${TRAJECTORY_SAVE_INTERVAL_SETA}/asb:${TRAJECTORY_SAVE_INTERVAL_AGENT_SAFETYBENCH}/agentharm:${TRAJECTORY_SAVE_INTERVAL_AGENTHARM})"
   else
-    echo "[config] rollout yaml -> ${RUN_CUSTOM_CONFIG_PATH} (max_iteration=${MAX_TURN}, harness_option=${HARNESS_OPTION})"
+    echo "[config] rollout yaml -> ${RUN_CUSTOM_CONFIG_PATH} (max_iteration=${MAX_TURN}, harness_option=${HARNESS_OPTION}, per_dataset=seta:${TRAJECTORY_SAVE_INTERVAL_SETA}/asb:${TRAJECTORY_SAVE_INTERVAL_AGENT_SAFETYBENCH}/agentharm:${TRAJECTORY_SAVE_INTERVAL_AGENTHARM})"
   fi
 else
   echo "[config] base yaml ${BASE_CUSTOM_CONFIG_PATH} not found; MAX_TURN=${MAX_TURN} will not take effect"
@@ -512,6 +554,8 @@ ensure_agentharm_dataset() {
 INCLUDES_SETA="0"
 INCLUDES_SAFETY="0"
 INCLUDES_AGENTHARM="0"
+MIX_MODE="${MIX_MODE:-all_visible}"
+export MIX_MODE
 
 case "${DATASET}" in
   seta)
@@ -534,6 +578,7 @@ case "${DATASET}" in
       MIX_ARGS=(
         --output "${MIXED_DATA}"
         --seed "${MIX_SEED:-42}"
+        --mode "${MIX_MODE}"
       )
       MIX_LABELS=()
       add_mix_source() {
@@ -579,6 +624,7 @@ case "${DATASET}" in
             --source "${SAFETY_DATA}:${MIX_SAFETY_RATIO:-1}"
             --output "${MIXED_DATA}"
             --seed "${MIX_SEED:-42}"
+            --mode "${MIX_MODE}"
           )
           if [[ -n "${MIX_TOTAL:-}" ]]; then
             MIX_ARGS+=(--total "${MIX_TOTAL}")
@@ -739,6 +785,9 @@ export CS_EVOLVING_ENABLED="${CS_EVOLVING_ENABLED:-false}"
 # Set TERMINAL_SAVE_TRAJ_DIR="" to disable.
 export TERMINAL_SAVE_TRAJ_DIR="${TERMINAL_SAVE_TRAJ_DIR}"
 export TRAJECTORY_SAVE_INTERVAL="${TRAJECTORY_SAVE_INTERVAL}"
+export TRAJECTORY_SAVE_INTERVAL_SETA
+export TRAJECTORY_SAVE_INTERVAL_AGENT_SAFETYBENCH
+export TRAJECTORY_SAVE_INTERVAL_AGENTHARM
 
 # Proxy bypass: some environments inject http_proxy/HTTPS_PROXY via shell rc.
 # aiohttp + requests will then try to tunnel the internal router→worker traffic
@@ -1133,6 +1182,7 @@ cat > "${RUN_DIR}/config/run_config.json" <<CFGEOF
   "includes_safety": "${INCLUDES_SAFETY}",
   "includes_agentharm": "${INCLUDES_AGENTHARM}",
   "prompt_data": "${ROLLOUT_PROMPT_DATA}",
+  "mix_mode": "${MIX_MODE}",
   "num_rollout": ${NUM_ROLLOUT},
   "rollout_batch_size": ${ROLLOUT_BATCH_SIZE},
   "n_samples": ${N_SAMPLES},
@@ -1173,6 +1223,9 @@ cat > "${RUN_DIR}/config/run_config.json" <<CFGEOF
   "safety_reward_summary_weight": "${SAFETY_REWARD_SUMMARY_WEIGHT}",
   "safety_reward_zero_threshold": "${SAFETY_REWARD_ZERO_THRESHOLD}",
   "trajectory_save_interval_env": "${TRAJECTORY_SAVE_INTERVAL}",
+  "trajectory_save_interval_seta": "${TRAJECTORY_SAVE_INTERVAL_SETA}",
+  "trajectory_save_interval_agent_safetybench": "${TRAJECTORY_SAVE_INTERVAL_AGENT_SAFETYBENCH}",
+  "trajectory_save_interval_agentharm": "${TRAJECTORY_SAVE_INTERVAL_AGENTHARM}",
   "exploration_profile": "${EXPLORATION_PROFILE}",
   "explore_entropy_coef": "${EXPLORE_ENTROPY_COEF}",
   "explore_think_mode": "${EXPLORE_THINK_MODE}",
@@ -1310,6 +1363,10 @@ RUNTIME_ENV_JSON="{
     \"SAFETY_REWARD_ZERO_THRESHOLD\": \"${SAFETY_REWARD_ZERO_THRESHOLD}\",
     \"TERMINAL_SAVE_TRAJ_DIR\": \"${TERMINAL_SAVE_TRAJ_DIR}\",
     \"TRAJECTORY_SAVE_INTERVAL\": \"${TRAJECTORY_SAVE_INTERVAL}\",
+    \"TRAJECTORY_SAVE_INTERVAL_SETA\": \"${TRAJECTORY_SAVE_INTERVAL_SETA}\",
+    \"TRAJECTORY_SAVE_INTERVAL_AGENT_SAFETYBENCH\": \"${TRAJECTORY_SAVE_INTERVAL_AGENT_SAFETYBENCH}\",
+    \"TRAJECTORY_SAVE_INTERVAL_AGENTHARM\": \"${TRAJECTORY_SAVE_INTERVAL_AGENTHARM}\",
+    \"MIX_MODE\": \"${MIX_MODE}\",
     \"RUN_DIR\": \"${RUN_DIR}\",
     \"RUN_ID\": \"${RUN_ID}\",
     \"RUN_NAME\": \"${RUN_NAME}\",
@@ -1364,6 +1421,28 @@ RUNTIME_ENV_JSON="{
 }"
 
 RAY_JOB_SUBMISSION_ID="${RAY_JOB_SUBMISSION_ID:-terminal_rl_8b_${NUM_GPUS}gpu_$(date +%Y%m%d_%H%M%S)}"
+CASE_STUDY_ON_EXIT="${CASE_STUDY_ON_EXIT:-0}"
+CASE_STUDY_ON_FAILURE="${CASE_STUDY_ON_FAILURE:-0}"
+CASE_STUDY_CONFIG="${CASE_STUDY_CONFIG:-${SCRIPT_DIR}/scripts/case_study_samples.yaml}"
+
+run_case_study_if_requested() {
+  local phase="$1"
+  if [[ "${CASE_STUDY_ON_EXIT}" != "1" ]]; then
+    return 0
+  fi
+  if [[ "${phase}" != "success" && "${CASE_STUDY_ON_FAILURE}" != "1" ]]; then
+    return 0
+  fi
+  if [[ ! -d "${RUN_DIR}/trajectories" ]]; then
+    log "Case-study skipped: ${RUN_DIR}/trajectories not found"
+    return 0
+  fi
+  log "Running case-study analysis (${phase})"
+  if ! CASE_STUDY_CONFIG="${CASE_STUDY_CONFIG}" \
+       bash "${SCRIPT_DIR}/scripts/run_case_study.sh" "${RUN_DIR}"; then
+    log "Case-study analysis failed; training exit status is unchanged"
+  fi
+}
 
 log "Submitting Ray job ${RAY_JOB_SUBMISSION_ID}"
 ray job submit --address="http://${MASTER_ADDR}:8265" \
@@ -1398,6 +1477,7 @@ fi
 
 RAY_STATUS_LOWER=$(echo "${RAY_STATUS_OUTPUT}" | tr '[:upper:]' '[:lower:]')
 if [[ "${RAY_STATUS_LOWER}" == *"succeeded"* ]]; then
+  run_case_study_if_requested success
   log "Ray job succeeded"
   exit 0
 fi
@@ -1424,4 +1504,5 @@ cat <<EOF
     latest : ${TMP_DOC_LATEST}/  (symlink → ${TMP_DOC_ROOT##*/})
 ========================================
 EOF
+run_case_study_if_requested failure
 exit 1

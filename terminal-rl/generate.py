@@ -788,13 +788,87 @@ def _sample_or_env_int(sample: Sample, key: str, env_name: str) -> int | None:
     return _optional_int(value)
 
 
-def _trajectory_save_interval(args) -> int:
-    raw = getattr(args, "trajectory_save_interval", None)
+def _trajectory_dataset_slug(data_source: str | None) -> str:
+    raw = str(data_source or "").strip().lower()
+    if raw in {"", "terminal_bench", "seta", "seta_env"}:
+        return "seta"
+    if raw in {"agent_safetybench", "agent-safety-bench", "safety", "asb"}:
+        return "agent_safetybench"
+    if raw in {"agentharm", "agent_harm", "ah"}:
+        return "agentharm"
+    return _sanitize_filename(raw) or "unknown"
+
+
+def _interval_candidates_for_dataset(dataset_slug: str) -> tuple[tuple[str, ...], tuple[str, ...]]:
+    if dataset_slug == "seta":
+        return (
+            ("trajectory_save_interval_seta", "trajectory_save_interval_terminal_bench"),
+            ("TRAJECTORY_SAVE_INTERVAL_SETA", "SAVE_INTERVAL_SETA"),
+        )
+    if dataset_slug == "agent_safetybench":
+        return (
+            (
+                "trajectory_save_interval_agent_safetybench",
+                "trajectory_save_interval_asb",
+                "trajectory_save_interval_safety",
+            ),
+            (
+                "TRAJECTORY_SAVE_INTERVAL_AGENT_SAFETYBENCH",
+                "TRAJECTORY_SAVE_INTERVAL_ASB",
+                "TRAJECTORY_SAVE_INTERVAL_SAFETY",
+                "SAVE_INTERVAL_AGENT_SAFETYBENCH",
+                "SAVE_INTERVAL_ASB",
+                "SAVE_INTERVAL_SAFETY",
+            ),
+        )
+    if dataset_slug == "agentharm":
+        return (
+            ("trajectory_save_interval_agentharm", "trajectory_save_interval_agent_harm"),
+            (
+                "TRAJECTORY_SAVE_INTERVAL_AGENTHARM",
+                "TRAJECTORY_SAVE_INTERVAL_AGENT_HARM",
+                "SAVE_INTERVAL_AGENTHARM",
+                "SAVE_INTERVAL_AGENT_HARM",
+            ),
+        )
+    return (
+        (f"trajectory_save_interval_{dataset_slug}",),
+        (f"TRAJECTORY_SAVE_INTERVAL_{dataset_slug.upper()}",),
+    )
+
+
+def _trajectory_save_interval(args, data_source: str | None = None) -> int:
+    dataset_slug = _trajectory_dataset_slug(data_source)
+    arg_names, env_names = _interval_candidates_for_dataset(dataset_slug)
+    raw = None
+    raw_source = None
+    for name in arg_names:
+        value = getattr(args, name, None)
+        if value is not None and value != "":
+            raw = value
+            raw_source = name
+            break
+    if raw is None:
+        for name in env_names:
+            value = os.getenv(name)
+            if value is not None and value != "":
+                raw = value
+                raw_source = name
+                break
+    if raw is None:
+        raw = getattr(args, "trajectory_save_interval", None)
+        raw_source = "trajectory_save_interval"
     if raw is None or raw == "":
         raw = os.getenv("TRAJECTORY_SAVE_INTERVAL", "1")
+        raw_source = "TRAJECTORY_SAVE_INTERVAL"
     value = _optional_int(raw)
     if value is None:
-        logger.warning("Invalid trajectory_save_interval=%r; falling back to 1", raw)
+        logger.warning(
+            "Invalid trajectory save interval %s=%r for dataset=%s; falling back to 1",
+            raw_source,
+            raw,
+            dataset_slug,
+        )
         return 1
     return value
 
@@ -890,10 +964,16 @@ def _save_rollout_artifacts(
             return
         if str(status) == "Status.FAILED" and raw_score == 0.0 and len(turn_records) <= 1:
             return
+        primary_metadata = (
+            samples[0].metadata
+            if samples and isinstance(samples[0].metadata, dict)
+            else (sample.metadata if isinstance(sample.metadata, dict) else {})
+        )
         ts = time.strftime("%Y%m%d_%H%M%S")
         ts_ns = time.time_ns()
+        dataset_slug = _trajectory_dataset_slug(primary_metadata.get("data_source"))
         stem = (
-            f"t{_sanitize_filename(task_spec.task_name)}"
+            f"{dataset_slug}_t{_sanitize_filename(task_spec.task_name)}"
             f"_r{run_ctx.rollout_id if run_ctx.rollout_id is not None else 'na'}"
             f"_st{run_ctx.train_step if run_ctx.train_step is not None else 'na'}"
             f"_g{run_ctx.group_index if run_ctx.group_index is not None else 'na'}"
@@ -964,11 +1044,6 @@ def _save_rollout_artifacts(
                 }
                 for s in samples
             ]
-        primary_metadata = (
-            samples[0].metadata
-            if samples and isinstance(samples[0].metadata, dict)
-            else (sample.metadata if isinstance(sample.metadata, dict) else {})
-        )
         primary_reward_details = primary_metadata.get("reward_details")
         primary_reward_reason = (
             primary_reward_details.get("reason")
@@ -982,6 +1057,7 @@ def _save_rollout_artifacts(
                 "task_name": task_spec.task_name,
                 "task_path": task_spec.task_path,
                 "data_source": primary_metadata.get("data_source"),
+                "dataset_slug": dataset_slug,
                 "safety_split": primary_metadata.get("safety_split"),
                 "reward_reason": primary_reward_reason,
                 "uid": run_ctx.uid,
@@ -995,6 +1071,7 @@ def _save_rollout_artifacts(
                 "eval_error": eval_error,
                 "safety_coef": safety_coef,
                 "prm_coef": prm_coef,
+                "trajectory_save_interval": trajectory_save_interval,
                 "trajectory_uncertainty": _jsonable(
                     primary_metadata.get("trajectory_uncertainty")
                 ),
@@ -1023,6 +1100,7 @@ def _save_rollout_artifacts(
             "sample_metadata": _jsonable(sample.metadata or {}),
             "sample_prompt": _jsonable(sample.prompt),
             "data_source": primary_metadata.get("data_source"),
+            "dataset_slug": dataset_slug,
             "safety_split": primary_metadata.get("safety_split"),
             "reward_details": _jsonable(primary_reward_details),
             "exploration": _jsonable(_exploration_audit_from_reward(reward_breakdown)),
@@ -1036,6 +1114,7 @@ def _save_rollout_artifacts(
             "task_reward": reward_breakdown.get("task_reward", reward_breakdown.get("base_score")),
             "exploration_reward": reward_breakdown.get("exploration_reward", 0.0),
             "total_reward": reward_breakdown.get("total_reward", reward_breakdown.get("score")),
+            "trajectory_save_interval": trajectory_save_interval,
             "ts_ns": ts_ns,
         }
         (run_dir / "meta.json").write_text(
@@ -1688,7 +1767,7 @@ async def generate(
         safety_enable = seta_safety_mode == "clawsentry"
     safety_enable = safety_enable and (not evaluation)
     safety_coef = _env_float("SAFETY_REWARD_COEF", 0.0)
-    traj_save_interval = _trajectory_save_interval(args)
+    traj_save_interval = _trajectory_save_interval(args, data_source=data_source)
     safety_summary_weight = _env_float("SAFETY_REWARD_SUMMARY_WEIGHT", 0.3)
     safety_zero_threshold = _env_float(
         "SAFETY_REWARD_ZERO_THRESHOLD", _SAFETY_ZERO_THRESHOLD
