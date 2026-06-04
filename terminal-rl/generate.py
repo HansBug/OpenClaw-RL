@@ -30,6 +30,11 @@ from custom_types import (
 from inference_client import SGLangTurnClient
 from agent_runner import create_agent_runner, normalize_harness_option
 from env_client import TerminalEnvClient
+from explore_agent57_lite import (
+    compute_lifelong_bonus as _agent57_compute_lifelong_bonus,
+    config_from_env as _agent57_config_from_env,
+    record_arm_event as _agent57_record_arm_event,
+)
 from safety_reward import (
     DEFAULT_ZERO_THRESHOLD as _SAFETY_ZERO_THRESHOLD,
     broadcast_to_turns as _safety_broadcast,
@@ -40,6 +45,7 @@ from safety_reward import (
 logger = logging.getLogger(__name__)
 
 _DIRECT_SCORE_DATA_SOURCES = {"agent_safetybench", "agentharm"}
+_AGENT57_CONFIG = _agent57_config_from_env()
 
 
 def _env_bool(name: str, default: bool = False) -> bool:
@@ -673,6 +679,7 @@ def _explore_debug_metrics(
     intrinsic_scaled: float,
     safety_penalty: float,
     lprnd_bonus: float,
+    agent57_bonus: float,
     cde_actor: Dict[str, float],
     turn_records: List[Dict[str, Any]],
     parse_error_count: int,
@@ -694,8 +701,11 @@ def _explore_debug_metrics(
 
     base_abs = abs(float(base_score_mean))
     bonus_to_base = abs(float(total_bonus)) / max(base_abs, 1e-6)
-    curiosity_pressure = max(0.0, intrinsic_scaled) + max(0.0, lprnd_bonus) + max(
-        0.0, float(cde_actor.get("bonus", 0.0))
+    curiosity_pressure = (
+        max(0.0, intrinsic_scaled)
+        + max(0.0, lprnd_bonus)
+        + max(0.0, agent57_bonus)
+        + max(0.0, float(cde_actor.get("bonus", 0.0)))
     )
     safety_pressure = max(0.0, -float(safety_penalty)) + float(danger_command_count)
     reward_hacking_risk = bool(base_score_mean <= 0.0 and total_bonus > 0.0)
@@ -920,6 +930,15 @@ def _exploration_audit_from_reward(reward: Dict[str, Any]) -> Dict[str, Any]:
         "explore_parse_error_count",
         "explore_intrinsic_scaled",
         "explore_lprnd",
+        "explore_agent57_enabled",
+        "explore_agent57_arm_id",
+        "explore_agent57_beta",
+        "explore_agent57_controller",
+        "explore_agent57_lifelong_enabled",
+        "explore_agent57_lifelong_raw",
+        "explore_agent57_lifelong_bonus",
+        "explore_agent57_lifelong_eligible",
+        "explore_agent57_lifelong_suppressed_reason",
         "explore_cde_actor_bonus",
         "explore_cde_actor_log_ppl",
         "explore_cde_actor_reward_gate",
@@ -1002,6 +1021,22 @@ def _save_rollout_artifacts(
                 "explore_lprnd", "explore_lprnd_raw", "explore_lprnd_coef",
                 "explore_lprnd_effective_coef", "explore_lprnd_schedule",
                 "explore_lprnd_decay_steps", "explore_lprnd_schedule_multiplier",
+                "explore_agent57_enabled",
+                "explore_agent57_arm_id", "explore_agent57_k",
+                "explore_agent57_beta", "explore_agent57_controller",
+                "explore_agent57_lifelong_enabled",
+                "explore_agent57_lifelong_backend",
+                "explore_agent57_lifelong_state_path",
+                "explore_agent57_lifelong_coef",
+                "explore_agent57_lifelong_clip",
+                "explore_agent57_lifelong_warmup",
+                "explore_agent57_lifelong_raw",
+                "explore_agent57_lifelong_bonus",
+                "explore_agent57_lifelong_unique_keys",
+                "explore_agent57_lifelong_seen_before",
+                "explore_agent57_lifelong_warmup_remaining",
+                "explore_agent57_lifelong_eligible",
+                "explore_agent57_lifelong_suppressed_reason",
                 "explore_cde_actor_bonus",
                 "explore_cde_actor_log_ppl", "explore_cde_actor_omega",
                 "explore_cde_actor_alpha", "explore_cde_actor_kappa",
@@ -2348,6 +2383,7 @@ async def generate(
             or _EXPLORE_SAFETY_FILTER_ENABLED
             or _EXPLORE_LPRND_ENABLED
             or _EXPLORE_CDE_ACTOR_ENABLED
+            or _AGENT57_CONFIG.active
         ):
             _intr_bonus = _explore_intrinsic_bonus(turn_records)
             _intr_schedule_multiplier = _explore_schedule_multiplier(
@@ -2366,6 +2402,26 @@ async def generate(
             )
             _lprnd_effective_coef = _EXPLORE_LPRND_COEF * _lprnd_schedule_multiplier
             _lprnd_bonus = _lprnd_raw * _lprnd_effective_coef
+            try:
+                _agent57_arm_id = int(
+                    (sample.metadata or {}).get(
+                        "agent57_arm_id",
+                        int(sample.index or 0) % max(1, _AGENT57_CONFIG.k),
+                    )
+                )
+            except (TypeError, ValueError):
+                _agent57_arm_id = 0
+            _agent57_metrics = _agent57_compute_lifelong_bonus(
+                config=_AGENT57_CONFIG,
+                arm_id=_agent57_arm_id,
+                actions=_iter_explore_actions(turn_records),
+                turn_records=turn_records,
+                status=status,
+                parse_error_count=agent_runner.parse_error_count,
+            )
+            _agent57_bonus = float(
+                _agent57_metrics.get("explore_agent57_lifelong_bonus", 0.0) or 0.0
+            )
             _base_score_values = []
             for _sample in samples:
                 if isinstance(_sample.reward, dict) and "score" in _sample.reward:
@@ -2384,7 +2440,13 @@ async def generate(
                 run_ctx.train_step,
             )
             _cde_actor_bonus = _cde_actor["bonus"]
-            _explore_total = _intr_scaled + _safe_penalty + _lprnd_bonus + _cde_actor_bonus
+            _explore_total = (
+                _intr_scaled
+                + _safe_penalty
+                + _lprnd_bonus
+                + _agent57_bonus
+                + _cde_actor_bonus
+            )
             _explore_debug = _explore_debug_metrics(
                 status=status,
                 base_score_mean=_base_score_mean,
@@ -2392,9 +2454,19 @@ async def generate(
                 intrinsic_scaled=_intr_scaled,
                 safety_penalty=_safe_penalty,
                 lprnd_bonus=_lprnd_bonus,
+                agent57_bonus=_agent57_bonus,
                 cde_actor=_cde_actor,
                 turn_records=turn_records,
                 parse_error_count=agent_runner.parse_error_count,
+            )
+            _agent57_record_arm_event(
+                config=_AGENT57_CONFIG,
+                arm_id=_agent57_arm_id,
+                base_score=_base_score_mean,
+                final_score=_base_score_mean + _explore_total,
+                status=status,
+                parse_error_count=agent_runner.parse_error_count,
+                bonus=_agent57_bonus,
             )
             for s in samples:
                 if isinstance(s.reward, dict) and "score" in s.reward:
@@ -2416,6 +2488,26 @@ async def generate(
                     s.reward["explore_lprnd_schedule"] = _EXPLORE_LPRND_SCHEDULE
                     s.reward["explore_lprnd_decay_steps"] = _EXPLORE_LPRND_DECAY_STEPS
                     s.reward["explore_lprnd_schedule_multiplier"] = _lprnd_schedule_multiplier
+                    if _AGENT57_CONFIG.active:
+                        if not isinstance(s.metadata, dict):
+                            s.metadata = {}
+                        s.reward.update(_agent57_metrics)
+                        s.metadata["agent57"] = {
+                            "enabled": bool(_AGENT57_CONFIG.enabled),
+                            "arm_id": _agent57_arm_id,
+                            "k": _AGENT57_CONFIG.k,
+                            "beta": _AGENT57_CONFIG.beta_for_arm(_agent57_arm_id),
+                            "controller": _AGENT57_CONFIG.controller,
+                            "lifelong_enabled": bool(_AGENT57_CONFIG.lifelong_enabled),
+                            "lifelong_backend": _AGENT57_CONFIG.lifelong_backend,
+                            "lifelong_bonus": _agent57_bonus,
+                            "lifelong_raw": _agent57_metrics.get(
+                                "explore_agent57_lifelong_raw", 0.0
+                            ),
+                            "lifelong_eligible": _agent57_metrics.get(
+                                "explore_agent57_lifelong_eligible", 0.0
+                            ),
+                        }
                     if _EXPLORE_CDE_ACTOR_ENABLED:
                         s.reward["explore_cde_actor_bonus"] = _cde_actor_bonus
                         s.reward["explore_cde_actor_log_ppl"] = _cde_actor["log_ppl"]

@@ -420,41 +420,60 @@ class WorkerPool:
             self._closing_task_labels.pop(task, None)
         return len(done)
 
+    async def _close_run_slot_with_semaphore(self, run_slot: RunSlot) -> None:
+        async with self._close_sem:
+            await self._close_run_slot_under_lock(run_slot)
+
+    async def _force_cleanup_after_close_failure(
+        self, run_slot: RunSlot, run_lease_id: str, *, reason: str
+    ) -> None:
+        try:
+            await run_slot.env.force_cleanup(reason=reason)
+        except Exception:
+            logger.exception(
+                "Force cleanup failed after %s for run session %s",
+                reason,
+                run_lease_id,
+            )
+
     async def _close_run_slot(
         self, task_key: str, run_lease_id: str, run_slot: RunSlot, *, reason: str
     ) -> None:
         logger.warning("%s %s (task=%s)", reason, run_lease_id, task_key)
-        async with self._close_sem:
-            try:
-                await asyncio.wait_for(
-                    self._close_run_slot_under_lock(run_slot),
-                    timeout=self.close_task_timeout,
+        try:
+            await asyncio.wait_for(
+                self._close_run_slot_with_semaphore(run_slot),
+                timeout=self.close_task_timeout,
+            )
+        except asyncio.TimeoutError:
+            logger.warning(
+                "Timed out closing run session %s after %.1fs while waiting for "
+                "the close semaphore, run lock, and/or env.close(); dropping it "
+                "from the pool so the close backlog can drain. Watchdog/preflight "
+                "cleanup will remove any orphan Docker objects.",
+                run_lease_id,
+                self.close_task_timeout,
+            )
+            await self._force_cleanup_after_close_failure(
+                run_slot, run_lease_id, reason="close_timeout"
+            )
+        except asyncio.CancelledError:
+            logger.warning(
+                "Close task for run session %s was cancelled; scheduling Docker "
+                "cleanup before dropping it from the pool.",
+                run_lease_id,
+            )
+            asyncio.create_task(
+                self._force_cleanup_after_close_failure(
+                    run_slot, run_lease_id, reason="close_cancelled"
                 )
-            except asyncio.TimeoutError:
-                logger.warning(
-                    "Timed out closing run session %s after %.1fs while waiting for "
-                    "the run lock and/or env.close(); dropping it from the pool so "
-                    "the close backlog can drain. Watchdog/preflight cleanup will "
-                    "remove any orphan Docker objects.",
-                    run_lease_id,
-                    self.close_task_timeout,
-                )
-                try:
-                    await run_slot.env.force_cleanup(reason="close_timeout")
-                except Exception:
-                    logger.exception(
-                        "Force cleanup failed after close timeout for run session %s",
-                        run_lease_id,
-                    )
-            except Exception:
-                logger.exception("Failed to close run session %s", run_lease_id)
-                try:
-                    await run_slot.env.force_cleanup(reason="close_exception")
-                except Exception:
-                    logger.exception(
-                        "Force cleanup failed after close exception for run session %s",
-                        run_lease_id,
-                    )
+            )
+            raise
+        except Exception:
+            logger.exception("Failed to close run session %s", run_lease_id)
+            await self._force_cleanup_after_close_failure(
+                run_slot, run_lease_id, reason="close_exception"
+            )
 
     def _schedule_close(
         self, task_key: str, run_lease_id: str, run_slot: RunSlot, *, reason: str
@@ -643,6 +662,17 @@ class WorkerPool:
     async def status(self) -> dict[str, Any]:
         async with self._lock:
             self._prune_done_closing_tasks()
+            now = time.time()
+            close_ages = [
+                now - started for started in self._closing_task_started.values()
+            ]
+            pending_close_age_sec = {
+                "min": round(min(close_ages), 1) if close_ages else 0.0,
+                "max": round(max(close_ages), 1) if close_ages else 0.0,
+                "over_close_timeout": sum(
+                    1 for age in close_ages if age >= self.close_task_timeout
+                ),
+            }
             tasks_info: dict[str, Any] = {}
             total_runs = 0
             for tk, ts in self._tasks.items():
@@ -655,6 +685,7 @@ class WorkerPool:
                 "max_runs_per_task": self.max_runs_per_task,
                 "total_active_runs": total_runs,
                 "pending_closes": len(self._closing_tasks),
+                "pending_close_age_sec": pending_close_age_sec,
                 "tasks": tasks_info,
             }
 
@@ -782,7 +813,37 @@ class WorkerPool:
                 "Shutdown: waiting for %d pending close tasks...",
                 len(self._closing_tasks),
             )
-            await asyncio.gather(*self._closing_tasks, return_exceptions=True)
+            shutdown_timeout = _env_float(
+                "WORKER_SHUTDOWN_CLOSE_TASKS_TIMEOUT",
+                max(5.0, self.close_task_timeout + 5.0),
+            )
+            try:
+                await asyncio.wait_for(
+                    asyncio.gather(*self._closing_tasks, return_exceptions=True),
+                    timeout=shutdown_timeout,
+                )
+            except asyncio.TimeoutError:
+                logger.warning(
+                    "Shutdown timed out after %.1fs with %d pending close tasks; "
+                    "cancelling them so pool_server can exit.",
+                    shutdown_timeout,
+                    len(self._closing_tasks),
+                )
+                for task in list(self._closing_tasks):
+                    task.cancel()
+                try:
+                    await asyncio.wait_for(
+                        asyncio.gather(
+                            *self._closing_tasks, return_exceptions=True
+                        ),
+                        timeout=5.0,
+                    )
+                except asyncio.TimeoutError:
+                    logger.warning(
+                        "Shutdown cancellation wait timed out; exiting with %d "
+                        "close task(s) still pending.",
+                        len(self._closing_tasks),
+                    )
 
 
 POOL: WorkerPool | None = None

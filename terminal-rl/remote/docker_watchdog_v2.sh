@@ -75,12 +75,13 @@ POOL_PENDING_CLOSES_WARN="${POOL_PENDING_CLOSES_WARN:-50}"
 POOL_PENDING_CLOSES_REPAIR="${POOL_PENDING_CLOSES_REPAIR:-1}"
 POOL_PENDING_CLOSES_REPAIR_THRESHOLD="${POOL_PENDING_CLOSES_REPAIR_THRESHOLD:-${POOL_PENDING_CLOSES_WARN}}"
 POOL_PENDING_CLOSES_STUCK_CHECKS="${POOL_PENDING_CLOSES_STUCK_CHECKS:-5}"
-POOL_PENDING_CLOSES_ACTIVE_MAX="${POOL_PENDING_CLOSES_ACTIVE_MAX:-8}"
+POOL_PENDING_CLOSES_ACTIVE_MAX="${POOL_PENDING_CLOSES_ACTIVE_MAX:-64}"
 POOL_PENDING_CLOSES_REAP_LIMIT="${POOL_PENDING_CLOSES_REAP_LIMIT:-0}"
 POOL_PENDING_CLOSES_REPAIR_COOLDOWN_S="${POOL_PENDING_CLOSES_REPAIR_COOLDOWN_S:-300}"
 POOL_PENDING_CLOSES_CANCEL_API="${POOL_PENDING_CLOSES_CANCEL_API:-1}"
 POOL_PENDING_CLOSES_CANCEL_TIMEOUT="${POOL_PENDING_CLOSES_CANCEL_TIMEOUT:-5}"
 POOL_PENDING_CLOSES_CANCEL_MIN_AGE="${POOL_PENDING_CLOSES_CANCEL_MIN_AGE:-90}"
+POOL_PENDING_CLOSES_KILL_CONTAINERS_WHEN_ACTIVE="${POOL_PENDING_CLOSES_KILL_CONTAINERS_WHEN_ACTIVE:-0}"
 BRIDGE_NETS_WARN="${BRIDGE_NETS_WARN:-200}"
 EMERGENCY_COOLDOWN_S="${EMERGENCY_COOLDOWN_S:-60}"
 POOL_SERVER_NAME_REGEX="${POOL_SERVER_NAME_REGEX:-openclaw_pool_server}"
@@ -135,15 +136,16 @@ detect_pid_namespace() {
 # 用 truncate-in-place 而不是 mv，否则 nohup 重定向的 fd 会丢
 rotate_log_if_big() {
     [ -f "${LOG_FILE}" ] || return 0
-    local sz
+    local sz tmp_file
     sz=$(stat -c%s "${LOG_FILE}" 2>/dev/null || echo 0)
     [ -n "${sz}" ] && [ "${sz}" -ge 0 ] 2>/dev/null || sz=0
     [ "${sz}" -gt "${LOG_MAX_BYTES}" ] || return 0
     local tail_bytes=52428800   # 保留尾部 50 MB
-    local tmp
-    tmp=$(tail -c "$tail_bytes" "${LOG_FILE}" 2>/dev/null)
+    tmp_file="$(mktemp /tmp/docker_watchdog_rotate.XXXXXX 2>/dev/null || echo /tmp/docker_watchdog_rotate.$$)"
+    tail -c "$tail_bytes" "${LOG_FILE}" > "${tmp_file}" 2>/dev/null || true
     : > "${LOG_FILE}"
-    printf '%s\n' "$tmp" >> "${LOG_FILE}" 2>/dev/null || true
+    cat "${tmp_file}" >> "${LOG_FILE}" 2>/dev/null || true
+    rm -f "${tmp_file}" 2>/dev/null || true
 }
 
 log() {
@@ -380,11 +382,16 @@ repair_stuck_pool_pending_closes() {
     LAST_POOL_PENDING_REPAIR_TS="$now"
 
     reason="stuck pool pending_closes=${pending} active=${active} high_count=${POOL_PENDING_HIGH_COUNT}"
-    log "POOL_REPAIR: ${reason}; reaping task containers with broad matcher"
-    matched=1
-    kill_task_containers_for_pressure "${reason}" "${POOL_PENDING_CLOSES_REAP_LIMIT}" || matched=0
-    timeout 30 docker container prune -f --filter "until=0s" >/dev/null 2>&1 || true
-    timeout 30 docker network prune -f >/dev/null 2>&1 || true
+    matched=0
+    if [ "${active}" -eq 0 ] 2>/dev/null \
+       || [ "${POOL_PENDING_CLOSES_KILL_CONTAINERS_WHEN_ACTIVE}" = "1" ]; then
+        log "POOL_REPAIR: ${reason}; reaping task containers with broad matcher"
+        kill_task_containers_for_pressure "${reason}" "${POOL_PENDING_CLOSES_REAP_LIMIT}" || matched=0
+        timeout 30 docker container prune -f --filter "until=0s" >/dev/null 2>&1 || true
+        timeout 30 docker network prune -f >/dev/null 2>&1 || true
+    else
+        log "POOL_REPAIR: ${reason}; active rollouts exist, skipping container kill/prune and using pending-close API only"
+    fi
 
     if [ "${POOL_PENDING_CLOSES_CANCEL_API}" = "1" ]; then
         repair_tmp="$(mktemp /tmp/pool_pending_repair.XXXXXX 2>/dev/null || echo /tmp/pool_pending_repair.$$)"
@@ -763,6 +770,7 @@ monitor_proxy() {
 
 stop_pool_server_for_disk_pressure() {
     [ "${POOL_STOP_ON_DISK_EMERGENCY}" = "1" ] || return 0
+    local reason="${1:-disk pressure}"
     local now pids
     now=$(date +%s)
     if [ $((now - LAST_POOL_STOP_TS)) -lt "${POOL_STOP_COOLDOWN_S}" ]; then
@@ -777,7 +785,7 @@ stop_pool_server_for_disk_pressure() {
         return 0
     fi
 
-    log "DISK: protective stop of pool_server due to persistent Docker data-root pressure: pid(s) ${pids}"
+    log "DISK: protective stop of pool_server due to persistent Docker data-root pressure (${reason}): pid(s) ${pids}"
     echo "$pids" | xargs -r kill 2>/dev/null || true
     sleep 5
     echo "$pids" | xargs -r kill -9 2>/dev/null || true
@@ -1020,7 +1028,7 @@ log "  proc emerg: docker_related=${DOCKER_PROC_EMERGENCY} shim=${SHIM_PROC_EMER
 log "  docker_down_shim_relief=${DOCKER_DOWN_SHIM_RELIEF} kill_shims_on_docker_down=${WATCHDOG_KILL_SHIMS_ON_DOCKER_DOWN}"
 log "  Mem  warn=${MEM_WARN_PCT}% emerg=${MEM_EMERGENCY_PCT}%"
 log "  pool=${POOL_HOST}:${POOL_PORT}  pool_server_regex=${POOL_SERVER_NAME_REGEX}"
-log "  pool_pending repair=${POOL_PENDING_CLOSES_REPAIR} warn=${POOL_PENDING_CLOSES_WARN} threshold=${POOL_PENDING_CLOSES_REPAIR_THRESHOLD} stuck_checks=${POOL_PENDING_CLOSES_STUCK_CHECKS} active_max=${POOL_PENDING_CLOSES_ACTIVE_MAX} reap_limit=${POOL_PENDING_CLOSES_REAP_LIMIT} cooldown=${POOL_PENDING_CLOSES_REPAIR_COOLDOWN_S}s cancel_api=${POOL_PENDING_CLOSES_CANCEL_API} cancel_timeout=${POOL_PENDING_CLOSES_CANCEL_TIMEOUT}s"
+log "  pool_pending repair=${POOL_PENDING_CLOSES_REPAIR} warn=${POOL_PENDING_CLOSES_WARN} threshold=${POOL_PENDING_CLOSES_REPAIR_THRESHOLD} stuck_checks=${POOL_PENDING_CLOSES_STUCK_CHECKS} active_max=${POOL_PENDING_CLOSES_ACTIVE_MAX} reap_limit=${POOL_PENDING_CLOSES_REAP_LIMIT} cooldown=${POOL_PENDING_CLOSES_REPAIR_COOLDOWN_S}s cancel_api=${POOL_PENDING_CLOSES_CANCEL_API} cancel_timeout=${POOL_PENDING_CLOSES_CANCEL_TIMEOUT}s kill_when_active=${POOL_PENDING_CLOSES_KILL_CONTAINERS_WHEN_ACTIVE}"
 log "  task_container_regex=${TASK_CONTAINER_REGEX}"
 log "  task_image_regex=${TASK_IMAGE_REGEX}"
 log "  docker_data_root=${DOCKER_DATA_ROOT}  proxy_url=${PROXY_URL}  proxy_env_file=${PROXY_ENV_FILE}"

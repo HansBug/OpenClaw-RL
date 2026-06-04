@@ -35,6 +35,17 @@ def _env_bool(name: str, default: bool) -> bool:
     return raw.strip().lower() not in {"0", "false", "no", "off"}
 
 
+def _env_float(name: str, default: float) -> float:
+    raw = os.getenv(name)
+    if raw is None or raw == "":
+        return default
+    try:
+        return float(raw)
+    except ValueError:
+        logger.warning("Invalid %s=%r; using default %s", name, raw, default)
+        return default
+
+
 def _docker_name_variants(value: str | None) -> set[str]:
     if not value:
         return set()
@@ -178,9 +189,25 @@ def _force_remove_docker_objects(
 
 
 def _stop_terminal_compat(terminal: Terminal, timeout: float) -> None:
-    if "timeout" in inspect.signature(terminal.stop).parameters:
+    try:
+        supports_timeout = "timeout" in inspect.signature(terminal.stop).parameters
+    except (TypeError, ValueError):
+        supports_timeout = False
+
+    if supports_timeout:
         terminal.stop(timeout=timeout)
     else:
+        if _env_bool("TERMINAL_ENV_FAST_CLOSE", False) or _env_bool(
+            "TERMINAL_ENV_SKIP_UNBOUNDED_STOP", False
+        ):
+            logger.warning(
+                "Terminal.stop(timeout=...) is unsupported; skipping unbounded "
+                "Terminal.stop() under fast close."
+            )
+            return
+        logger.warning(
+            "Terminal.stop(timeout=...) is unsupported; retrying with Terminal.stop()."
+        )
         terminal.stop()
 
 
@@ -189,9 +216,19 @@ def _drain_toolkit_sessions(toolkit: Any) -> None:
     if not isinstance(sessions, dict):
         return
     lock = getattr(toolkit, "_session_lock", None)
+    acquired_lock = False
     try:
         if lock is not None:
-            lock.acquire()
+            try:
+                acquired_lock = bool(lock.acquire(blocking=False))
+            except TypeError:
+                acquired_lock = bool(lock.acquire(False))
+            if not acquired_lock:
+                logger.warning(
+                    "Skipping TerminalToolkit session drain because session lock "
+                    "is currently held."
+                )
+                return
         for session in sessions.values():
             proc = session.get("process")
             if proc is not None:
@@ -211,7 +248,7 @@ def _drain_toolkit_sessions(toolkit: Any) -> None:
                     pass
         sessions.clear()
     finally:
-        if lock is not None:
+        if lock is not None and acquired_lock:
             try:
                 lock.release()
             except RuntimeError:
@@ -530,6 +567,7 @@ class TerminalEnv:
 
         cleanup_completed = terminal is None
         cleanup_error = False
+        fast_close = _env_bool("TERMINAL_ENV_FAST_CLOSE", False)
         try:
             if agent_safetybench_env is not None:
                 try:
@@ -548,13 +586,20 @@ class TerminalEnv:
                     )
 
             if toolkit is not None:
-                try:
-                    await asyncio.to_thread(toolkit.cleanup)
-                except Exception:
-                    cleanup_error = True
-                    logger.exception(
-                        "Failed to cleanup terminal toolkit for %s", trial_name
+                if fast_close:
+                    logger.warning(
+                        "Fast close enabled for %s; skipping TerminalToolkit.cleanup "
+                        "and relying on direct Docker cleanup.",
+                        trial_name,
                     )
+                else:
+                    try:
+                        await asyncio.to_thread(toolkit.cleanup)
+                    except Exception:
+                        cleanup_error = True
+                        logger.exception(
+                            "Failed to cleanup terminal toolkit for %s", trial_name
+                        )
                 try:
                     await asyncio.to_thread(_drain_toolkit_sessions, toolkit)
                 except Exception:
@@ -565,8 +610,14 @@ class TerminalEnv:
 
             if terminal is not None and timeouts is not None:
                 try:
+                    close_timeout = timeouts.close_session
+                    if fast_close:
+                        close_timeout = min(
+                            close_timeout,
+                            _env_float("TERMINAL_ENV_FAST_CLOSE_STOP_TIMEOUT", 5.0),
+                        )
                     await asyncio.to_thread(
-                        _stop_terminal_compat, terminal, timeouts.close_session
+                        _stop_terminal_compat, terminal, close_timeout
                     )
                     cleanup_completed = True
                     logger.info("TerminalEnv %s closed", trial_name)
@@ -575,12 +626,16 @@ class TerminalEnv:
                     logger.exception("Failed to stop terminal session during close")
         finally:
             force_always = _env_bool("TERMINAL_ENV_FORCE_DOCKER_CLEANUP_ALWAYS", False)
-            if terminal is not None and (force_always or cleanup_error or not cleanup_completed):
-                reason = (
-                    "always"
-                    if force_always and cleanup_completed and not cleanup_error
-                    else "close_incomplete"
-                )
+            force_needed = (
+                force_always or fast_close or cleanup_error or not cleanup_completed
+            )
+            if terminal is not None and force_needed:
+                if fast_close:
+                    reason = "fast_close"
+                elif force_always and cleanup_completed and not cleanup_error:
+                    reason = "always"
+                else:
+                    reason = "close_incomplete"
                 try:
                     await asyncio.to_thread(
                         _force_remove_docker_objects,

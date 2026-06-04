@@ -65,7 +65,7 @@ WORKER_MAX_DOCKER_INODE_PCT="${WORKER_MAX_DOCKER_INODE_PCT:-80}"
 PREFLIGHT_DISK_CLEANUP="${PREFLIGHT_DISK_CLEANUP:-1}"
 WORKER_MAX_CONCURRENT_BUILDS="${WORKER_MAX_CONCURRENT_BUILDS:-8}"
 WORKER_PRESSURE_GUARD_ENABLED="${WORKER_PRESSURE_GUARD_ENABLED:-1}"
-WORKER_CLOSE_TASK_TIMEOUT="${WORKER_CLOSE_TASK_TIMEOUT:-90}"
+WORKER_CLOSE_TASK_TIMEOUT="${WORKER_CLOSE_TASK_TIMEOUT:-45}"
 WORKER_PIDS_PAUSE_ALLOCATE_PCT="${WORKER_PIDS_PAUSE_ALLOCATE_PCT:-75}"
 WORKER_PIDS_REJECT_RESET_PCT="${WORKER_PIDS_REJECT_RESET_PCT:-85}"
 WORKER_SHIM_PAUSE_ALLOCATE="${WORKER_SHIM_PAUSE_ALLOCATE:-256}"
@@ -76,14 +76,20 @@ WORKER_DOCKER_CLI_TIMEOUT="${WORKER_DOCKER_CLI_TIMEOUT:-3}"
 WORKER_PRESSURE_CACHE_TTL="${WORKER_PRESSURE_CACHE_TTL:-5}"
 TERMINAL_ENV_FORCE_DOCKER_CLEANUP="${TERMINAL_ENV_FORCE_DOCKER_CLEANUP:-1}"
 TERMINAL_ENV_FORCE_DOCKER_CLEANUP_BROAD="${TERMINAL_ENV_FORCE_DOCKER_CLEANUP_BROAD:-1}"
-TERMINAL_ENV_FORCE_DOCKER_CLEANUP_ALWAYS="${TERMINAL_ENV_FORCE_DOCKER_CLEANUP_ALWAYS:-0}"
+TERMINAL_ENV_FORCE_DOCKER_CLEANUP_ALWAYS="${TERMINAL_ENV_FORCE_DOCKER_CLEANUP_ALWAYS:-1}"
 TERMINAL_ENV_FORCE_DOCKER_CLEANUP_TIMEOUT="${TERMINAL_ENV_FORCE_DOCKER_CLEANUP_TIMEOUT:-20}"
+TERMINAL_ENV_FAST_CLOSE="${TERMINAL_ENV_FAST_CLOSE:-1}"
+TERMINAL_ENV_SKIP_UNBOUNDED_STOP="${TERMINAL_ENV_SKIP_UNBOUNDED_STOP:-1}"
+TERMINAL_ENV_FAST_CLOSE_STOP_TIMEOUT="${TERMINAL_ENV_FAST_CLOSE_STOP_TIMEOUT:-5}"
 WORKER_REPAIR_PENDING_CLOSES="${WORKER_REPAIR_PENDING_CLOSES:-1}"
 WORKER_REPAIR_PENDING_CLOSES_MAX_ACTIVE_RUNS="${WORKER_REPAIR_PENDING_CLOSES_MAX_ACTIVE_RUNS:-64}"
 WORKER_REPAIR_PENDING_CLOSES_CANCEL_TIMEOUT="${WORKER_REPAIR_PENDING_CLOSES_CANCEL_TIMEOUT:-5}"
-WORKER_REPAIR_PENDING_CLOSES_MIN_AGE="${WORKER_REPAIR_PENDING_CLOSES_MIN_AGE:-90}"
+WORKER_REPAIR_PENDING_CLOSES_MIN_AGE="${WORKER_REPAIR_PENDING_CLOSES_MIN_AGE:-45}"
 WORKER_DOCKER_BUILD_DEDUP="${WORKER_DOCKER_BUILD_DEDUP:-1}"
 WORKER_DOCKER_BUILD_SKIP_EXISTING="${WORKER_DOCKER_BUILD_SKIP_EXISTING:-1}"
+CPU_POOL_LOG_MAX_BYTES="${CPU_POOL_LOG_MAX_BYTES:-209715200}"
+CPU_POOL_LOG_TAIL_BYTES="${CPU_POOL_LOG_TAIL_BYTES:-52428800}"
+CPU_ERR_SCAN_LINES="${CPU_ERR_SCAN_LINES:-5000}"
 
 log "=== pool_server_pu_v2 starting ==="
 log "  max_tasks=${WORKER_MAX_TASKS}  max_runs_per_task=${WORKER_MAX_RUNS_PER_TASK}"
@@ -97,6 +103,7 @@ log "  docker_data_root=${DOCKER_DATA_ROOT} disk_guard=${WORKER_DISK_GUARD_ENABL
 log "  pressure_guard=${WORKER_PRESSURE_GUARD_ENABLED} pids_pause=${WORKER_PIDS_PAUSE_ALLOCATE_PCT}% pids_reset=${WORKER_PIDS_REJECT_RESET_PCT}%"
 log "  pressure_guard shim_pause=${WORKER_SHIM_PAUSE_ALLOCATE} shim_reset=${WORKER_SHIM_REJECT_RESET} pending_pause=${WORKER_PENDING_CLOSES_PAUSE_ALLOCATE} pending_reset=${WORKER_PENDING_CLOSES_REJECT_RESET}"
 log "  force_cleanup=${TERMINAL_ENV_FORCE_DOCKER_CLEANUP} broad=${TERMINAL_ENV_FORCE_DOCKER_CLEANUP_BROAD} always=${TERMINAL_ENV_FORCE_DOCKER_CLEANUP_ALWAYS} timeout=${TERMINAL_ENV_FORCE_DOCKER_CLEANUP_TIMEOUT}s"
+log "  fast_close=${TERMINAL_ENV_FAST_CLOSE} skip_unbounded_stop=${TERMINAL_ENV_SKIP_UNBOUNDED_STOP} stop_timeout=${TERMINAL_ENV_FAST_CLOSE_STOP_TIMEOUT}s"
 log "  pending_close_repair=${WORKER_REPAIR_PENDING_CLOSES} max_active=${WORKER_REPAIR_PENDING_CLOSES_MAX_ACTIVE_RUNS} cancel_timeout=${WORKER_REPAIR_PENDING_CLOSES_CANCEL_TIMEOUT}s min_age=${WORKER_REPAIR_PENDING_CLOSES_MIN_AGE}s"
 log "  docker_build_dedup=${WORKER_DOCKER_BUILD_DEDUP} skip_existing=${WORKER_DOCKER_BUILD_SKIP_EXISTING}"
 
@@ -116,6 +123,25 @@ CPU_ERR_LOG="${TMP_DOC_LATEST}/cpu_err.log"
 
 log "  full log: ${CPU_POOL_LOG}"
 log "  err log:  ${CPU_ERR_LOG}"
+
+rotate_file_in_place() {
+    local file="$1"
+    local max_bytes="$2"
+    local tail_bytes="$3"
+    local size tmp
+    [ -f "${file}" ] || return 0
+    size=$(stat -c%s "${file}" 2>/dev/null || echo 0)
+    [ -n "${size}" ] && [ "${size}" -ge 0 ] 2>/dev/null || size=0
+    [ "${size}" -gt "${max_bytes}" ] || return 0
+    tmp="$(mktemp "${TMP_DOC_LATEST}/rotate.XXXXXX")"
+    tail -c "${tail_bytes}" "${file}" > "${tmp}" 2>/dev/null || true
+    : > "${file}"
+    cat "${tmp}" >> "${file}" 2>/dev/null || true
+    rm -f "${tmp}" 2>/dev/null || true
+    log "  rotated ${file}: kept last ${tail_bytes} bytes from ${size} bytes"
+}
+
+rotate_file_in_place "${CPU_POOL_LOG}" "${CPU_POOL_LOG_MAX_BYTES}" "${CPU_POOL_LOG_TAIL_BYTES}"
 
 docker_disk_snapshot() {
     df -P -BG "${DOCKER_DATA_ROOT}" 2>/dev/null | awk 'NR==2 {gsub("%","",$5); gsub("G","",$4); print $5, $4}'
@@ -314,8 +340,8 @@ log ""
 (
   while true; do
     sleep 30
-    grep -E "Error|Exception|Traceback|500|502|PermissionError|docker|FAILED|Connection|SLOTS_EXHAUSTED|Too many open files|address pools" \
-         "${CPU_POOL_LOG}" 2>/dev/null \
+    tail -n "${CPU_ERR_SCAN_LINES}" "${CPU_POOL_LOG}" 2>/dev/null \
+      | grep -E "Error|Exception|Traceback|500|502|PermissionError|docker|FAILED|Connection|SLOTS_EXHAUSTED|Too many open files|address pools|pending_closes" \
       | grep -v "DeprecationWarning" \
       | tail -n 300 \
       > "${CPU_ERR_LOG}" 2>/dev/null || true
@@ -326,8 +352,8 @@ ERR_FILTER_PID=$!
 cleanup() {
   kill "${ERR_FILTER_PID}" 2>/dev/null || true
   # Final snapshot
-  grep -E "Error|Exception|Traceback|500|502|PermissionError|docker|FAILED|Connection|SLOTS_EXHAUSTED|Too many open files|address pools" \
-       "${CPU_POOL_LOG}" 2>/dev/null \
+  tail -n "${CPU_ERR_SCAN_LINES}" "${CPU_POOL_LOG}" 2>/dev/null \
+    | grep -E "Error|Exception|Traceback|500|502|PermissionError|docker|FAILED|Connection|SLOTS_EXHAUSTED|Too many open files|address pools|pending_closes" \
     | grep -v "DeprecationWarning" \
     | tail -n 300 \
     > "${CPU_ERR_LOG}" 2>/dev/null || true
@@ -380,6 +406,9 @@ export TERMINAL_ENV_FORCE_DOCKER_CLEANUP
 export TERMINAL_ENV_FORCE_DOCKER_CLEANUP_BROAD
 export TERMINAL_ENV_FORCE_DOCKER_CLEANUP_ALWAYS
 export TERMINAL_ENV_FORCE_DOCKER_CLEANUP_TIMEOUT
+export TERMINAL_ENV_FAST_CLOSE
+export TERMINAL_ENV_SKIP_UNBOUNDED_STOP
+export TERMINAL_ENV_FAST_CLOSE_STOP_TIMEOUT
 export WORKER_REPAIR_PENDING_CLOSES
 export WORKER_REPAIR_PENDING_CLOSES_MAX_ACTIVE_RUNS
 export WORKER_REPAIR_PENDING_CLOSES_CANCEL_TIMEOUT

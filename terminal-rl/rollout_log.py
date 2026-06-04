@@ -31,6 +31,19 @@ _REWARD_COMPONENT_KEYS = (
     "explore_lprnd_raw",
     "explore_lprnd_effective_coef",
     "explore_lprnd_schedule_multiplier",
+    "explore_agent57_enabled",
+    "explore_agent57_arm_id",
+    "explore_agent57_k",
+    "explore_agent57_beta",
+    "explore_agent57_lifelong_enabled",
+    "explore_agent57_lifelong_coef",
+    "explore_agent57_lifelong_clip",
+    "explore_agent57_lifelong_raw",
+    "explore_agent57_lifelong_bonus",
+    "explore_agent57_lifelong_unique_keys",
+    "explore_agent57_lifelong_seen_before",
+    "explore_agent57_lifelong_warmup_remaining",
+    "explore_agent57_lifelong_eligible",
     "explore_cde_actor_bonus",
     "explore_cde_actor_log_ppl",
     "explore_cde_actor_eligible",
@@ -77,7 +90,7 @@ _REWARD_DETAIL_NUMERIC_KEYS = (
 )
 _STRUCTURED_LOG_PREFIX = "TERMINAL_RL_METRIC_JSON"
 _STRUCTURED_SCHEMA = "terminal_rl.per_dataset_metrics.v1"
-_STRUCTURED_SCHEMA_VERSION = 3
+_STRUCTURED_SCHEMA_VERSION = 4
 _LAST_EVAL_BY_DATASET: dict[str, dict[str, Any]] = {}
 
 
@@ -400,6 +413,210 @@ def _add_turn_uncertainty_metrics(
     return out
 
 
+def _reward_flag(sample: Sample, key: str) -> bool | None:
+    value = _reward_raw(sample, key)
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)) and math.isfinite(float(value)):
+        return bool(value)
+    if isinstance(value, str):
+        lowered = value.strip().lower()
+        if lowered in {"1", "true", "yes", "on"}:
+            return True
+        if lowered in {"0", "false", "no", "off"}:
+            return False
+    return None
+
+
+def _agent57_samples(samples: List[Sample]) -> List[Sample]:
+    source = [s for s in samples if not getattr(s, "remove_sample", False)] or samples
+    out: list[Sample] = []
+    for sample in source:
+        if any(
+            _reward_raw(sample, key) is not None
+            for key in (
+                "explore_agent57_enabled",
+                "explore_agent57_lifelong_enabled",
+                "explore_agent57_arm_id",
+                "explore_agent57_lifelong_bonus",
+            )
+        ):
+            out.append(sample)
+    return out
+
+
+def _agent57_summary(samples: List[Sample]) -> dict[str, Any]:
+    source = [s for s in samples if not getattr(s, "remove_sample", False)] or samples
+    agent_samples = _agent57_samples(source)
+    if not agent_samples:
+        return {}
+
+    arm_counts: dict[int, int] = defaultdict(int)
+    suppressed_counts: dict[str, int] = defaultdict(int)
+    state_error_count = 0
+    active_count = 0
+    lifelong_enabled_count = 0
+    for sample in agent_samples:
+        arm = _reward_value(sample, "explore_agent57_arm_id")
+        if arm is not None:
+            arm_counts[int(arm)] += 1
+        enabled = _reward_flag(sample, "explore_agent57_enabled")
+        lifelong_enabled = _reward_flag(sample, "explore_agent57_lifelong_enabled")
+        if enabled or lifelong_enabled or arm is not None:
+            active_count += 1
+        if lifelong_enabled:
+            lifelong_enabled_count += 1
+        reason_raw = _reward_raw(sample, "explore_agent57_lifelong_suppressed_reason")
+        reason = str(reason_raw or "").strip()
+        if reason:
+            reason_key = _sanitize_metric_part(reason)
+            suppressed_counts[reason_key] += 1
+            if reason.startswith("state_error:"):
+                state_error_count += 1
+
+    def mean(key: str) -> float | None:
+        return _stats_mean(
+            _stats([v for v in (_reward_value(s, key) for s in agent_samples) if v is not None])
+        )
+
+    count = len(agent_samples)
+    top_arm: int | None = None
+    top_arm_ratio: float | None = None
+    if arm_counts:
+        top_arm, top_arm_count = max(arm_counts.items(), key=lambda item: item[1])
+        top_arm_ratio = top_arm_count / count if count else None
+
+    top_reason: str | None = None
+    top_reason_ratio: float | None = None
+    if suppressed_counts:
+        top_reason, top_reason_count = max(
+            suppressed_counts.items(), key=lambda item: item[1]
+        )
+        top_reason_ratio = top_reason_count / count if count else None
+
+    eligible_values = [
+        v for v in (
+            _reward_value(s, "explore_agent57_lifelong_eligible")
+            for s in agent_samples
+        )
+        if v is not None
+    ]
+    eligible_rate = (
+        sum(1 for value in eligible_values if value > 0.0) / len(eligible_values)
+        if eligible_values
+        else None
+    )
+
+    return {
+        "agent57/active": active_count / count if count else None,
+        "agent57/lifelong_enabled": (
+            lifelong_enabled_count / count if count else None
+        ),
+        "agent57/lifelong_bonus": mean("explore_agent57_lifelong_bonus"),
+        "agent57/lifelong_raw": mean("explore_agent57_lifelong_raw"),
+        "agent57/lifelong_unique_keys": mean(
+            "explore_agent57_lifelong_unique_keys"
+        ),
+        "agent57/lifelong_seen_before": mean(
+            "explore_agent57_lifelong_seen_before"
+        ),
+        "agent57/lifelong_warmup_remaining": mean(
+            "explore_agent57_lifelong_warmup_remaining"
+        ),
+        "agent57/lifelong_eligible_rate": eligible_rate,
+        "agent57/lifelong_state_error_rate": (
+            state_error_count / count if count else None
+        ),
+        "agent57/arm_count": len(arm_counts) if arm_counts else None,
+        "agent57/top_arm": float(top_arm) if top_arm is not None else None,
+        "agent57/top_arm_ratio": top_arm_ratio,
+        "agent57/top_suppressed_reason": top_reason,
+        "agent57/top_suppressed_ratio": top_reason_ratio,
+    }
+
+
+def _add_agent57_debug_metrics(
+    log_dict: Dict[str, Any],
+    prefix: str,
+    samples: List[Sample],
+) -> dict[str, Any]:
+    agent_samples = _agent57_samples(samples)
+    summary = _agent57_summary(agent_samples)
+    if not agent_samples:
+        return summary
+
+    total = len(agent_samples)
+    log_dict[f"{prefix}/explore/agent57/sample_count"] = total
+    for record_key, metric_name in (
+        ("agent57/active", "active_rate"),
+        ("agent57/lifelong_enabled", "lifelong_enabled_rate"),
+        ("agent57/lifelong_eligible_rate", "lifelong_eligible_rate"),
+        ("agent57/lifelong_state_error_rate", "lifelong_state_error_rate"),
+        ("agent57/arm_count", "arm_count"),
+        ("agent57/top_arm", "top_arm"),
+        ("agent57/top_arm_ratio", "top_arm_ratio"),
+        ("agent57/top_suppressed_ratio", "top_suppressed_ratio"),
+    ):
+        value = summary.get(record_key)
+        if value is not None:
+            log_dict[f"{prefix}/explore/agent57/{metric_name}"] = value
+
+    for reward_key, metric_name in (
+        ("explore_agent57_beta", "beta"),
+        ("explore_agent57_lifelong_raw", "lifelong_raw"),
+        ("explore_agent57_lifelong_bonus", "lifelong_bonus"),
+        ("explore_agent57_lifelong_unique_keys", "lifelong_unique_keys"),
+        ("explore_agent57_lifelong_seen_before", "lifelong_seen_before"),
+        ("explore_agent57_lifelong_warmup_remaining", "lifelong_warmup_remaining"),
+    ):
+        values = [
+            v for v in (_reward_value(s, reward_key) for s in agent_samples)
+            if v is not None
+        ]
+        if values:
+            _add_stats(log_dict, f"{prefix}/explore/agent57/{metric_name}", values)
+
+    suppressed_counts: dict[str, int] = defaultdict(int)
+    by_arm: dict[int, list[Sample]] = defaultdict(list)
+    for sample in agent_samples:
+        reason = str(
+            _reward_raw(sample, "explore_agent57_lifelong_suppressed_reason") or ""
+        ).strip()
+        if reason:
+            suppressed_counts[_sanitize_metric_part(reason)] += 1
+        arm = _reward_value(sample, "explore_agent57_arm_id")
+        if arm is not None:
+            by_arm[int(arm)].append(sample)
+
+    for reason, count in sorted(suppressed_counts.items()):
+        log_dict[f"{prefix}/explore/agent57/suppressed/{reason}"] = count
+        log_dict[f"{prefix}/explore/agent57/suppressed_ratio/{reason}"] = (
+            count / total if total else 0.0
+        )
+
+    for arm_id, arm_samples in sorted(by_arm.items()):
+        arm_prefix = f"{prefix}/explore/agent57/arm_{arm_id}"
+        arm_count = len(arm_samples)
+        log_dict[f"{arm_prefix}/sample_count"] = arm_count
+        log_dict[f"{arm_prefix}/sample_ratio"] = arm_count / total if total else 0.0
+        for reward_key, metric_name in (
+            ("score", "reward"),
+            ("explore_base_score_before_bonus", "base_reward"),
+            ("explore_agent57_beta", "beta"),
+            ("explore_agent57_lifelong_raw", "lifelong_raw"),
+            ("explore_agent57_lifelong_bonus", "lifelong_bonus"),
+            ("explore_agent57_lifelong_eligible", "lifelong_eligible"),
+        ):
+            values = [
+                v for v in (_reward_value(s, reward_key) for s in arm_samples)
+                if v is not None
+            ]
+            if values:
+                _add_stats(log_dict, f"{arm_prefix}/{metric_name}", values)
+
+    return summary
+
+
 def _add_exploration_debug_metrics(
     log_dict: Dict[str, Any],
     prefix: str,
@@ -428,6 +645,13 @@ def _add_exploration_debug_metrics(
         "explore_parse_error_count",
         "explore_cde_actor_log_ppl",
         "explore_lprnd_raw",
+        "explore_agent57_beta",
+        "explore_agent57_lifelong_raw",
+        "explore_agent57_lifelong_bonus",
+        "explore_agent57_lifelong_unique_keys",
+        "explore_agent57_lifelong_seen_before",
+        "explore_agent57_lifelong_warmup_remaining",
+        "explore_agent57_lifelong_eligible",
     )
     for key in numeric_keys:
         values = [v for v in (_reward_value(s, key) for s in source) if v is not None]
@@ -466,6 +690,7 @@ def _add_exploration_debug_metrics(
             log_dict[f"{prefix}/explore/mood/{mood}"] = count
             log_dict[f"{prefix}/explore/mood_ratio/{mood}"] = count / total if total else 0.0
 
+    summary.update(_add_agent57_debug_metrics(log_dict, prefix, source))
     return summary
 
 
@@ -630,6 +855,7 @@ def _metric_record_from_samples(
     low_progress_fraction = _trajectory_uncertainty_mean(
         samples, "low_progress_fraction"
     )
+    agent57_fields = _agent57_summary(reward_source)
 
     # Exploration reward is additive reward shaping produced in generate.py:
     # count/signature novelty, optional LP-RND logprob surprise, optional CDE
@@ -682,6 +908,7 @@ def _metric_record_from_samples(
         "turn_uncertainty/mean_abs_score_delta": turn_score_delta_mean,
         "turn_uncertainty/low_progress_fraction": low_progress_fraction,
         "rollout_time_sec": rollout_time,
+        **agent57_fields,
     }
 
 
@@ -814,6 +1041,19 @@ def _add_per_dataset_log_dict(log_dict: Dict[str, Any], records: list[dict[str, 
             "turn_uncertainty/mean_score",
             "turn_uncertainty/mean_abs_score_delta",
             "turn_uncertainty/low_progress_fraction",
+            "agent57/active",
+            "agent57/lifelong_enabled",
+            "agent57/lifelong_bonus",
+            "agent57/lifelong_raw",
+            "agent57/lifelong_unique_keys",
+            "agent57/lifelong_seen_before",
+            "agent57/lifelong_warmup_remaining",
+            "agent57/lifelong_eligible_rate",
+            "agent57/lifelong_state_error_rate",
+            "agent57/arm_count",
+            "agent57/top_arm",
+            "agent57/top_arm_ratio",
+            "agent57/top_suppressed_ratio",
         ):
             value = record.get(key)
             if value is not None:
@@ -834,10 +1074,10 @@ def _format_per_dataset_table(
     epoch = records[0].get("epoch")
     title = f"========== step {step} | epoch {epoch if epoch is not None else '-'} | phase: {phase} | run: {run} =========="
     header = (
-        "dataset          | reward/total | reward/task | reward/explore | test_acc | "
+        "dataset          | reward/total | reward/task | reward/explore | a57_life | a57_elg | test_acc | "
         "resp_len | kl     | entropy"
     )
-    sep = "-----------------+--------------+-------------+----------------+----------+----------+--------+--------"
+    sep = "-----------------+--------------+-------------+----------------+----------+---------+----------+----------+--------+--------"
     body = []
     for record in records:
         body.append(
@@ -845,6 +1085,8 @@ def _format_per_dataset_table(
             f"{_format_float(record.get('reward/total'), width=12)} | "
             f"{_format_float(record.get('reward/task'), width=11)} | "
             f"{_format_float(record.get('reward/exploration'), width=14)} | "
+            f"{_format_float(record.get('agent57/lifelong_bonus'), width=8)} | "
+            f"{_format_float(record.get('agent57/lifelong_eligible_rate'), width=7)} | "
             f"{_format_float(record.get('test_acc'), width=8)} | "
             f"{_format_float(record.get('response_length'), width=8)} | "
             f"{_format_float(record.get('kl'), width=6)} | "
@@ -1093,6 +1335,7 @@ def _dataset_metrics(
                 "safety_score",
                 "explore_total_bonus",
                 "explore_intrinsic_scaled",
+                "explore_agent57_lifelong_bonus",
                 "explore_safety_penalty",
             ):
                 values = [
@@ -1178,6 +1421,9 @@ def _dataset_metrics(
                     "explore_intrinsic_scaled_mean": _stats_mean(
                         split_component_stats.get("explore_intrinsic_scaled")
                     ),
+                    "explore_agent57_lifelong_bonus_mean": _stats_mean(
+                        split_component_stats.get("explore_agent57_lifelong_bonus")
+                    ),
                     "explore_safety_penalty_mean": _stats_mean(
                         split_component_stats.get("explore_safety_penalty")
                     ),
@@ -1214,6 +1460,27 @@ def _dataset_metrics(
                     component_stats.get("explore_safety_penalty")
                 ),
                 "explore_lprnd_mean": _stats_mean(component_stats.get("explore_lprnd")),
+                "explore_agent57_lifelong_bonus_mean": _stats_mean(
+                    component_stats.get("explore_agent57_lifelong_bonus")
+                ),
+                "explore_agent57_lifelong_raw_mean": _stats_mean(
+                    component_stats.get("explore_agent57_lifelong_raw")
+                ),
+                "agent57_lifelong_eligible_rate": explore_summary.get(
+                    "agent57/lifelong_eligible_rate"
+                ),
+                "agent57_lifelong_state_error_rate": explore_summary.get(
+                    "agent57/lifelong_state_error_rate"
+                ),
+                "agent57_arm_count": explore_summary.get("agent57/arm_count"),
+                "agent57_top_arm": explore_summary.get("agent57/top_arm"),
+                "agent57_top_arm_ratio": explore_summary.get("agent57/top_arm_ratio"),
+                "agent57_top_suppressed_reason": explore_summary.get(
+                    "agent57/top_suppressed_reason"
+                ),
+                "agent57_top_suppressed_ratio": explore_summary.get(
+                    "agent57/top_suppressed_ratio"
+                ),
                 "explore_cde_actor_bonus_mean": _stats_mean(
                     component_stats.get("explore_cde_actor_bonus")
                 ),
@@ -1266,7 +1533,7 @@ def _format_reward_breakdown_table(rows: List[dict[str, Any]]) -> str:
         return ""
     header = (
         "dataset                 n train final_reward test_acc raw_score base_reward "
-        "safety explore_reward intrinsic safepen   cde lprnd"
+        "safety explore_reward intrinsic safepen   a57   cde lprnd"
     )
     line = "-" * len(header)
     body = []
@@ -1283,8 +1550,56 @@ def _format_reward_breakdown_table(rows: List[dict[str, Any]]) -> str:
             f"{_format_float(row.get('exploration_reward_mean'), width=14)} "
             f"{_format_float(row.get('explore_intrinsic_scaled_mean'), width=9)} "
             f"{_format_float(row.get('explore_safety_penalty_mean'), width=7)} "
+            f"{_format_float(row.get('explore_agent57_lifelong_bonus_mean'), width=5)} "
             f"{_format_float(row.get('explore_cde_actor_bonus_mean'), width=5)} "
             f"{_format_float(row.get('explore_lprnd_mean'), width=5)}"
+        )
+    return "\n".join([header, line, *body])
+
+
+def _format_agent57_table(rows: List[dict[str, Any]]) -> str:
+    agent_rows = [
+        row for row in rows
+        if row.get("explore_agent57_lifelong_bonus_mean") is not None
+        or row.get("agent57_arm_count") is not None
+    ]
+    if not agent_rows:
+        return ""
+    header = (
+        "dataset                 n arms top_arm a57_raw a57_bonus eligible stateerr suppressed"
+    )
+    line = "-" * len(header)
+    body = []
+    for row in agent_rows:
+        suppressed = str(row.get("agent57_top_suppressed_reason") or "-")
+        suppressed_ratio = _to_float(row.get("agent57_top_suppressed_ratio"))
+        if suppressed != "-" and suppressed_ratio is not None:
+            suppressed = f"{suppressed[:18]}:{suppressed_ratio:.0%}"
+        top_arm = row.get("agent57_top_arm")
+        top_arm_ratio = _to_float(row.get("agent57_top_arm_ratio"))
+        top_arm_text = "-"
+        if top_arm is not None:
+            try:
+                top_arm_text = str(int(float(top_arm)))
+            except (TypeError, ValueError):
+                top_arm_text = str(top_arm)
+            if top_arm_ratio is not None:
+                top_arm_text = f"{top_arm_text}:{top_arm_ratio:.0%}"
+        arm_count = row.get("agent57_arm_count")
+        try:
+            arm_count_text = str(int(float(arm_count))) if arm_count is not None else "-"
+        except (TypeError, ValueError):
+            arm_count_text = str(arm_count)
+        body.append(
+            f"{str(row['dataset'])[:22]:22} "
+            f"{int(row['count']):4d} "
+            f"{arm_count_text[:4]:4} "
+            f"{top_arm_text[:7]:7} "
+            f"{_format_float(row.get('explore_agent57_lifelong_raw_mean'), width=7)} "
+            f"{_format_float(row.get('explore_agent57_lifelong_bonus_mean'), width=9)} "
+            f"{_format_float(row.get('agent57_lifelong_eligible_rate'), width=8)} "
+            f"{_format_float(row.get('agent57_lifelong_state_error_rate'), width=8)} "
+            f"{suppressed}"
         )
     return "\n".join([header, line, *body])
 
@@ -1433,6 +1748,9 @@ def rollout_log(rollout_id, args, samples, rollout_extra_metrics, rollout_time):
             step,
             reward_table,
         )
+    agent57_table = _format_agent57_table(dataset_rows)
+    if agent57_table:
+        logger.info("agent57 diagnostics rollout=%s step=%s\n%s", rollout_id, step, agent57_table)
     split_table = _format_split_table(split_rows)
     if split_table:
         logger.info("dataset split metrics rollout=%s step=%s\n%s", rollout_id, step, split_table)
