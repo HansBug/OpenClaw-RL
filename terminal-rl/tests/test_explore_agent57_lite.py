@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import sys
+import sqlite3
 from pathlib import Path
 
 TERMINAL_RL_DIR = Path(__file__).resolve().parents[1]
@@ -222,3 +223,50 @@ def test_lifelong_key_v2_task_bucket_is_opt_in(monkeypatch):
         metadata={"data_source": "seta", "task_path": "seta_env/2"},
     )
     assert task_a_key != task_b_key
+
+
+def test_sqlite_arm_event_schema_migration(tmp_path, monkeypatch):
+    db_path = tmp_path / "agent57.sqlite3"
+    conn = sqlite3.connect(db_path)
+    try:
+        conn.execute(
+            "CREATE TABLE arm_events "
+            "(id INTEGER PRIMARY KEY AUTOINCREMENT, ts REAL NOT NULL, "
+            "arm_id INTEGER NOT NULL, base_score REAL NOT NULL, "
+            "final_score REAL NOT NULL, success INTEGER NOT NULL, "
+            "parse_error INTEGER NOT NULL, truncated INTEGER NOT NULL, "
+            "bonus REAL NOT NULL)"
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    monkeypatch.setenv("EXPLORE_AGENT57_LITE", "1")
+    monkeypatch.setenv("EXPLORE_AGENT57_CONTROLLER", "ucb")
+    monkeypatch.setenv("EXPLORE_AGENT57_LIFELONG_BACKEND", "sqlite")
+    monkeypatch.setenv("EXPLORE_AGENT57_STATE_PATH", str(db_path))
+    a57._SQLITE_SCHEMA_INITIALIZED.discard(str(db_path))
+    config = a57.config_from_env()
+
+    a57.record_arm_event(
+        config=config,
+        arm_id=1,
+        base_score=1.0,
+        final_score=1.0,
+        status="completed",
+        parse_error_count=0,
+        bonus=0.0,
+        dataset="seta",
+    )
+
+    conn = sqlite3.connect(db_path)
+    try:
+        columns = {row[1] for row in conn.execute("PRAGMA table_info(arm_events)")}
+        row = conn.execute(
+            "SELECT dataset, normalized_base_score FROM arm_events ORDER BY id DESC LIMIT 1"
+        ).fetchone()
+    finally:
+        conn.close()
+
+    assert {"dataset", "normalized_base_score"}.issubset(columns)
+    assert row == ("seta", 1.0)

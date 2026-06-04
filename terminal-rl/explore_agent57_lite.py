@@ -204,7 +204,7 @@ def config_from_env() -> Agent57LiteConfig:
 _LOCAL_LOCK = threading.Lock()
 _LOCAL_COUNTS: dict[str, int] = {}
 _LOCAL_TRAJ_SEEN = 0
-_LOCAL_ARM_EVENTS: list[dict[str, float]] = []
+_LOCAL_ARM_EVENTS: list[dict[str, Any]] = []
 _SQLITE_SCHEMA_LOCK = threading.Lock()
 _SQLITE_SCHEMA_INITIALIZED: set[str] = set()
 
@@ -219,6 +219,17 @@ def _normalize_dataset(value: Any) -> str:
     if text in {"agent_harm", "ah"}:
         return "agentharm"
     return text or "unknown"
+
+
+def _ensure_column(conn: sqlite3.Connection, table: str, name: str, ddl: str) -> None:
+    columns = {str(row[1]) for row in conn.execute(f"PRAGMA table_info({table})")}
+    if name in columns:
+        return
+    try:
+        conn.execute(f"ALTER TABLE {table} ADD COLUMN {ddl}")
+    except sqlite3.OperationalError as exc:
+        if "duplicate column name" not in str(exc).lower():
+            raise
 
 
 def _connect(path: str) -> sqlite3.Connection:
@@ -246,20 +257,18 @@ def _connect(path: str) -> sqlite3.Connection:
                     "parse_error INTEGER NOT NULL, truncated INTEGER NOT NULL, "
                     "bonus REAL NOT NULL)"
                 )
-                columns = {
-                    str(row[1])
-                    for row in conn.execute("PRAGMA table_info(arm_events)").fetchall()
-                }
-                if "dataset" not in columns:
-                    conn.execute(
-                        "ALTER TABLE arm_events "
-                        "ADD COLUMN dataset TEXT NOT NULL DEFAULT ''"
-                    )
-                if "normalized_base_score" not in columns:
-                    conn.execute(
-                        "ALTER TABLE arm_events "
-                        "ADD COLUMN normalized_base_score REAL NOT NULL DEFAULT 0.0"
-                    )
+                _ensure_column(
+                    conn,
+                    "arm_events",
+                    "dataset",
+                    "dataset TEXT NOT NULL DEFAULT ''",
+                )
+                _ensure_column(
+                    conn,
+                    "arm_events",
+                    "normalized_base_score",
+                    "normalized_base_score REAL NOT NULL DEFAULT 0.0",
+                )
                 _SQLITE_SCHEMA_INITIALIZED.add(path_key)
     return conn
 
@@ -569,9 +578,9 @@ class V2LifelongKeyBuilder(LifelongKeyBuilder):
     ) -> list[str]:
         result_fps = _turn_result_fingerprints(turn_records)
         dataset = _normalize_dataset(
-            _metadata_value(metadata, "data_source")
+            _metadata_value(metadata, "agent57_dataset")
+            or _metadata_value(metadata, "data_source")
             or _metadata_value(metadata, "task_meta", "data_source")
-            or _metadata_value(metadata, "agent57_dataset")
         )
         split = str(
             _metadata_value(metadata, "safety_split")
@@ -823,7 +832,7 @@ def _sqlite_arm_stats(
 
 def _aggregate_arm_stats(
     k: int,
-    events: list[dict[str, float]],
+    events: list[dict[str, Any]],
     *,
     dataset: str | None = None,
 ) -> list[dict[str, float]]:
