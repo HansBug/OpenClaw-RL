@@ -31,6 +31,7 @@ from inference_client import SGLangTurnClient
 from agent_runner import create_agent_runner, normalize_harness_option
 from env_client import TerminalEnvClient
 from explore_agent57_lite import (
+    compute_ngu_lite_bonus as _agent57_compute_ngu_lite_bonus,
     compute_lifelong_bonus as _agent57_compute_lifelong_bonus,
     config_from_env as _agent57_config_from_env,
     record_arm_event as _agent57_record_arm_event,
@@ -295,6 +296,20 @@ def _explore_intrinsic_bonus(turn_records: List[Dict[str, Any]]) -> float:
         else:
             _CMD_COUNTER[key] = _CMD_COUNTER.get(key, 0) + 1
             total += 1.0 / math.sqrt(_CMD_COUNTER[key])
+    return total
+
+
+def _explore_episode_signature_novelty(turn_records: List[Dict[str, Any]]) -> float:
+    """Episode-local signature novelty used by Agent57 NGU-lite product mode."""
+    if not turn_records:
+        return 0.0
+    total = 0.0
+    episode_counter: Dict[str, int] = {}
+    for action in _iter_explore_actions(turn_records):
+        key_src = action["signature"]
+        key = hashlib.md5(key_src.encode()).hexdigest()[:10]
+        episode_counter[key] = episode_counter.get(key, 0) + 1
+        total += 1.0 / math.sqrt(episode_counter[key])
     return total
 
 
@@ -929,14 +944,25 @@ def _exploration_audit_from_reward(reward: Dict[str, Any]) -> Dict[str, Any]:
         "explore_danger_command_count",
         "explore_parse_error_count",
         "explore_intrinsic_scaled",
+        "explore_intrinsic_in_total",
         "explore_lprnd",
         "explore_agent57_enabled",
         "explore_agent57_arm_id",
         "explore_agent57_beta",
+        "explore_agent57_combine_mode",
         "explore_agent57_controller",
         "explore_agent57_lifelong_enabled",
         "explore_agent57_lifelong_raw",
         "explore_agent57_lifelong_bonus",
+        "explore_agent57_lifelong_bonus_unclipped",
+        "explore_agent57_ngu_episodic_source",
+        "explore_agent57_ngu_mod_clip",
+        "explore_agent57_ngu_episodic",
+        "explore_agent57_ngu_life_mod",
+        "explore_agent57_ngu_bonus",
+        "explore_agent57_ngu_bonus_unclipped",
+        "explore_agent57_bonus_unclipped",
+        "explore_agent57_bonus_clipped",
         "explore_agent57_lifelong_eligible",
         "explore_agent57_lifelong_suppressed_reason",
         "explore_cde_actor_bonus",
@@ -1013,6 +1039,7 @@ def _save_rollout_artifacts(
                 "raw_reward", "task_reward", "exploration_reward", "total_reward",
                 "prm_turn_score", "safety_score", "safety_coef",
                 "explore_intrinsic", "explore_intrinsic_scaled",
+                "explore_intrinsic_in_total",
                 "explore_intrinsic_coef", "explore_intrinsic_effective_coef",
                 "explore_intrinsic_schedule", "explore_intrinsic_decay_steps",
                 "explore_intrinsic_schedule_multiplier",
@@ -1024,6 +1051,7 @@ def _save_rollout_artifacts(
                 "explore_agent57_enabled",
                 "explore_agent57_arm_id", "explore_agent57_k",
                 "explore_agent57_beta", "explore_agent57_controller",
+                "explore_agent57_combine_mode", "explore_agent57_max_bonus",
                 "explore_agent57_lifelong_enabled",
                 "explore_agent57_lifelong_backend",
                 "explore_agent57_lifelong_state_path",
@@ -1032,6 +1060,15 @@ def _save_rollout_artifacts(
                 "explore_agent57_lifelong_warmup",
                 "explore_agent57_lifelong_raw",
                 "explore_agent57_lifelong_bonus",
+                "explore_agent57_lifelong_bonus_unclipped",
+                "explore_agent57_ngu_episodic_source",
+                "explore_agent57_ngu_mod_clip",
+                "explore_agent57_ngu_episodic",
+                "explore_agent57_ngu_life_mod",
+                "explore_agent57_ngu_bonus",
+                "explore_agent57_ngu_bonus_unclipped",
+                "explore_agent57_bonus_unclipped",
+                "explore_agent57_bonus_clipped",
                 "explore_agent57_lifelong_unique_keys",
                 "explore_agent57_lifelong_seen_before",
                 "explore_agent57_lifelong_warmup_remaining",
@@ -2422,6 +2459,36 @@ async def generate(
             _agent57_bonus = float(
                 _agent57_metrics.get("explore_agent57_lifelong_bonus", 0.0) or 0.0
             )
+            if (
+                _AGENT57_CONFIG.active
+                and _AGENT57_CONFIG.combine_mode == "ngu_lite"
+            ):
+                _agent57_episodic = (
+                    _intr_bonus
+                    if _AGENT57_CONFIG.ngu_episodic_source == "intrinsic"
+                    else _explore_episode_signature_novelty(turn_records)
+                )
+                _agent57_ngu_metrics = _agent57_compute_ngu_lite_bonus(
+                    config=_AGENT57_CONFIG,
+                    arm_id=_agent57_arm_id,
+                    episodic_novelty=_agent57_episodic,
+                    lifelong_raw=float(
+                        _agent57_metrics.get(
+                            "explore_agent57_lifelong_raw", 0.0
+                        )
+                        or 0.0
+                    ),
+                    lifelong_eligible=bool(
+                        _agent57_metrics.get(
+                            "explore_agent57_lifelong_eligible", 0.0
+                        )
+                    ),
+                )
+                _agent57_metrics.update(_agent57_ngu_metrics)
+                _agent57_bonus = float(
+                    _agent57_ngu_metrics.get("explore_agent57_ngu_bonus", 0.0)
+                    or 0.0
+                )
             _base_score_values = []
             for _sample in samples:
                 if isinstance(_sample.reward, dict) and "score" in _sample.reward:
@@ -2440,8 +2507,16 @@ async def generate(
                 run_ctx.train_step,
             )
             _cde_actor_bonus = _cde_actor["bonus"]
+            _intr_for_total = (
+                0.0
+                if (
+                    _AGENT57_CONFIG.active
+                    and _AGENT57_CONFIG.combine_mode == "ngu_lite"
+                )
+                else _intr_scaled
+            )
             _explore_total = (
-                _intr_scaled
+                _intr_for_total
                 + _safe_penalty
                 + _lprnd_bonus
                 + _agent57_bonus
@@ -2451,7 +2526,7 @@ async def generate(
                 status=status,
                 base_score_mean=_base_score_mean,
                 total_bonus=_explore_total,
-                intrinsic_scaled=_intr_scaled,
+                intrinsic_scaled=_intr_for_total,
                 safety_penalty=_safe_penalty,
                 lprnd_bonus=_lprnd_bonus,
                 agent57_bonus=_agent57_bonus,
@@ -2473,6 +2548,7 @@ async def generate(
                     s.reward["score"] += _explore_total
                     s.reward["explore_intrinsic"] = _intr_bonus
                     s.reward["explore_intrinsic_scaled"] = _intr_scaled
+                    s.reward["explore_intrinsic_in_total"] = _intr_for_total
                     s.reward["explore_intrinsic_coef"] = _EXPLORE_INTRINSIC_COEF
                     s.reward["explore_intrinsic_effective_coef"] = _intr_effective_coef
                     s.reward["explore_intrinsic_schedule"] = _EXPLORE_INTRINSIC_SCHEDULE
@@ -2498,9 +2574,16 @@ async def generate(
                             "k": _AGENT57_CONFIG.k,
                             "beta": _AGENT57_CONFIG.beta_for_arm(_agent57_arm_id),
                             "controller": _AGENT57_CONFIG.controller,
+                            "combine_mode": _AGENT57_CONFIG.combine_mode,
                             "lifelong_enabled": bool(_AGENT57_CONFIG.lifelong_enabled),
                             "lifelong_backend": _AGENT57_CONFIG.lifelong_backend,
-                            "lifelong_bonus": _agent57_bonus,
+                            "bonus": _agent57_bonus,
+                            "lifelong_bonus": _agent57_metrics.get(
+                                "explore_agent57_lifelong_bonus", 0.0
+                            ),
+                            "ngu_bonus": _agent57_metrics.get(
+                                "explore_agent57_ngu_bonus", 0.0
+                            ),
                             "lifelong_raw": _agent57_metrics.get(
                                 "explore_agent57_lifelong_raw", 0.0
                             ),

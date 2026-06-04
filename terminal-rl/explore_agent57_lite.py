@@ -83,6 +83,10 @@ class Agent57LiteConfig:
     enabled: bool
     k: int
     arm_betas: tuple[float, ...]
+    combine_mode: str
+    ngu_mod_clip: float
+    ngu_episodic_source: str
+    max_bonus: float
     controller: str
     ucb_c: float
     ucb_window: int
@@ -130,10 +134,24 @@ def config_from_env() -> Agent57LiteConfig:
     if backend not in {"local", "sqlite"}:
         backend = "local"
     betas = _parse_betas(os.getenv("EXPLORE_AGENT57_ARM_BETAS", ""), k)
+    combine_mode = os.getenv("EXPLORE_AGENT57_COMBINE_MODE", "add").strip().lower()
+    if combine_mode not in {"add", "ngu_lite"}:
+        combine_mode = "add"
+    ngu_episodic_source = (
+        os.getenv("EXPLORE_AGENT57_NGU_EPISODIC_SOURCE", "signature_intrinsic")
+        .strip()
+        .lower()
+    )
+    if ngu_episodic_source not in {"signature_intrinsic", "intrinsic"}:
+        ngu_episodic_source = "signature_intrinsic"
     return Agent57LiteConfig(
         enabled=enabled,
         k=k,
         arm_betas=tuple(betas),
+        combine_mode=combine_mode,
+        ngu_mod_clip=max(1.0, _env_float("EXPLORE_AGENT57_NGU_MOD_CLIP", 5.0)),
+        ngu_episodic_source=ngu_episodic_source,
+        max_bonus=max(0.0, _env_float("EXPLORE_AGENT57_MAX_BONUS", 0.0)),
         controller=controller,
         ucb_c=max(0.0, _env_float("EXPLORE_AGENT57_UCB_C", 0.5)),
         ucb_window=max(1, _env_int("EXPLORE_AGENT57_UCB_WINDOW", 256)),
@@ -251,6 +269,13 @@ def _finite_float(value: Any, default: float = 0.0) -> float:
     except (TypeError, ValueError):
         return default
     return num if math.isfinite(num) else default
+
+
+def _clamp_bonus(value: float, max_abs: float) -> tuple[float, bool]:
+    if max_abs <= 0.0:
+        return value, False
+    clipped = min(max(value, -max_abs), max_abs)
+    return clipped, clipped != value
 
 
 def _bucket_len(text: str) -> str:
@@ -376,6 +401,8 @@ def compute_lifelong_bonus(
         "explore_agent57_arm_id": int(arm_id),
         "explore_agent57_k": int(config.k),
         "explore_agent57_beta": float(beta),
+        "explore_agent57_combine_mode": config.combine_mode,
+        "explore_agent57_max_bonus": float(config.max_bonus),
         "explore_agent57_controller": config.controller,
         "explore_agent57_lifelong_enabled": bool(config.lifelong_enabled),
         "explore_agent57_lifelong_backend": config.lifelong_backend,
@@ -385,11 +412,14 @@ def compute_lifelong_bonus(
         "explore_agent57_lifelong_warmup": int(config.lifelong_warmup),
         "explore_agent57_lifelong_raw": 0.0,
         "explore_agent57_lifelong_bonus": 0.0,
+        "explore_agent57_lifelong_bonus_unclipped": 0.0,
         "explore_agent57_lifelong_unique_keys": 0,
         "explore_agent57_lifelong_seen_before": 0,
         "explore_agent57_lifelong_warmup_remaining": int(config.lifelong_warmup),
         "explore_agent57_lifelong_eligible": 0.0,
         "explore_agent57_lifelong_suppressed_reason": "",
+        "explore_agent57_bonus_unclipped": 0.0,
+        "explore_agent57_bonus_clipped": 0.0,
     }
     if not config.active or not config.lifelong_enabled:
         return metrics
@@ -433,7 +463,55 @@ def compute_lifelong_bonus(
         return metrics
 
     metrics["explore_agent57_lifelong_eligible"] = 1.0
-    metrics["explore_agent57_lifelong_bonus"] = float(beta * config.lifelong_coef * raw)
+    unclipped = float(beta * config.lifelong_coef * raw)
+    bonus, clipped = _clamp_bonus(unclipped, config.max_bonus)
+    metrics["explore_agent57_lifelong_bonus_unclipped"] = unclipped
+    metrics["explore_agent57_lifelong_bonus"] = float(bonus)
+    metrics["explore_agent57_bonus_unclipped"] = unclipped
+    metrics["explore_agent57_bonus_clipped"] = 1.0 if clipped else 0.0
+    return metrics
+
+
+def compute_ngu_lite_bonus(
+    *,
+    config: Agent57LiteConfig,
+    arm_id: int,
+    episodic_novelty: float,
+    lifelong_raw: float,
+    lifelong_eligible: bool,
+) -> dict[str, Any]:
+    """Compute the optional NGU-lite product bonus.
+
+    The function is intentionally pure and side-effect free: lifelong count
+    updates remain in `compute_lifelong_bonus`, while this combines the current
+    rollout's episode novelty with the already-measured lifelong raw signal.
+    """
+    beta = config.beta_for_arm(arm_id)
+    episodic = max(0.0, _finite_float(episodic_novelty))
+    raw_life = max(0.0, _finite_float(lifelong_raw))
+    life_mod = min(max(1.0 + raw_life, 1.0), config.ngu_mod_clip)
+    metrics: dict[str, Any] = {
+        "explore_agent57_ngu_mod_clip": float(config.ngu_mod_clip),
+        "explore_agent57_ngu_episodic_source": config.ngu_episodic_source,
+        "explore_agent57_ngu_episodic": float(episodic),
+        "explore_agent57_ngu_life_mod": float(life_mod),
+        "explore_agent57_ngu_bonus": 0.0,
+        "explore_agent57_ngu_bonus_unclipped": 0.0,
+    }
+    if (
+        not config.active
+        or config.combine_mode != "ngu_lite"
+        or not config.lifelong_enabled
+        or not lifelong_eligible
+    ):
+        return metrics
+
+    unclipped = float(beta * config.lifelong_coef * episodic * life_mod)
+    bonus, clipped = _clamp_bonus(unclipped, config.max_bonus)
+    metrics["explore_agent57_ngu_bonus_unclipped"] = unclipped
+    metrics["explore_agent57_ngu_bonus"] = float(bonus)
+    metrics["explore_agent57_bonus_unclipped"] = unclipped
+    metrics["explore_agent57_bonus_clipped"] = 1.0 if clipped else 0.0
     return metrics
 
 
