@@ -558,8 +558,27 @@ class WorkerPool:
     async def _force_cleanup_after_close_failure(
         self, run_slot: RunSlot, run_lease_id: str, *, reason: str
     ) -> None:
+        timeout = _env_float("WORKER_FORCE_CLEANUP_TIMEOUT", 30.0)
         try:
-            await run_slot.env.force_cleanup(reason=reason)
+            logger.warning(
+                "Force cleanup starting for run session %s after %s (timeout=%.1fs)",
+                run_lease_id,
+                reason,
+                timeout,
+            )
+            await asyncio.wait_for(run_slot.env.force_cleanup(reason=reason), timeout=timeout)
+            logger.warning(
+                "Force cleanup finished for run session %s after %s",
+                run_lease_id,
+                reason,
+            )
+        except asyncio.TimeoutError:
+            logger.warning(
+                "Force cleanup timed out for run session %s after %s (timeout=%.1fs)",
+                run_lease_id,
+                reason,
+                timeout,
+            )
         except Exception:
             logger.exception(
                 "Force cleanup failed after %s for run session %s",
@@ -590,11 +609,11 @@ class WorkerPool:
             )
         except asyncio.CancelledError:
             logger.warning(
-                "Close task for run session %s was cancelled; scheduling Docker "
+                "Close task for run session %s was cancelled; forcing Docker "
                 "cleanup before dropping it from the pool.",
                 run_lease_id,
             )
-            asyncio.create_task(
+            await asyncio.shield(
                 self._force_cleanup_after_close_failure(
                     run_slot, run_lease_id, reason="close_cancelled"
                 )
@@ -973,6 +992,42 @@ class WorkerPool:
             "pending_after": pending_after,
         }
 
+    async def _force_cleanup_slots(
+        self, slots: list[tuple[str, str, RunSlot]], *, reason: str
+    ) -> None:
+        if not slots:
+            return
+        timeout = _env_float(
+            "WORKER_SHUTDOWN_FORCE_CLEANUP_TIMEOUT",
+            max(10.0, min(120.0, len(slots) * 2.0)),
+        )
+        logger.warning(
+            "Shutdown force cleanup starting for %d run slot(s), reason=%s timeout=%.1fs",
+            len(slots),
+            reason,
+            timeout,
+        )
+        cleanup_tasks = [
+            asyncio.create_task(
+                self._force_cleanup_after_close_failure(run_slot, run_lease_id, reason=reason)
+            )
+            for _task_key, run_lease_id, run_slot in slots
+        ]
+        try:
+            await asyncio.wait_for(
+                asyncio.gather(*cleanup_tasks, return_exceptions=True),
+                timeout=timeout,
+            )
+        except asyncio.TimeoutError:
+            logger.warning(
+                "Shutdown force cleanup timed out with %d cleanup task(s) still pending",
+                sum(1 for task in cleanup_tasks if not task.done()),
+            )
+            for task in cleanup_tasks:
+                task.cancel()
+            await asyncio.gather(*cleanup_tasks, return_exceptions=True)
+        logger.warning("Shutdown force cleanup finished for reason=%s", reason)
+
     async def periodic_reap(self, interval: float = 60.0) -> None:
         while True:
             await asyncio.sleep(interval)
@@ -1026,7 +1081,7 @@ class WorkerPool:
             except asyncio.TimeoutError:
                 logger.warning(
                     "Shutdown timed out after %.1fs with %d pending close tasks; "
-                    "cancelling them so pool_server can exit.",
+                    "cancelling them and forcing Docker cleanup.",
                     shutdown_timeout,
                     len(self._closing_tasks),
                 )
@@ -1045,6 +1100,15 @@ class WorkerPool:
                         "close task(s) still pending.",
                         len(self._closing_tasks),
                     )
+                await self._force_cleanup_slots(
+                    slots_to_close,
+                    reason="shutdown_close_timeout",
+                )
+            else:
+                await self._force_cleanup_slots(
+                    slots_to_close,
+                    reason="shutdown_final_sweep",
+                )
 
 
 POOL: WorkerPool | None = None

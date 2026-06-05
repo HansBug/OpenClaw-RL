@@ -52,7 +52,10 @@ WORKER_MAX_RUNS_PER_TASK="${WORKER_MAX_RUNS_PER_TASK:-16}"
 WORKER_MAX_CONCURRENT_CLOSES="${WORKER_MAX_CONCURRENT_CLOSES:-32}"
 ENV_SERVER_PORT="${ENV_SERVER_PORT:-18081}"
 SKIP_PREFLIGHT_CLEANUP="${SKIP_PREFLIGHT_CLEANUP:-0}"
-PREFLIGHT_KILL_ORPHAN_RUNNING="${PREFLIGHT_KILL_ORPHAN_RUNNING:-0}"
+PREFLIGHT_KILL_ORPHAN_RUNNING="${PREFLIGHT_KILL_ORPHAN_RUNNING:-1}"
+FINAL_DOCKER_CLEANUP="${FINAL_DOCKER_CLEANUP:-1}"
+FINAL_DOCKER_CLEANUP_TIMEOUT="${FINAL_DOCKER_CLEANUP_TIMEOUT:-90}"
+POOL_SERVER_SHUTDOWN_GRACE="${POOL_SERVER_SHUTDOWN_GRACE:-60}"
 PROXY_ENV_FILE="${PROXY_ENV_FILE:-/etc/seta_build_proxy.env}"
 SKIP_PROXY_ENV="${SKIP_PROXY_ENV:-0}"
 CLAWSENTRY_NEEDED="${CLAWSENTRY_NEEDED:-0}"
@@ -135,7 +138,7 @@ log "  max_concurrent_closes=${WORKER_MAX_CONCURRENT_CLOSES}"
 log "  max_concurrent_builds=${WORKER_MAX_CONCURRENT_BUILDS}"
 log "  close_task_timeout=${WORKER_CLOSE_TASK_TIMEOUT}"
 log "  port=${ENV_SERVER_PORT}  skip_cleanup=${SKIP_PREFLIGHT_CLEANUP}"
-log "  preflight_kill_orphan_running=${PREFLIGHT_KILL_ORPHAN_RUNNING}"
+log "  preflight_kill_orphan_running=${PREFLIGHT_KILL_ORPHAN_RUNNING} final_docker_cleanup=${FINAL_DOCKER_CLEANUP}"
 log "  total_capacity=$((WORKER_MAX_TASKS * WORKER_MAX_RUNS_PER_TASK)) slots"
 log "  docker_data_root=${DOCKER_DATA_ROOT} disk_guard=${WORKER_DISK_GUARD_ENABLED}"
 log "  pressure_guard=${WORKER_PRESSURE_GUARD_ENABLED} pids_pause=${WORKER_PIDS_PAUSE_ALLOCATE_PCT}% pids_reset=${WORKER_PIDS_REJECT_RESET_PCT}%"
@@ -159,6 +162,43 @@ docker_disk_snapshot() {
 
 docker_inode_snapshot() {
     df -Pi "${DOCKER_DATA_ROOT}" 2>/dev/null | awk 'NR==2 {gsub("%","",$5); print $5}'
+}
+
+TASK_CONTAINER_REGEX="${TASK_CONTAINER_REGEX:-^[0-9]+[-_].*(slime[-_]?run|client|helper).*$}"
+TASK_IMAGE_REGEX="${TASK_IMAGE_REGEX:-^tb__[0-9]+__.*(:|$)}"
+
+task_container_lines() {
+    docker ps --format '{{.ID}}\t{{.Names}}\t{{.Image}}' 2>/dev/null \
+        | awk -F '\t' -v name_re="${TASK_CONTAINER_REGEX}" -v image_re="${TASK_IMAGE_REGEX}" \
+            '$2 ~ name_re || $3 ~ image_re {print $0}' || true
+}
+
+task_container_ids() {
+    task_container_lines | awk -F '\t' 'NF >= 1 {print $1}' | sed '/^$/d' || true
+}
+
+cleanup_task_docker_objects() {
+    local reason="$1"
+    local ids count stopped dangling_nets
+
+    stopped=$(docker ps -aq --filter "status=exited" --filter "status=dead" 2>/dev/null | wc -l || true)
+    log "  Docker cleanup (${reason}): stopped containers=${stopped:-0}"
+    if [[ "${stopped:-0}" -gt 0 ]] 2>/dev/null; then
+        timeout "${FINAL_DOCKER_CLEANUP_TIMEOUT}" docker container prune -f >/dev/null 2>&1 || true
+    fi
+
+    ids="$(task_container_ids)"
+    count=$(printf '%s\n' "${ids}" | sed '/^$/d' | wc -l || true)
+    log "  Docker cleanup (${reason}): running task containers=${count:-0}"
+    if [[ "${count:-0}" -gt 0 ]] 2>/dev/null; then
+        printf '%s\n' "${ids}" \
+            | xargs -r -n 20 timeout "${FINAL_DOCKER_CLEANUP_TIMEOUT}" docker rm -f >/dev/null 2>&1 || true
+        log "  Docker cleanup (${reason}): removed matching running task containers"
+    fi
+
+    dangling_nets=$(docker network ls --filter "dangling=true" -q 2>/dev/null | wc -l || true)
+    log "  Docker cleanup (${reason}): dangling networks=${dangling_nets:-0}"
+    timeout "${FINAL_DOCKER_CLEANUP_TIMEOUT}" docker network prune -f >/dev/null 2>&1 || true
 }
 
 preflight_disk_guard() {
@@ -284,43 +324,28 @@ fi
 # ── Pre-flight: orphan container/network cleanup (坑5) ───────────────────────
 log "Pre-flight [5/6]: Orphan container/network cleanup (SKIP_PREFLIGHT_CLEANUP=${SKIP_PREFLIGHT_CLEANUP})"
 if [[ "${SKIP_PREFLIGHT_CLEANUP}" != "1" ]]; then
-    # Count stopped containers that look like task containers (numeric prefix pattern)
-    STOPPED=$(docker ps -aq --filter "status=exited" --filter "status=dead" 2>/dev/null | wc -l)
-    log "  stopped containers: ${STOPPED}"
-    if [[ "${STOPPED}" -gt 0 ]]; then
-        log "  Pruning stopped containers..."
-        docker container prune -f >/dev/null 2>&1 || true
-        log "  ✅ Pruned"
-    fi
-
-    # Prune dangling networks
-    DANGLING_NETS=$(docker network ls --filter "dangling=true" -q 2>/dev/null | wc -l)
-    if [[ "${DANGLING_NETS}" -gt 0 ]]; then
-        log "  Pruning ${DANGLING_NETS} dangling networks..."
-        docker network prune -f >/dev/null 2>&1 || true
-        log "  ✅ Pruned networks"
-    fi
-
-    # Check for running task containers from previous pool. Match both the
-    # slime-run compose project names and multi-service task images such as
-    # tb__890__staging-server.
-    ORPHAN_PATTERN='^[0-9]+[-_].*(slime[-_]?run|client|helper).*$'
-    ORPHAN_IMAGE_PATTERN='^tb__[0-9]+__.*(:|$)'
-    ORPHAN_LINES=$(docker ps --format '{{.ID}}\t{{.Names}}\t{{.Image}}' 2>/dev/null \
-        | awk -F '\t' -v name_re="${ORPHAN_PATTERN}" -v image_re="${ORPHAN_IMAGE_PATTERN}" \
-            '$2 ~ name_re || $3 ~ image_re {print $0}' || true)
-    ORPHAN_IDS=$(printf '%s\n' "${ORPHAN_LINES}" | awk -F '\t' 'NF >= 1 {print $1}' | sed '/^$/d' || true)
-    ORPHAN_RUNNING=$(printf '%s\n' "${ORPHAN_IDS}" | sed '/^$/d' | wc -l || true)
-    if [[ "${ORPHAN_RUNNING}" -gt 0 ]]; then
-        log "  ⚠️  ${ORPHAN_RUNNING} orphan task containers still running"
-        if [[ "${PREFLIGHT_KILL_ORPHAN_RUNNING}" == "1" ]]; then
-            log "  Removing orphan running task containers before starting pool_server..."
-            printf '%s\n' "${ORPHAN_IDS}" | xargs -r docker rm -f >/dev/null 2>&1 || true
-            log "  ✅ Removed orphan running task containers"
-        else
-            log "     Inspect: docker ps --format '{{.ID}} {{.Names}} {{.Image}}' | grep -E '${ORPHAN_PATTERN}|${ORPHAN_IMAGE_PATTERN}'"
-            log "     Cleanup: docker ps --format '{{.ID}} {{.Names}} {{.Image}}' | awk '/${ORPHAN_PATTERN}|${ORPHAN_IMAGE_PATTERN}/ {print \$1}' | xargs -r docker rm -f"
-            log "     Or set PREFLIGHT_KILL_ORPHAN_RUNNING=1 when no active training uses this worker."
+    if [[ "${PREFLIGHT_KILL_ORPHAN_RUNNING}" == "1" ]]; then
+        cleanup_task_docker_objects "preflight"
+    else
+        STOPPED=$(docker ps -aq --filter "status=exited" --filter "status=dead" 2>/dev/null | wc -l || true)
+        log "  stopped containers: ${STOPPED:-0}"
+        if [[ "${STOPPED:-0}" -gt 0 ]] 2>/dev/null; then
+            log "  Pruning stopped containers..."
+            timeout "${FINAL_DOCKER_CLEANUP_TIMEOUT}" docker container prune -f >/dev/null 2>&1 || true
+            log "  ✅ Pruned"
+        fi
+        DANGLING_NETS=$(docker network ls --filter "dangling=true" -q 2>/dev/null | wc -l || true)
+        if [[ "${DANGLING_NETS:-0}" -gt 0 ]] 2>/dev/null; then
+            log "  Pruning ${DANGLING_NETS} dangling networks..."
+            timeout "${FINAL_DOCKER_CLEANUP_TIMEOUT}" docker network prune -f >/dev/null 2>&1 || true
+            log "  ✅ Pruned networks"
+        fi
+        ORPHAN_RUNNING=$(task_container_ids | wc -l || true)
+        if [[ "${ORPHAN_RUNNING:-0}" -gt 0 ]] 2>/dev/null; then
+            log "  ⚠️  ${ORPHAN_RUNNING} orphan task containers still running"
+            log "     Matching name regex: ${TASK_CONTAINER_REGEX}"
+            log "     Matching image regex: ${TASK_IMAGE_REGEX}"
+            log "     Set PREFLIGHT_KILL_ORPHAN_RUNNING=1 to remove them before start."
         fi
     fi
 else
@@ -358,18 +383,62 @@ log ""
   done
 ) &
 ERR_FILTER_PID=$!
+POOL_SERVER_PID=""
+CLEANUP_STARTED=0
 
 cleanup() {
-  kill "${ERR_FILTER_PID}" 2>/dev/null || true
+  local rc="${1:-0}"
+  if [[ "${CLEANUP_STARTED}" == "1" ]]; then
+    return 0
+  fi
+  CLEANUP_STARTED=1
+  trap - EXIT INT TERM
+
+  set +e
+  if [[ -n "${POOL_SERVER_PID:-}" ]] && kill -0 "${POOL_SERVER_PID}" 2>/dev/null; then
+    log "Stopping pool_server child PID=${POOL_SERVER_PID}..."
+    kill "${POOL_SERVER_PID}" 2>/dev/null || true
+    for _ in $(seq 1 "${POOL_SERVER_SHUTDOWN_GRACE}"); do
+      kill -0 "${POOL_SERVER_PID}" 2>/dev/null || break
+      sleep 1
+    done
+    if kill -0 "${POOL_SERVER_PID}" 2>/dev/null; then
+      log "pool_server child did not stop within ${POOL_SERVER_SHUTDOWN_GRACE}s; sending SIGKILL"
+      kill -9 "${POOL_SERVER_PID}" 2>/dev/null || true
+    fi
+    wait "${POOL_SERVER_PID}" 2>/dev/null || true
+  fi
+
+  if [[ -n "${ERR_FILTER_PID:-}" ]]; then
+    kill "${ERR_FILTER_PID}" 2>/dev/null || true
+    wait "${ERR_FILTER_PID}" 2>/dev/null || true
+  fi
+
   # Final snapshot
   tail -n "${CPU_ERR_SCAN_LINES}" "${CPU_POOL_LOG}" 2>/dev/null \
     | grep -E "Error|Exception|Traceback|500|502|PermissionError|docker|FAILED|Connection|SLOTS_EXHAUSTED|Too many open files|address pools|pending_closes" \
     | grep -v "DeprecationWarning" \
     | tail -n 300 \
     > "${CPU_ERR_LOG}" 2>/dev/null || true
-  log "pool_server stopped."
+
+  if [[ "${FINAL_DOCKER_CLEANUP}" == "1" ]]; then
+    cleanup_task_docker_objects "final"
+  else
+    log "Final Docker cleanup skipped (FINAL_DOCKER_CLEANUP=0)"
+  fi
+
+  log "pool_server stopped (rc=${rc})."
 }
-trap cleanup EXIT INT TERM
+
+terminate() {
+  local sig_rc="${1:-143}"
+  cleanup "${sig_rc}"
+  exit "${sig_rc}"
+}
+
+trap 'cleanup "$?"' EXIT
+trap 'terminate 130' INT
+trap 'terminate 143' TERM
 
 # ── Capacity summary before start ────────────────────────────────────────────
 echo "========================================"
@@ -445,12 +514,20 @@ import sys
 print("  pool_server python version:", sys.version.replace("\n", " "))
 PY
 
-# Use stdbuf for line-buffered output (real-time log visibility)
-exec stdbuf -oL -eL \
+# Use stdbuf for line-buffered output (real-time log visibility). Do not use
+# exec here: the launcher owns cleanup traps and must survive the child process.
+stdbuf -oL -eL \
     "${POOL_SERVER_PYTHON}" -m terminal-rl.remote.pool_server \
     --host 0.0.0.0 \
     --port "${ENV_SERVER_PORT}" \
     --max-tasks "${WORKER_MAX_TASKS}" \
     --max-runs-per-task "${WORKER_MAX_RUNS_PER_TASK}" \
     --max-concurrent-closes "${WORKER_MAX_CONCURRENT_CLOSES}" \
-    --output-root "${TBENCH_OUTPUT_ROOT}"
+    --output-root "${TBENCH_OUTPUT_ROOT}" &
+POOL_SERVER_PID=$!
+set +e
+wait "${POOL_SERVER_PID}"
+POOL_SERVER_RC=$?
+set -e
+POOL_SERVER_PID=""
+exit "${POOL_SERVER_RC}"

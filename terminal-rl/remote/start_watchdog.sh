@@ -33,15 +33,16 @@ touch "${LOG_FILE}"
 ln -sfn "${OPENCLAW_REMOTE_LOG_DIR}" "${REMOTE_LOG_ROOT}/${CPU_WORKER_ID}/latest_watchdog" 2>/dev/null || true
 
 cd "${REPO_ROOT}"
-{
-    echo "========================================"
-    echo "  OpenClaw docker watchdog"
-    echo "  repo:       ${REPO_ROOT}"
-    echo "  worker_id:  ${CPU_WORKER_ID}"
-    echo "  run_id:     ${OPENCLAW_REMOTE_RUN_ID}"
-    echo "  log_dir:    ${OPENCLAW_REMOTE_LOG_DIR}"
-    echo "  log_file:   ${LOG_FILE}"
-    echo "  pool:       ${POOL_HOST}:${POOL_PORT}"
-    echo "========================================"
-} | tee -a "${LOG_FILE}"
-exec bash terminal-rl/remote/docker_watchdog_v2.sh 2>&1 | tee -a "${LOG_FILE}"
+exec > >(tee -a "${LOG_FILE}") 2>&1
+
+echo "========================================"
+echo "  OpenClaw docker watchdog"
+echo "  repo:       ${REPO_ROOT}"
+echo "  worker_id:  ${CPU_WORKER_ID}"
+echo "  run_id:     ${OPENCLAW_REMOTE_RUN_ID}"
+echo "  log_dir:    ${OPENCLAW_REMOTE_LOG_DIR}"
+echo "  log_file:   ${LOG_FILE}"
+echo "  pool:       ${POOL_HOST}:${POOL_PORT}"
+echo "========================================"
+
+exec bash terminal-rl/remote/docker_watchdog_v2.sh

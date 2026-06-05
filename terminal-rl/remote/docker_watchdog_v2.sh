@@ -311,7 +311,7 @@ task_container_count() {
 
 stop_pool_server_for_pressure() {
     local reason="$1"
-    local proc_dir pid cmdline killed=0
+    local proc_dir pid cmdline pids killed=0
 
     for proc_dir in /proc/[0-9]*; do
         [ -r "${proc_dir}/cmdline" ] || continue
@@ -328,6 +328,24 @@ stop_pool_server_for_pressure() {
 
     if [ "${killed}" -eq 0 ]; then
         log "PRESSURE: no pool_server process matched for stop (reason=${reason})"
+        return 0
+    fi
+
+    sleep 5
+    pids=""
+    for proc_dir in /proc/[0-9]*; do
+        [ -r "${proc_dir}/cmdline" ] || continue
+        pid="${proc_dir##*/}"
+        cmdline="$(< "${proc_dir}/cmdline")"
+        case "${cmdline}" in
+            *terminal-rl.remote.pool_server*|*remote.pool_server*|*pool_server.py*|*run_pool_server_pu_v2.sh*)
+                pids="${pids} ${pid}"
+                ;;
+        esac
+    done
+    if [ -n "${pids}" ]; then
+        log "PRESSURE: pool_server still alive after SIGTERM; sending SIGKILL (reason=${reason})"
+        printf '%s\n' "${pids}" | xargs -r kill -9 2>/dev/null || true
     fi
 }
 
