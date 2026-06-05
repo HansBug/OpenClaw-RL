@@ -162,7 +162,51 @@ def _next_actor():
     return actor
 
 
-async def _post(client, url, payload, max_retries=60):
+def _retry_after_seconds(response: httpx.Response | None) -> float | None:
+    if response is None:
+        return None
+    raw = response.headers.get("retry-after")
+    if not raw:
+        return None
+    try:
+        value = float(raw)
+    except ValueError:
+        return None
+    return value if value > 0 else None
+
+
+def _retry_sleep_seconds(
+    retry_count: int,
+    *,
+    base_delay: float,
+    max_delay: float,
+    backoff_factor: float,
+    jitter: float,
+    retry_after: float | None,
+) -> float:
+    delay = max(0.0, base_delay)
+    if backoff_factor > 1.0 and retry_count > 1:
+        delay *= backoff_factor ** (retry_count - 1)
+    if max_delay > 0:
+        delay = min(delay, max_delay)
+    if retry_after is not None:
+        delay = max(delay, retry_after)
+    if jitter > 0 and delay > 0:
+        delay += random.uniform(0.0, delay * jitter)
+    return delay
+
+
+async def _post(
+    client,
+    url,
+    payload,
+    max_retries=60,
+    *,
+    retry_base_delay: float = 1.0,
+    retry_max_delay: float = 1.0,
+    retry_backoff_factor: float = 1.0,
+    retry_jitter: float = 0.0,
+):
     retry_count = 0
     while retry_count < max_retries:
         response = None
@@ -188,7 +232,15 @@ async def _post(client, url, payload, max_retries=60):
             if retry_count >= max_retries:
                 logger.info(f"Max retries ({max_retries}) reached, failing... (url={url})")
                 raise e
-            await asyncio.sleep(1)
+            sleep_seconds = _retry_sleep_seconds(
+                retry_count,
+                base_delay=retry_base_delay,
+                max_delay=retry_max_delay,
+                backoff_factor=retry_backoff_factor,
+                jitter=retry_jitter,
+                retry_after=_retry_after_seconds(response),
+            )
+            await asyncio.sleep(sleep_seconds)
             continue
         finally:
             if response is not None:
@@ -245,8 +297,26 @@ def _init_ray_distributed_post(args):
                 timeout=httpx.Timeout(None),
             )
 
-        async def do_post(self, url, payload, max_retries=60):
-            return await _post(self._client, url, payload, max_retries)
+        async def do_post(
+            self,
+            url,
+            payload,
+            max_retries=60,
+            retry_base_delay=1.0,
+            retry_max_delay=1.0,
+            retry_backoff_factor=1.0,
+            retry_jitter=0.0,
+        ):
+            return await _post(
+                self._client,
+                url,
+                payload,
+                max_retries,
+                retry_base_delay=retry_base_delay,
+                retry_max_delay=retry_max_delay,
+                retry_backoff_factor=retry_backoff_factor,
+                retry_jitter=retry_jitter,
+            )
 
     # Create actors per node
     created = []
@@ -270,7 +340,16 @@ def _init_ray_distributed_post(args):
     _post_actors = created
 
 
-async def post(url, payload, max_retries=60):
+async def post(
+    url,
+    payload,
+    max_retries=60,
+    *,
+    retry_base_delay: float = 1.0,
+    retry_max_delay: float = 1.0,
+    retry_backoff_factor: float = 1.0,
+    retry_jitter: float = 0.0,
+):
     # If distributed mode is enabled and actors exist, dispatch via Ray.
     if _distributed_post_enabled and _post_actors:
         try:
@@ -279,13 +358,30 @@ async def post(url, payload, max_retries=60):
             actor = _next_actor()
             if actor is not None:
                 # Use a thread to avoid blocking the event loop on ray.get
-                obj_ref = actor.do_post.remote(url, payload, max_retries)
+                obj_ref = actor.do_post.remote(
+                    url,
+                    payload,
+                    max_retries,
+                    retry_base_delay,
+                    retry_max_delay,
+                    retry_backoff_factor,
+                    retry_jitter,
+                )
                 return await asyncio.to_thread(ray.get, obj_ref)
         except Exception as e:
             logger.info(f"[http_utils] Distributed POST failed, falling back to local: {e} (url={url})")
             # fall through to local
 
-    return await _post(_http_client, url, payload, max_retries)
+    return await _post(
+        _http_client,
+        url,
+        payload,
+        max_retries,
+        retry_base_delay=retry_base_delay,
+        retry_max_delay=retry_max_delay,
+        retry_backoff_factor=retry_backoff_factor,
+        retry_jitter=retry_jitter,
+    )
 
 
 async def get(url):

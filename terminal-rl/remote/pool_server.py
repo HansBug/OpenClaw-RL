@@ -866,7 +866,8 @@ class WorkerPool:
 
             popped = self._pop_run_slot_locked(run_lease_id)
             if popped is not None:
-                close_now = popped
+                task_key, run_slot = popped
+                close_now = (task_key, run_lease_id, run_slot)
 
         if close_now is not None:
             task_key, run_lease_id, run_slot = close_now
@@ -1285,10 +1286,13 @@ async def allocate(request: Request) -> JSONResponse:
                 "details": exc.details,
             },
             status_code=503,
+            headers={"Retry-After": os.getenv("WORKER_PRESSURE_RETRY_AFTER", "10")},
         )
     except CapacityError as exc:
         return JSONResponse(
-            {"ok": False, "error": exc.message, "code": exc.code}, status_code=429
+            {"ok": False, "error": exc.message, "code": exc.code},
+            status_code=429,
+            headers={"Retry-After": os.getenv("WORKER_CAPACITY_RETRY_AFTER", "5")},
         )
     except Exception as exc:
         return JSONResponse({"ok": False, "error": str(exc)}, status_code=500)

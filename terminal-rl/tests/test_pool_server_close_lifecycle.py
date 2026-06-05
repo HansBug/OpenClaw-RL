@@ -131,6 +131,25 @@ def _new_pool(pool_server_mod, env: _DummyEnv, tmp_path: Path):
     )
 
 
+def test_close_allocated_run_cleans_up_without_unpack_error(monkeypatch, tmp_path):
+    async def _case():
+        pool_server = _install_import_stubs(monkeypatch)
+        env = _DummyEnv()
+        pool = _new_pool(pool_server, env, tmp_path)
+
+        lease = await pool.allocate("task")
+        lease_id = lease["lease_id"]
+
+        assert await pool.close_run(lease_id, reason="test_close") is True
+        if pool._closing_tasks:
+            await asyncio.gather(*pool._closing_tasks, return_exceptions=False)
+
+        assert lease_id not in pool._run_to_task
+        assert env.close_count == 1
+
+    asyncio.run(_case())
+
+
 def test_idle_reaper_skips_in_flight_reset(monkeypatch, tmp_path):
     async def _case():
         pool_server = _install_import_stubs(monkeypatch)

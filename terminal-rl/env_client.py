@@ -9,12 +9,27 @@ from slime.utils.http_utils import post
 logger = logging.getLogger(__name__)
 
 
+def _env_float(name: str, default: float) -> float:
+    raw = os.getenv(name)
+    if raw is None or raw == "":
+        return default
+    try:
+        return float(raw)
+    except ValueError:
+        logger.warning("Invalid %s=%r; using %.4f", name, raw, default)
+        return default
+
+
 class TerminalEnvClient:
 
     def __init__(self, base_url: str):
         self.base_url = base_url.rstrip("/")
         self.default_max_retries = int(os.getenv("ENV_HTTP_MAX_RETRIES", "10"))
         self.allocate_max_retries = int(os.getenv("ENV_ALLOCATE_MAX_RETRIES", "100"))
+        self.allocate_retry_base_delay = _env_float("ENV_ALLOCATE_RETRY_BASE_DELAY", 2.0)
+        self.allocate_retry_max_delay = _env_float("ENV_ALLOCATE_RETRY_MAX_DELAY", 30.0)
+        self.allocate_retry_backoff = _env_float("ENV_ALLOCATE_RETRY_BACKOFF", 2.0)
+        self.allocate_retry_jitter = _env_float("ENV_ALLOCATE_RETRY_JITTER", 0.25)
         self.evaluate_max_retries = int(os.getenv("ENV_EVALUATE_MAX_RETRIES", "1"))
         self.close_max_retries = int(os.getenv("ENV_CLOSE_MAX_RETRIES", "3"))
         self.exec_tool_max_retries = int(os.getenv("ENV_EXEC_TOOL_MAX_RETRIES", "3"))
@@ -29,6 +44,10 @@ class TerminalEnvClient:
             f"{self.base_url}/allocate",
             {"task_key": task_key, "request_id": request_id},
             max_retries=self.allocate_max_retries,
+            retry_base_delay=self.allocate_retry_base_delay,
+            retry_max_delay=self.allocate_retry_max_delay,
+            retry_backoff_factor=self.allocate_retry_backoff,
+            retry_jitter=self.allocate_retry_jitter,
         )
         if not out.get("ok", False):
             raise RuntimeError(f"allocate failed: {out}")
