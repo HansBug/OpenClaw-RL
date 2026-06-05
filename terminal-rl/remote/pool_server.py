@@ -420,23 +420,34 @@ class WorkerPool:
         return TerminalEnv()
 
     @staticmethod
-    def _run_slot_container_ref(run_slot: RunSlot) -> str:
+    def _run_slot_container_info(run_slot: RunSlot) -> dict[str, Any]:
         env = run_slot.env
         terminal = getattr(env, "_terminal", None)
         container = getattr(terminal, "container", None) if terminal is not None else None
-        container_id = getattr(container, "id", None) or "?"
-        if isinstance(container_id, str) and len(container_id) > 12:
-            container_id = container_id[:12]
+        container_id = getattr(container, "id", None)
+        short_id = container_id[:12] if isinstance(container_id, str) else None
         container_name = (
             getattr(container, "name", None)
             or getattr(env, "_last_client_container_name", None)
-            or "?"
         )
-        container_status = getattr(container, "status", None) or "?"
-        trial_name = getattr(env, "_last_trial_name", None) or "?"
+        container_status = getattr(container, "status", None)
+        trial_name = getattr(env, "_last_trial_name", None)
+        return {
+            "id": container_id,
+            "short_id": short_id,
+            "name": container_name,
+            "status": container_status,
+            "trial_name": trial_name,
+        }
+
+    @classmethod
+    def _run_slot_container_ref(cls, run_slot: RunSlot) -> str:
+        info = cls._run_slot_container_info(run_slot)
         return (
-            f"container_name={container_name} container_id={container_id} "
-            f"container_status={container_status} trial={trial_name}"
+            f"container_name={info.get('name') or '?'} "
+            f"container_id={info.get('short_id') or '?'} "
+            f"container_status={info.get('status') or '?'} "
+            f"trial={info.get('trial_name') or '?'}"
         )
 
     def _pop_run_slot_locked(
@@ -877,6 +888,9 @@ class WorkerPool:
                 ),
             }
             tasks_info: dict[str, Any] = {}
+            active_container_ids: set[str] = set()
+            active_container_names: set[str] = set()
+            active_trial_names: set[str] = set()
             total_runs = 0
             in_flight_runs = 0
             closing_requested_runs = 0
@@ -887,12 +901,24 @@ class WorkerPool:
                         in_flight_runs += 1
                     if rslot.close_requested:
                         closing_requested_runs += 1
+                    container_info = self._run_slot_container_info(rslot)
+                    for key in ("id", "short_id"):
+                        value = container_info.get(key)
+                        if isinstance(value, str) and value:
+                            active_container_ids.add(value)
+                    container_name = container_info.get("name")
+                    if isinstance(container_name, str) and container_name:
+                        active_container_names.add(container_name)
+                    trial_name = container_info.get("trial_name")
+                    if isinstance(trial_name, str) and trial_name:
+                        active_trial_names.add(trial_name)
                     run_details[rid] = {
                         "phase": rslot.phase,
                         "in_flight_ops": rslot.in_flight_ops,
                         "active_op": rslot.active_op,
                         "close_requested": rslot.close_requested,
                         "age_sec": round(now - rslot.last_used_ts, 1),
+                        "container": container_info,
                     }
                 tasks_info[tk] = {"active_runs": len(ts.runs), "runs": run_details}
                 total_runs += len(ts.runs)
@@ -906,6 +932,9 @@ class WorkerPool:
                 "closing_requested_runs": closing_requested_runs,
                 "pending_closes": len(self._closing_tasks),
                 "pending_close_age_sec": pending_close_age_sec,
+                "active_container_ids": sorted(active_container_ids),
+                "active_container_names": sorted(active_container_names),
+                "active_trial_names": sorted(active_trial_names),
                 "tasks": tasks_info,
             }
 

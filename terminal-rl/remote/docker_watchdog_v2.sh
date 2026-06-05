@@ -87,6 +87,19 @@ EMERGENCY_COOLDOWN_S="${EMERGENCY_COOLDOWN_S:-60}"
 POOL_SERVER_NAME_REGEX="${POOL_SERVER_NAME_REGEX:-openclaw_pool_server}"
 TASK_CONTAINER_REGEX="${TASK_CONTAINER_REGEX:-^[0-9]+[-_].*(slime[-_]?run|client|helper).*$}"
 TASK_IMAGE_REGEX="${TASK_IMAGE_REGEX:-^tb__[0-9]+__.*(:|$)}"
+WATCHDOG_REAP_HEADROOM="${WATCHDOG_REAP_HEADROOM:-32}"
+WATCHDOG_SOFT_REAP_BATCH="${WATCHDOG_SOFT_REAP_BATCH:-16}"
+WATCHDOG_HARD_REAP_BATCH="${WATCHDOG_HARD_REAP_BATCH:-64}"
+WATCHDOG_STALE_MIN_AGE_SOFT="${WATCHDOG_STALE_MIN_AGE_SOFT:-900}"
+WATCHDOG_STALE_MIN_AGE_PRESSURE="${WATCHDOG_STALE_MIN_AGE_PRESSURE:-300}"
+WATCHDOG_STALE_MIN_AGE_HARD="${WATCHDOG_STALE_MIN_AGE_HARD:-120}"
+WATCHDOG_STALE_STATUS_MIN_AGE="${WATCHDOG_STALE_STATUS_MIN_AGE:-3600}"
+WATCHDOG_STALE_LOW_CPU_PCT="${WATCHDOG_STALE_LOW_CPU_PCT:-1.0}"
+WATCHDOG_STALE_LOW_MEM_MB="${WATCHDOG_STALE_LOW_MEM_MB:-1024}"
+WATCHDOG_STATS_TIMEOUT="${WATCHDOG_STATS_TIMEOUT:-10}"
+WATCHDOG_PROTECTED_IDS_FILE="${WATCHDOG_PROTECTED_IDS_FILE:-/tmp/docker_watchdog_protected_ids.$$}"
+WATCHDOG_PROTECTED_NAMES_FILE="${WATCHDOG_PROTECTED_NAMES_FILE:-/tmp/docker_watchdog_protected_names.$$}"
+WATCHDOG_PROTECTED_TRIALS_FILE="${WATCHDOG_PROTECTED_TRIALS_FILE:-/tmp/docker_watchdog_protected_trials.$$}"
 HEARTBEAT_INTERVAL="${HEARTBEAT_INTERVAL:-600}"  # "I'm alive" line every 10 min
 
 DISK_CHECK_INTERVAL="${DISK_CHECK_INTERVAL:-60}"
@@ -117,6 +130,15 @@ LAST_PROC_WARN_TS=0
 LAST_PIDS_RELIEF_TS=0
 LAST_POOL_PENDING_REPAIR_TS=0
 POOL_PENDING_HIGH_COUNT=0
+
+cleanup_watchdog_tmp() {
+    rm -f \
+        "${WATCHDOG_PROTECTED_IDS_FILE}" \
+        "${WATCHDOG_PROTECTED_NAMES_FILE}" \
+        "${WATCHDOG_PROTECTED_TRIALS_FILE}" \
+        2>/dev/null || true
+}
+trap cleanup_watchdog_tmp EXIT
 
 # ── namespace 检测 ────────────────────────────────────────────────────
 HOST_PID_NS=0
@@ -707,6 +729,7 @@ monitor_pod_cgroup() {
 # 供 heartbeat 复用，不重新发起 HTTP/docker 调用。
 LAST_POOL_ACTIVE="?"
 LAST_POOL_PENDING="?"
+LAST_POOL_PROTECTED_COUNT=0
 LAST_BRIDGE_NETS="?"
 LAST_POOL_STATUS_TS=0
 check_pool_server() {
@@ -718,7 +741,11 @@ check_pool_server() {
         log "WARN: pool_server /healthz unreachable"
         LAST_POOL_ACTIVE="down"
         LAST_POOL_PENDING="down"
+        LAST_POOL_PROTECTED_COUNT=0
         LAST_POOL_STATUS_TS=0
+        : > "${WATCHDOG_PROTECTED_IDS_FILE}" 2>/dev/null || true
+        : > "${WATCHDOG_PROTECTED_NAMES_FILE}" 2>/dev/null || true
+        : > "${WATCHDOG_PROTECTED_TRIALS_FILE}" 2>/dev/null || true
         rm -f "$health_tmp" 2>/dev/null || true
         return 1
     fi
@@ -727,33 +754,101 @@ check_pool_server() {
     fi
     rm -f "$health_tmp" 2>/dev/null || true
 
-    local body pending=0 active=0 active_tasks=0 active_runs=0
+    local body pending=0 active=0 active_tasks=0 active_runs=0 protected_count=0
     body=$(timeout 3 curl -fsS --noproxy '*' "http://${POOL_HOST}:${POOL_PORT}/status" 2>/dev/null)
     if [ -n "$body" ]; then
-        # 合并到 1 个 python 调用减少 fork 开销
-        local parsed
-        parsed=$(echo "$body" | python3 -c '
-import json, sys
+        local status_tmp ids_tmp names_tmp trials_tmp parsed
+        status_tmp="$(mktemp /tmp/pool_status.XXXXXX 2>/dev/null || echo /tmp/pool_status.$$)"
+        ids_tmp="$(mktemp /tmp/pool_active_ids.XXXXXX 2>/dev/null || echo /tmp/pool_active_ids.$$)"
+        names_tmp="$(mktemp /tmp/pool_active_names.XXXXXX 2>/dev/null || echo /tmp/pool_active_names.$$)"
+        trials_tmp="$(mktemp /tmp/pool_active_trials.XXXXXX 2>/dev/null || echo /tmp/pool_active_trials.$$)"
+        printf '%s' "$body" > "$status_tmp"
+        parsed=$(python3 - "$status_tmp" "$ids_tmp" "$names_tmp" "$trials_tmp" <<'PY' 2>/dev/null || true
+import json
+import sys
+
+status_path, ids_path, names_path, trials_path = sys.argv[1:5]
+
+def clean_values(values):
+    out = set()
+    for value in values:
+        if isinstance(value, str):
+            value = value.strip()
+            if value:
+                out.add(value)
+    return out
+
 try:
-    d = json.load(sys.stdin)
-    p = d.get("pool", d)
-    print(p.get("pending_closes", 0), p.get("active_tasks", 0), p.get("total_active_runs", 0))
+    with open(status_path, "r", encoding="utf-8") as fh:
+        data = json.load(fh)
+    pool = data.get("pool", data)
+    pending = int(pool.get("pending_closes", 0) or 0)
+    active_tasks = int(pool.get("active_tasks", 0) or 0)
+    active_runs = int(pool.get("total_active_runs", 0) or 0)
+
+    ids = clean_values(pool.get("active_container_ids", []))
+    names = clean_values(pool.get("active_container_names", []))
+    trials = clean_values(pool.get("active_trial_names", []))
+    tasks = pool.get("tasks", {})
+    if isinstance(tasks, dict):
+        for task_info in tasks.values():
+            if not isinstance(task_info, dict):
+                continue
+            runs = task_info.get("runs", {})
+            if not isinstance(runs, dict):
+                continue
+            for run_info in runs.values():
+                if not isinstance(run_info, dict):
+                    continue
+                container = run_info.get("container", {})
+                if not isinstance(container, dict):
+                    continue
+                ids.update(clean_values([container.get("id"), container.get("short_id")]))
+                names.update(clean_values([container.get("name")]))
+                trials.update(clean_values([container.get("trial_name")]))
+
+    for path, values in ((ids_path, ids), (names_path, names), (trials_path, trials)):
+        with open(path, "w", encoding="utf-8") as fh:
+            for value in sorted(values):
+                fh.write(value + "\n")
+    protected_count = max(len(ids), len(names), len(trials), active_runs)
+    print("OK", pending, active_tasks, active_runs, protected_count)
 except Exception:
-    print("0 0 0")
-' 2>/dev/null)
+    for path in (ids_path, names_path, trials_path):
+        with open(path, "w", encoding="utf-8") as fh:
+            pass
+    print("ERR 0 0 0 0")
+PY
+)
         set -- ${parsed}
-        pending="${1:-0}"
-        active_tasks="${2:-0}"
-        active_runs="${3:-0}"
-        active="${active_runs}"
-        pending="${pending:-0}"
-        active="${active:-0}"
-        LAST_POOL_PENDING="$pending"
-        LAST_POOL_ACTIVE="$active"
-        LAST_POOL_STATUS_TS="$(date +%s)"
+        if [ "${1:-ERR}" = "OK" ]; then
+            pending="${2:-0}"
+            active_tasks="${3:-0}"
+            active_runs="${4:-0}"
+            protected_count="${5:-0}"
+            active="${active_runs}"
+            pending="${pending:-0}"
+            active="${active:-0}"
+            mv -f "$ids_tmp" "${WATCHDOG_PROTECTED_IDS_FILE}" 2>/dev/null || cp "$ids_tmp" "${WATCHDOG_PROTECTED_IDS_FILE}" 2>/dev/null || true
+            mv -f "$names_tmp" "${WATCHDOG_PROTECTED_NAMES_FILE}" 2>/dev/null || cp "$names_tmp" "${WATCHDOG_PROTECTED_NAMES_FILE}" 2>/dev/null || true
+            mv -f "$trials_tmp" "${WATCHDOG_PROTECTED_TRIALS_FILE}" 2>/dev/null || cp "$trials_tmp" "${WATCHDOG_PROTECTED_TRIALS_FILE}" 2>/dev/null || true
+            LAST_POOL_PENDING="$pending"
+            LAST_POOL_ACTIVE="$active"
+            LAST_POOL_PROTECTED_COUNT="$protected_count"
+            LAST_POOL_STATUS_TS="$(date +%s)"
+        else
+            : > "${WATCHDOG_PROTECTED_IDS_FILE}" 2>/dev/null || true
+            : > "${WATCHDOG_PROTECTED_NAMES_FILE}" 2>/dev/null || true
+            : > "${WATCHDOG_PROTECTED_TRIALS_FILE}" 2>/dev/null || true
+            LAST_POOL_ACTIVE="unknown"
+            LAST_POOL_PENDING="unknown"
+            LAST_POOL_PROTECTED_COUNT=0
+            LAST_POOL_STATUS_TS=0
+        fi
+        rm -f "$status_tmp" "$ids_tmp" "$names_tmp" "$trials_tmp" 2>/dev/null || true
         if [ "$pending" -gt "$POOL_PENDING_CLOSES_WARN" ] 2>/dev/null; then
             POOL_PENDING_HIGH_COUNT=$((POOL_PENDING_HIGH_COUNT + 1))
-            log "WARN: pool_server pending_closes=${pending} (active_runs=${active_runs}, active_tasks=${active_tasks}, high_count=${POOL_PENDING_HIGH_COUNT}/${POOL_PENDING_CLOSES_STUCK_CHECKS})"
+            log "WARN: pool_server pending_closes=${pending} (active_runs=${active_runs}, active_tasks=${active_tasks}, protected=${protected_count}, high_count=${POOL_PENDING_HIGH_COUNT}/${POOL_PENDING_CLOSES_STUCK_CHECKS})"
             if [ "$pending" -ge "$POOL_PENDING_CLOSES_REPAIR_THRESHOLD" ] 2>/dev/null \
                && [ "$POOL_PENDING_HIGH_COUNT" -ge "$POOL_PENDING_CLOSES_STUCK_CHECKS" ] 2>/dev/null \
                && [ "$active" -le "$POOL_PENDING_CLOSES_ACTIVE_MAX" ] 2>/dev/null; then
@@ -766,7 +861,11 @@ except Exception:
     else
         LAST_POOL_ACTIVE="unknown"
         LAST_POOL_PENDING="unknown"
+        LAST_POOL_PROTECTED_COUNT=0
         LAST_POOL_STATUS_TS=0
+        : > "${WATCHDOG_PROTECTED_IDS_FILE}" 2>/dev/null || true
+        : > "${WATCHDOG_PROTECTED_NAMES_FILE}" 2>/dev/null || true
+        : > "${WATCHDOG_PROTECTED_TRIALS_FILE}" 2>/dev/null || true
     fi
 
     local nets
@@ -946,42 +1045,354 @@ pool_status_age_seconds() {
     echo $((now - LAST_POOL_STATUS_TS))
 }
 
-pool_status_allows_task_container_reap() {
+pool_status_is_fresh() {
     local age max_age
     [[ "${LAST_POOL_ACTIVE}" =~ ^[0-9]+$ ]] || return 1
     age="$(pool_status_age_seconds)"
     [[ "${age}" =~ ^[0-9]+$ ]] || return 1
     max_age=$((POOL_CHECK_INTERVAL * 3))
-    [ "${age}" -le "${max_age}" ] 2>/dev/null || return 1
-    [ "${LAST_POOL_ACTIVE}" -eq 0 ] 2>/dev/null
+    [ "${age}" -le "${max_age}" ] 2>/dev/null
+}
+
+min_int() {
+    local a="$1"
+    local b="$2"
+    if [ "$a" -lt "$b" ] 2>/dev/null; then
+        echo "$a"
+    else
+        echo "$b"
+    fi
+}
+
+task_container_reap_target() {
+    local target active_floor
+    target="${MAX_RUNNING_CONTAINERS}"
+    if [[ "${LAST_POOL_ACTIVE}" =~ ^[0-9]+$ ]]; then
+        active_floor=$((LAST_POOL_ACTIVE + WATCHDOG_REAP_HEADROOM))
+        if [ "$active_floor" -gt "$target" ] 2>/dev/null; then
+            target="$active_floor"
+        fi
+    fi
+    echo "$target"
+}
+
+reap_unprotected_task_containers() {
+    local reason="$1"
+    local limit="${2:-0}"
+    local min_age="${3:-900}"
+    local mode="${4:-soft}"
+    local require_idle="${5:-1}"
+    local ps_tmp stats_tmp kill_tmp sample_tmp summary rc total protected candidates selected sample
+
+    ps_tmp="$(mktemp /tmp/watchdog_task_ps.XXXXXX 2>/dev/null || echo /tmp/watchdog_task_ps.$$)"
+    stats_tmp="$(mktemp /tmp/watchdog_task_stats.XXXXXX 2>/dev/null || echo /tmp/watchdog_task_stats.$$)"
+    kill_tmp="$(mktemp /tmp/watchdog_task_kill.XXXXXX 2>/dev/null || echo /tmp/watchdog_task_kill.$$)"
+    sample_tmp="$(mktemp /tmp/watchdog_task_sample.XXXXXX 2>/dev/null || echo /tmp/watchdog_task_sample.$$)"
+
+    if ! timeout "${DOCKER_CLI_TIMEOUT}" docker ps -a --format '{{.CreatedAt}}\t{{.ID}}\t{{.Names}}\t{{.Image}}\t{{.Status}}' > "$ps_tmp" 2>/dev/null; then
+        log "REAP: docker ps failed; cannot build task container inventory (reason=${reason})"
+        rm -f "$ps_tmp" "$stats_tmp" "$kill_tmp" "$sample_tmp" 2>/dev/null || true
+        return 1
+    fi
+    timeout "${WATCHDOG_STATS_TIMEOUT}" docker stats --no-stream --format '{{.Container}}\t{{.Name}}\t{{.CPUPerc}}\t{{.MemUsage}}' > "$stats_tmp" 2>/dev/null || true
+
+    summary=$(python3 - "$ps_tmp" "$stats_tmp" \
+        "${WATCHDOG_PROTECTED_IDS_FILE}" \
+        "${WATCHDOG_PROTECTED_NAMES_FILE}" \
+        "${WATCHDOG_PROTECTED_TRIALS_FILE}" \
+        "$kill_tmp" "$sample_tmp" \
+        "$limit" "$min_age" "$mode" "$require_idle" \
+        "$TASK_CONTAINER_REGEX" "$TASK_IMAGE_REGEX" \
+        "$WATCHDOG_STALE_LOW_CPU_PCT" "$WATCHDOG_STALE_LOW_MEM_MB" <<'PY' 2>/dev/null
+import datetime as _dt
+import re
+import sys
+import time
+
+(
+    ps_path,
+    stats_path,
+    protected_ids_path,
+    protected_names_path,
+    protected_trials_path,
+    kill_path,
+    sample_path,
+    limit_raw,
+    min_age_raw,
+    mode,
+    require_idle_raw,
+    name_re_raw,
+    image_re_raw,
+    low_cpu_raw,
+    low_mem_raw,
+) = sys.argv[1:16]
+
+def read_set(path):
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            return {line.strip() for line in fh if line.strip()}
+    except OSError:
+        return set()
+
+def docker_name_variants(value):
+    if not value:
+        return set()
+    raw = value.strip()
+    if not raw:
+        return set()
+    cleaned = re.sub(r"[^A-Za-z0-9_.-]+", "-", raw).strip("-_.")
+    variants = {
+        raw,
+        cleaned,
+        cleaned.replace(".", "-"),
+        cleaned.replace("_", "-"),
+        cleaned.replace(".", "_"),
+    }
+    return {v for v in variants if v and "slime-run" in v}
+
+def compile_re(raw):
+    try:
+        return re.compile(raw)
+    except re.error:
+        return re.compile(r"a^")
+
+def parse_int(raw, default):
+    try:
+        return int(float(raw))
+    except (TypeError, ValueError):
+        return default
+
+def parse_float(raw, default=None):
+    try:
+        return float(str(raw).strip().rstrip("%"))
+    except (TypeError, ValueError):
+        return default
+
+def parse_mem_mb(raw):
+    left = str(raw or "").split("/", 1)[0].strip()
+    m = re.match(r"^([0-9.]+)\s*([KMGT]?i?B)?$", left, re.I)
+    if not m:
+        return None
+    value = parse_float(m.group(1), None)
+    if value is None:
+        return None
+    unit = (m.group(2) or "B").lower()
+    factors = {
+        "b": 1.0 / (1024 * 1024),
+        "kb": 1.0 / 1024,
+        "kib": 1.0 / 1024,
+        "mb": 1.0,
+        "mib": 1.0,
+        "gb": 1024.0,
+        "gib": 1024.0,
+        "tb": 1024.0 * 1024.0,
+        "tib": 1024.0 * 1024.0,
+    }
+    return value * factors.get(unit, 1.0)
+
+def parse_created_epoch(raw):
+    parts = str(raw or "").split()
+    if len(parts) >= 3:
+        try:
+            return int(_dt.datetime.strptime(" ".join(parts[:3]), "%Y-%m-%d %H:%M:%S %z").timestamp())
+        except (ValueError, OverflowError):
+            return 0
+    return 0
+
+def id_is_protected(container_id, protected_ids):
+    if not container_id:
+        return False
+    for protected_id in protected_ids:
+        if container_id == protected_id or container_id.startswith(protected_id) or protected_id.startswith(container_id):
+            return True
+    return False
+
+def name_is_project_match(name, projects):
+    if not name:
+        return False
+    for project in projects:
+        if name == project or name.startswith(f"{project}-") or name.startswith(f"{project}_") or name.startswith(project):
+            return True
+    return False
+
+limit = parse_int(limit_raw, 0)
+min_age = parse_int(min_age_raw, 900)
+require_idle = str(require_idle_raw) == "1"
+low_cpu = parse_float(low_cpu_raw, 1.0)
+low_mem = parse_float(low_mem_raw, 1024.0)
+name_re = compile_re(name_re_raw)
+image_re = compile_re(image_re_raw)
+now = int(time.time())
+
+protected_ids = read_set(protected_ids_path)
+protected_names = read_set(protected_names_path)
+protected_trials = read_set(protected_trials_path)
+protected_projects = set()
+for value in protected_names | protected_trials:
+    protected_projects.update(docker_name_variants(value))
+
+stats = {}
+try:
+    with open(stats_path, "r", encoding="utf-8") as fh:
+        for line in fh:
+            parts = line.rstrip("\n").split("\t")
+            if len(parts) < 4:
+                continue
+            cid, name, cpu_raw, mem_raw = parts[:4]
+            item = (parse_float(cpu_raw, None), parse_mem_mb(mem_raw), mem_raw)
+            if cid:
+                stats[cid] = item
+            if name:
+                stats[name] = item
+except OSError:
+    pass
+
+total = 0
+protected = 0
+candidates = []
+
+try:
+    lines = open(ps_path, "r", encoding="utf-8").read().splitlines()
+except OSError:
+    lines = []
+
+for line in lines:
+    parts = line.split("\t", 4)
+    if len(parts) < 5:
+        continue
+    created_raw, cid, name, image, status = parts
+    if not (name_re.search(name or "") or image_re.search(image or "")):
+        continue
+    total += 1
+    if id_is_protected(cid, protected_ids) or name in protected_names or name_is_project_match(name, protected_projects):
+        protected += 1
+        continue
+
+    created_epoch = parse_created_epoch(created_raw)
+    age = max(0, now - created_epoch) if created_epoch else 0
+    stat = stats.get(cid) or stats.get(name) or (None, None, "")
+    cpu_pct, mem_mb, mem_raw = stat
+    is_low_cpu = cpu_pct is not None and cpu_pct <= low_cpu
+    is_low_mem = mem_mb is not None and mem_mb <= low_mem
+    is_idle = is_low_cpu and is_low_mem
+    status_l = (status or "").lower()
+    priority = None
+    why = ""
+
+    if "dead" in status_l or "exited" in status_l or "removing" in status_l:
+        priority = 0
+        why = "stopped"
+    elif "created" in status_l:
+        if age >= min_age:
+            priority = 1
+            why = "created_old"
+    elif status_l.startswith("up"):
+        if age >= min_age and (not require_idle or is_idle):
+            priority = 2 if is_idle else 3
+            why = "running_idle" if is_idle else "running_old"
+    elif age >= min_age and (not require_idle or is_idle):
+        priority = 4
+        why = "unknown_old"
+
+    if priority is None:
+        continue
+    cpu_text = "?" if cpu_pct is None else f"{cpu_pct:.2f}%"
+    mem_text = "?" if mem_mb is None else f"{mem_mb:.1f}MiB"
+    sample = f"{cid} name={name} age={age}s status={status} cpu={cpu_text} mem={mem_text} why={why}"
+    candidates.append((priority, created_epoch or now, cid, sample))
+
+candidates.sort(key=lambda item: (item[0], item[1], item[2]))
+selected = candidates[:limit] if limit > 0 else candidates
+with open(kill_path, "w", encoding="utf-8") as fh:
+    for _, _, cid, _ in selected:
+        fh.write(cid + "\n")
+with open(sample_path, "w", encoding="utf-8") as fh:
+    for _, _, _, sample in selected[:8]:
+        fh.write(sample + "\n")
+print(total, protected, len(candidates), len(selected))
+PY
+)
+    rc=$?
+    if [ "$rc" -ne 0 ] || [ -z "$summary" ]; then
+        log "REAP: inventory parser failed (reason=${reason}, mode=${mode})"
+        rm -f "$ps_tmp" "$stats_tmp" "$kill_tmp" "$sample_tmp" 2>/dev/null || true
+        return 1
+    fi
+
+    set -- ${summary}
+    total="${1:-0}"
+    protected="${2:-0}"
+    candidates="${3:-0}"
+    selected="${4:-0}"
+    if [ "$selected" -le 0 ] 2>/dev/null; then
+        log "REAP: no eligible unprotected task containers (reason=${reason}, mode=${mode}, total=${total}, protected=${protected}, candidates=${candidates}, min_age=${min_age}s, require_idle=${require_idle})"
+        rm -f "$ps_tmp" "$stats_tmp" "$kill_tmp" "$sample_tmp" 2>/dev/null || true
+        return 1
+    fi
+
+    sample="$(tr '\n' ';' < "$sample_tmp" 2>/dev/null | head -c 700)"
+    log "REAP: removing ${selected} unprotected task containers (reason=${reason}, mode=${mode}, total=${total}, protected=${protected}, candidates=${candidates}, min_age=${min_age}s, require_idle=${require_idle}) sample=${sample}"
+    xargs -r -n 10 timeout 30 docker rm -f < "$kill_tmp" >/dev/null 2>&1 || true
+    rm -f "$ps_tmp" "$stats_tmp" "$kill_tmp" "$sample_tmp" 2>/dev/null || true
+    return 0
 }
 
 enforce_container_limit() {
-    local running status_age
+    local running status_age target excess limit pressure_reason reap_min_age
     # 只统计 task 容器（带数字前缀 + client/helper 后缀），不算 pool_server 等基础容器
     running=$(task_container_count 2>/dev/null || echo 0)
     LAST_RUNNING_TASKS="$running"
 
-    if [ "${running}" -gt "${HARD_KILL_THRESHOLD}" ]; then
-        local excess=$((running - MAX_RUNNING_CONTAINERS))
-        if pool_status_allows_task_container_reap; then
-            log "HARD LIMIT: ${running} task containers > ${HARD_KILL_THRESHOLD}, pool active=${LAST_POOL_ACTIVE}, killing ${excess} oldest"
-            kill_task_containers_for_pressure "hard task container limit ${running}>${HARD_KILL_THRESHOLD}" "${excess}" || true
+    if [ "${running}" -gt "${HARD_KILL_THRESHOLD}" ] 2>/dev/null \
+       || [ "${LAST_SHIM_PROCS:-0}" -ge "${SHIM_PROC_WARN}" ] 2>/dev/null; then
+        if [ "${running}" -gt "${HARD_KILL_THRESHOLD}" ] 2>/dev/null; then
+            pressure_reason="hard task container limit ${running}>${HARD_KILL_THRESHOLD}"
+            reap_min_age="${WATCHDOG_STALE_MIN_AGE_HARD}"
+            if [ "${LAST_SHIM_PROCS:-0}" -ge "${SHIM_PROC_WARN}" ] 2>/dev/null; then
+                pressure_reason="${pressure_reason}; shim pressure ${LAST_SHIM_PROCS:-0}>=${SHIM_PROC_WARN}"
+            fi
+        else
+            pressure_reason="shim pressure ${LAST_SHIM_PROCS:-0}>=${SHIM_PROC_WARN}"
+            reap_min_age="${WATCHDOG_STALE_MIN_AGE_PRESSURE}"
+        fi
+        if pool_status_is_fresh; then
+            target="$(task_container_reap_target)"
+            excess=$((running - target))
+            if [ "$excess" -le 0 ] 2>/dev/null; then
+                log "HARD/PRESSURE: ${pressure_reason}, but running=${running} <= protected target=${target} (pool active=${LAST_POOL_ACTIVE}, protected=${LAST_POOL_PROTECTED_COUNT}); no task reap"
+                return
+            fi
+            limit="$(min_int "$excess" "$WATCHDOG_HARD_REAP_BATCH")"
+            log "HARD/PRESSURE: ${pressure_reason}; running=${running} target=${target} pool active=${LAST_POOL_ACTIVE} protected=${LAST_POOL_PROTECTED_COUNT}; reaping up to ${limit}"
+            reap_unprotected_task_containers "${pressure_reason}" "${limit}" "${reap_min_age}" "hard" 0 || true
         else
             status_age="$(pool_status_age_seconds)"
-            log "HARD LIMIT suppressed: ${running} task containers > ${HARD_KILL_THRESHOLD}, but pool active=${LAST_POOL_ACTIVE} status_age=${status_age}s; not killing active rollout containers"
+            excess=$((running - MAX_RUNNING_CONTAINERS))
+            if [ "$excess" -le 0 ] 2>/dev/null; then
+                log "HARD/PRESSURE suppressed: ${pressure_reason}, pool status stale active=${LAST_POOL_ACTIVE} status_age=${status_age}s and running=${running} <= ${MAX_RUNNING_CONTAINERS}"
+                return
+            fi
+            limit="$(min_int "$excess" "$WATCHDOG_HARD_REAP_BATCH")"
+            log "HARD/PRESSURE conservative reap: ${pressure_reason}; pool status stale active=${LAST_POOL_ACTIVE} status_age=${status_age}s; only very old idle unprotected containers are eligible (limit=${limit})"
+            reap_unprotected_task_containers "${pressure_reason}; stale pool status" "${limit}" "${WATCHDOG_STALE_STATUS_MIN_AGE}" "stale_status" 1 || true
         fi
         return
     fi
 
     if [ "${running}" -gt "${MAX_RUNNING_CONTAINERS}" ]; then
-        local excess=$((running - MAX_RUNNING_CONTAINERS))
-        if pool_status_allows_task_container_reap; then
-            log "Soft limit: ${running} task containers > ${MAX_RUNNING_CONTAINERS}, pool active=${LAST_POOL_ACTIVE}, killing ${excess} oldest"
-            kill_task_containers_for_pressure "soft task container limit ${running}>${MAX_RUNNING_CONTAINERS}" "${excess}" || true
+        if pool_status_is_fresh; then
+            target="$(task_container_reap_target)"
+            excess=$((running - target))
+            if [ "$excess" -le 0 ] 2>/dev/null; then
+                log "Soft limit: ${running} task containers > ${MAX_RUNNING_CONTAINERS}, but running <= protected target=${target} (pool active=${LAST_POOL_ACTIVE}, protected=${LAST_POOL_PROTECTED_COUNT}); no task reap"
+                return
+            fi
+            limit="$(min_int "$excess" "$WATCHDOG_SOFT_REAP_BATCH")"
+            log "Soft limit: ${running} task containers > ${MAX_RUNNING_CONTAINERS}; running=${running} target=${target} pool active=${LAST_POOL_ACTIVE} protected=${LAST_POOL_PROTECTED_COUNT}; reaping up to ${limit} old idle unprotected containers"
+            reap_unprotected_task_containers "soft task container limit ${running}>${MAX_RUNNING_CONTAINERS}" "${limit}" "${WATCHDOG_STALE_MIN_AGE_SOFT}" "soft" 1 || true
         else
             status_age="$(pool_status_age_seconds)"
-            log "Soft limit suppressed: ${running} task containers > ${MAX_RUNNING_CONTAINERS}, but pool active=${LAST_POOL_ACTIVE} status_age=${status_age}s; not killing active rollout containers"
+            log "Soft limit suppressed: ${running} task containers > ${MAX_RUNNING_CONTAINERS}, pool status stale active=${LAST_POOL_ACTIVE} status_age=${status_age}s; not killing possible active rollout containers"
         fi
     fi
 }
@@ -1097,6 +1508,7 @@ log "  pool=${POOL_HOST}:${POOL_PORT}  pool_server_regex=${POOL_SERVER_NAME_REGE
 log "  pool_pending repair=${POOL_PENDING_CLOSES_REPAIR} warn=${POOL_PENDING_CLOSES_WARN} threshold=${POOL_PENDING_CLOSES_REPAIR_THRESHOLD} stuck_checks=${POOL_PENDING_CLOSES_STUCK_CHECKS} active_max=${POOL_PENDING_CLOSES_ACTIVE_MAX} reap_limit=${POOL_PENDING_CLOSES_REAP_LIMIT} cooldown=${POOL_PENDING_CLOSES_REPAIR_COOLDOWN_S}s cancel_api=${POOL_PENDING_CLOSES_CANCEL_API} cancel_timeout=${POOL_PENDING_CLOSES_CANCEL_TIMEOUT}s kill_when_active=${POOL_PENDING_CLOSES_KILL_CONTAINERS_WHEN_ACTIVE}"
 log "  task_container_regex=${TASK_CONTAINER_REGEX}"
 log "  task_image_regex=${TASK_IMAGE_REGEX}"
+log "  task_reap headroom=${WATCHDOG_REAP_HEADROOM} soft_batch=${WATCHDOG_SOFT_REAP_BATCH} hard_batch=${WATCHDOG_HARD_REAP_BATCH} soft_age=${WATCHDOG_STALE_MIN_AGE_SOFT}s pressure_age=${WATCHDOG_STALE_MIN_AGE_PRESSURE}s hard_age=${WATCHDOG_STALE_MIN_AGE_HARD}s stale_status_age=${WATCHDOG_STALE_STATUS_MIN_AGE}s low_cpu=${WATCHDOG_STALE_LOW_CPU_PCT}% low_mem=${WATCHDOG_STALE_LOW_MEM_MB}MiB stats_timeout=${WATCHDOG_STATS_TIMEOUT}s"
 log "  docker_data_root=${DOCKER_DATA_ROOT}  proxy_url=${PROXY_URL}  proxy_env_file=${PROXY_ENV_FILE}"
 log "  auto_repair=${WATCHDOG_AUTO_REPAIR} repair_mode=${WATCHDOG_REPAIR_MODE} repair_cooldown=${REPAIR_COOLDOWN_S}s repair_lock=${REPAIR_LOCK_DIR}"
 log "  log_file=${LOG_FILE}  log_max=${LOG_MAX_BYTES}"
