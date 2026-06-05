@@ -878,8 +878,8 @@ else
   # requests against the pool. With 1 worker pool (--max-tasks 16 default), the
   # original 16*8=128 burst easily saturates docker. Drop to 8*4=32 to leave
   # room for retries and to avoid the connection-reset cascade seen in run-3.
-  ROLLOUT_BATCH_SIZE="${ROLLOUT_BATCH_SIZE:-8}"
-  N_SAMPLES="${N_SAMPLES:-4}"
+  ROLLOUT_BATCH_SIZE="${ROLLOUT_BATCH_SIZE:-16}"
+  N_SAMPLES="${N_SAMPLES:-8}"
   MAX_TOKENS_PER_GPU="${MAX_TOKENS_PER_GPU:-16384}"
 fi
 ROLLOUT_MAX_RESPONSE_LEN="${ROLLOUT_MAX_RESPONSE_LEN:-8192}"

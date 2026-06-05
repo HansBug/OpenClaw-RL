@@ -137,7 +137,7 @@ wait_for_dockerd_api() {
   [ "${max_attempts}" -gt 0 ] 2>/dev/null || max_attempts=60
   log "  waiting for dockerd API (${label}, up to ${DOCKER_START_WAIT_SECONDS}s) ..."
   for i in $(seq 1 "${max_attempts}"); do
-    if timeout 5 docker info >/dev/null 2>&1; then
+    if timeout 10 docker info >/dev/null 2>&1; then
       log "  [OK] dockerd API ready after ~$((i*5))s (${label})"
       return 0
     fi

@@ -76,6 +76,39 @@ bash terminal-rl/terminal_qwen3_8b_rl.sh
 
 ---
 
+### Qwen3-8B eval-only on puyuan cluster
+
+Run these from `/mnt/shared-storage-user/puyuan/code/OpenClaw-RL` on a 4-GPU node. The mock suite evaluates AgentSafetyBench train and AgentHarm val with local mock envs, so no Docker worker is required.
+
+```bash
+EVAL_SUITE=mock EVAL_CKPT=init \
+  bash terminal-rl/terminal-rl_qwen3-8b_eval_pu.sh
+
+EVAL_SUITE=mock EVAL_CKPT=step119 \
+  bash terminal-rl/terminal-rl_qwen3-8b_eval_pu.sh
+```
+
+Smoke test the same path with two samples per dataset:
+
+```bash
+EVAL_SUITE=mock EVAL_CKPT=init EVAL_LIMIT=2 \
+  bash terminal-rl/terminal-rl_qwen3-8b_eval_pu.sh
+```
+
+Run SETA after pool workers are ready:
+
+```bash
+EVAL_SUITE=seta EVAL_CKPT=init WORKER_URLS=http://<worker-host>:18081 \
+  bash terminal-rl/terminal-rl_qwen3-8b_eval_pu.sh
+
+EVAL_SUITE=seta EVAL_CKPT=step119 WORKER_URLS=http://<worker-host>:18081 \
+  bash terminal-rl/terminal-rl_qwen3-8b_eval_pu.sh
+```
+
+Outputs are written under `runs/eval_qwen3-8b_<ckpt>_<suite>_<timestamp>/logs/`, including `eval.log`, `ray_job.log`, and `metrics.jsonl`.
+
+---
+
 ### PRM training (optional)
 
 To enable PRM scoring with the 2-node script, add:
