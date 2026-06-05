@@ -91,7 +91,45 @@ CPU_POOL_LOG_MAX_BYTES="${CPU_POOL_LOG_MAX_BYTES:-209715200}"
 CPU_POOL_LOG_TAIL_BYTES="${CPU_POOL_LOG_TAIL_BYTES:-52428800}"
 CPU_ERR_SCAN_LINES="${CPU_ERR_SCAN_LINES:-5000}"
 
+# ── Log paths ─────────────────────────────────────────────────────────────────
+TMP_DOC_LATEST="${REPO_ROOT}/tmp_doc_latest"
+REMOTE_LOG_ROOT="${REMOTE_LOG_ROOT:-${TMP_DOC_LATEST}/remote_logs}"
+CPU_WORKER_ID="${CPU_WORKER_ID:-$(hostname -f 2>/dev/null || hostname 2>/dev/null || echo unknown-worker)}"
+CPU_WORKER_ID="$(printf '%s' "${CPU_WORKER_ID}" | tr -c 'A-Za-z0-9_.-' '_')"
+OPENCLAW_REMOTE_RUN_ID="${OPENCLAW_REMOTE_RUN_ID:-$(date +%Y%m%d_%H%M%S)_pid$$}"
+OPENCLAW_REMOTE_LOG_DIR="${OPENCLAW_REMOTE_LOG_DIR:-${REMOTE_LOG_ROOT}/${CPU_WORKER_ID}/${OPENCLAW_REMOTE_RUN_ID}}"
+CPU_POOL_LOG="${CPU_POOL_LOG:-${OPENCLAW_REMOTE_LOG_DIR}/cpu_pool.log}"
+CPU_ERR_LOG="${CPU_ERR_LOG:-${OPENCLAW_REMOTE_LOG_DIR}/cpu_err.log}"
+export REMOTE_LOG_ROOT CPU_WORKER_ID OPENCLAW_REMOTE_RUN_ID OPENCLAW_REMOTE_LOG_DIR
+mkdir -p "${TMP_DOC_LATEST}" "${OPENCLAW_REMOTE_LOG_DIR}" "$(dirname "${CPU_POOL_LOG}")" "$(dirname "${CPU_ERR_LOG}")"
+ln -sfn "${OPENCLAW_REMOTE_LOG_DIR}" "${REMOTE_LOG_ROOT}/${CPU_WORKER_ID}/latest_server" 2>/dev/null || true
+
+rotate_file_in_place() {
+    local file="$1"
+    local max_bytes="$2"
+    local tail_bytes="$3"
+    local size tmp
+    [ -f "${file}" ] || return 0
+    size=$(stat -c%s "${file}" 2>/dev/null || echo 0)
+    [ -n "${size}" ] && [ "${size}" -ge 0 ] 2>/dev/null || size=0
+    [ "${size}" -gt "${max_bytes}" ] || return 0
+    tmp="$(mktemp "${TMP_DOC_LATEST}/rotate.XXXXXX")"
+    tail -c "${tail_bytes}" "${file}" > "${tmp}" 2>/dev/null || true
+    : > "${file}"
+    cat "${tmp}" >> "${file}" 2>/dev/null || true
+    rm -f "${tmp}" 2>/dev/null || true
+    log "  rotated ${file}: kept last ${tail_bytes} bytes from ${size} bytes"
+}
+
+rotate_file_in_place "${CPU_POOL_LOG}" "${CPU_POOL_LOG_MAX_BYTES}" "${CPU_POOL_LOG_TAIL_BYTES}"
+exec > >(tee -a "${CPU_POOL_LOG}") 2>&1
+
 log "=== pool_server_pu_v2 starting ==="
+log "  worker id: ${CPU_WORKER_ID}"
+log "  run id:    ${OPENCLAW_REMOTE_RUN_ID}"
+log "  log dir:   ${OPENCLAW_REMOTE_LOG_DIR}"
+log "  full log: ${CPU_POOL_LOG}"
+log "  err log:  ${CPU_ERR_LOG}"
 log "  max_tasks=${WORKER_MAX_TASKS}  max_runs_per_task=${WORKER_MAX_RUNS_PER_TASK}"
 log "  max_concurrent_closes=${WORKER_MAX_CONCURRENT_CLOSES}"
 log "  max_concurrent_builds=${WORKER_MAX_CONCURRENT_BUILDS}"
@@ -114,34 +152,6 @@ if [[ "${SKIP_PROXY_ENV}" != "1" && -f "${PROXY_ENV_FILE}" ]]; then
 elif [[ "${SKIP_PROXY_ENV}" != "1" ]]; then
     log "  proxy env not found at ${PROXY_ENV_FILE}; continuing without it"
 fi
-
-# ── Log paths ─────────────────────────────────────────────────────────────────
-TMP_DOC_LATEST="${REPO_ROOT}/tmp_doc_latest"
-mkdir -p "${TMP_DOC_LATEST}"
-CPU_POOL_LOG="${TMP_DOC_LATEST}/cpu_pool.log"
-CPU_ERR_LOG="${TMP_DOC_LATEST}/cpu_err.log"
-
-log "  full log: ${CPU_POOL_LOG}"
-log "  err log:  ${CPU_ERR_LOG}"
-
-rotate_file_in_place() {
-    local file="$1"
-    local max_bytes="$2"
-    local tail_bytes="$3"
-    local size tmp
-    [ -f "${file}" ] || return 0
-    size=$(stat -c%s "${file}" 2>/dev/null || echo 0)
-    [ -n "${size}" ] && [ "${size}" -ge 0 ] 2>/dev/null || size=0
-    [ "${size}" -gt "${max_bytes}" ] || return 0
-    tmp="$(mktemp "${TMP_DOC_LATEST}/rotate.XXXXXX")"
-    tail -c "${tail_bytes}" "${file}" > "${tmp}" 2>/dev/null || true
-    : > "${file}"
-    cat "${tmp}" >> "${file}" 2>/dev/null || true
-    rm -f "${tmp}" 2>/dev/null || true
-    log "  rotated ${file}: kept last ${tail_bytes} bytes from ${size} bytes"
-}
-
-rotate_file_in_place "${CPU_POOL_LOG}" "${CPU_POOL_LOG_MAX_BYTES}" "${CPU_POOL_LOG_TAIL_BYTES}"
 
 docker_disk_snapshot() {
     df -P -BG "${DOCKER_DATA_ROOT}" 2>/dev/null | awk 'NR==2 {gsub("%","",$5); gsub("G","",$4); print $5, $4}'
@@ -443,5 +453,4 @@ exec stdbuf -oL -eL \
     --max-tasks "${WORKER_MAX_TASKS}" \
     --max-runs-per-task "${WORKER_MAX_RUNS_PER_TASK}" \
     --max-concurrent-closes "${WORKER_MAX_CONCURRENT_CLOSES}" \
-    --output-root "${TBENCH_OUTPUT_ROOT}" \
-    2>&1 | tee -a "${CPU_POOL_LOG}"
+    --output-root "${TBENCH_OUTPUT_ROOT}"

@@ -7,6 +7,7 @@ import os
 import shutil
 import subprocess
 import time
+import traceback
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -361,6 +362,16 @@ class RunSlot:
     env: TerminalEnv
     last_used_ts: float = field(default_factory=time.time)
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    phase: str = "allocated"
+    in_flight_ops: int = 0
+    active_op: str | None = None
+    close_requested: bool = False
+    close_reason: str | None = None
+    close_requested_ts: float | None = None
+    reset_started_ts: float | None = None
+    reset_completed_ts: float | None = None
+    first_step_ts: float | None = None
+    evaluate_completed_ts: float | None = None
 
 
 @dataclass
@@ -408,9 +419,129 @@ class WorkerPool:
     def _new_env(self) -> TerminalEnv:
         return TerminalEnv()
 
+    @staticmethod
+    def _run_slot_container_ref(run_slot: RunSlot) -> str:
+        env = run_slot.env
+        terminal = getattr(env, "_terminal", None)
+        container = getattr(terminal, "container", None) if terminal is not None else None
+        container_id = getattr(container, "id", None) or "?"
+        if isinstance(container_id, str) and len(container_id) > 12:
+            container_id = container_id[:12]
+        container_name = (
+            getattr(container, "name", None)
+            or getattr(env, "_last_client_container_name", None)
+            or "?"
+        )
+        container_status = getattr(container, "status", None) or "?"
+        trial_name = getattr(env, "_last_trial_name", None) or "?"
+        return (
+            f"container_name={container_name} container_id={container_id} "
+            f"container_status={container_status} trial={trial_name}"
+        )
+
+    def _pop_run_slot_locked(
+        self, run_lease_id: str
+    ) -> tuple[str, RunSlot] | None:
+        task_key = self._run_to_task.pop(run_lease_id, None)
+        if task_key is None:
+            return None
+        task_slot = self._tasks.get(task_key)
+        run_slot = task_slot.runs.pop(run_lease_id, None) if task_slot else None
+        if task_slot is not None and not task_slot.runs:
+            self._tasks.pop(task_key, None)
+            logger.info("Removed empty task slot: %s", task_key)
+        if run_slot is None:
+            return None
+        return task_key, run_slot
+
+    def _phase_for_op(self, op_name: str) -> str:
+        return {
+            "reset": "resetting",
+            "exec_tool": "stepping",
+            "evaluate": "evaluating",
+            "heartbeat": "heartbeat",
+        }.get(op_name, op_name)
+
+    async def _begin_run_op(self, run_lease_id: str, op_name: str) -> RunSlot:
+        async with self._lock:
+            run_slot = self._get_run_slot(run_lease_id)
+            if run_slot.close_requested:
+                raise RuntimeError(
+                    f"Run {run_lease_id} is closing; rejecting new {op_name} request"
+                )
+            now = time.time()
+            run_slot.in_flight_ops += 1
+            run_slot.active_op = op_name
+            run_slot.phase = self._phase_for_op(op_name)
+            run_slot.last_used_ts = now
+            if op_name == "reset":
+                run_slot.reset_started_ts = now
+            logger.debug(
+                "Run op begin: lease=%s task=%s op=%s phase=%s in_flight=%d %s",
+                run_lease_id,
+                run_slot.task_key,
+                op_name,
+                run_slot.phase,
+                run_slot.in_flight_ops,
+                self._run_slot_container_ref(run_slot),
+            )
+            return run_slot
+
+    async def _finish_run_op(
+        self, run_slot: RunSlot, op_name: str, *, success: bool
+    ) -> None:
+        close_after: tuple[str, str, RunSlot, str] | None = None
+        async with self._lock:
+            now = time.time()
+            run_slot.in_flight_ops = max(0, run_slot.in_flight_ops - 1)
+            run_slot.last_used_ts = now
+            if success:
+                if op_name == "reset":
+                    run_slot.reset_completed_ts = now
+                    run_slot.phase = "ready"
+                elif op_name == "exec_tool":
+                    if run_slot.first_step_ts is None:
+                        run_slot.first_step_ts = now
+                    run_slot.phase = "stepped"
+                elif op_name == "evaluate":
+                    run_slot.evaluate_completed_ts = now
+                    run_slot.phase = "evaluated"
+                elif run_slot.in_flight_ops == 0:
+                    run_slot.phase = "ready"
+            else:
+                run_slot.phase = "failed"
+            if run_slot.in_flight_ops == 0:
+                run_slot.active_op = None
+
+            if run_slot.close_requested and run_slot.in_flight_ops == 0:
+                popped = self._pop_run_slot_locked(run_slot.run_lease_id)
+                if popped is not None:
+                    task_key, popped_slot = popped
+                    close_reason = (
+                        "Closing run slot after in-flight "
+                        f"{op_name}: {popped_slot.close_reason or 'close_requested'}"
+                    )
+                    close_after = (
+                        task_key,
+                        popped_slot.run_lease_id,
+                        popped_slot,
+                        close_reason,
+                    )
+
+        if close_after is not None:
+            task_key, run_lease_id, slot_to_close, close_reason = close_after
+            self._schedule_close(
+                task_key,
+                run_lease_id,
+                slot_to_close,
+                reason=close_reason,
+            )
+
     async def _close_run_slot_under_lock(self, run_slot: RunSlot) -> None:
         async with run_slot.lock:
+            run_slot.phase = "closing"
             await run_slot.env.close()
+            run_slot.phase = "closed"
 
     def _prune_done_closing_tasks(self) -> int:
         done = {task for task in self._closing_tasks if task.done()}
@@ -507,6 +638,10 @@ class WorkerPool:
         for task_key, task_slot in list(self._tasks.items()):
             expired_runs: list[str] = []
             for rid, rslot in task_slot.runs.items():
+                if rslot.in_flight_ops > 0 or rslot.lock.locked():
+                    continue
+                if rslot.close_requested:
+                    continue
                 if now - rslot.last_used_ts > self.run_idle_ttl:
                     expired_runs.append(rid)
 
@@ -584,10 +719,13 @@ class WorkerPool:
         return {"lease_id": run_lease_id, "reused": False}
 
     async def heartbeat(self, run_lease_id: str) -> None:
-        async with self._lock:
-            run_slot = self._get_run_slot(run_lease_id)
-        async with run_slot.lock:
-            run_slot.last_used_ts = time.time()
+        run_slot = await self._begin_run_op(run_lease_id, "heartbeat")
+        success = False
+        try:
+            async with run_slot.lock:
+                success = True
+        finally:
+            await self._finish_run_op(run_slot, "heartbeat", success=success)
 
     async def reset(
         self,
@@ -599,8 +737,7 @@ class WorkerPool:
         if not isinstance(task_meta, dict):
             raise ValueError("task_meta must be a dict")
 
-        async with self._lock:
-            run_slot = self._get_run_slot(run_lease_id)
+        run_slot = await self._begin_run_op(run_lease_id, "reset")
 
         run_ctx = _build_run_ctx(
             run_ctx_payload, default_log_dir=self.output_root / "AgentRunner_Output"
@@ -608,55 +745,102 @@ class WorkerPool:
         timeouts = _parse_timeout_overrides(self.default_timeouts, task_timeouts)
         task_spec = _build_task_spec(task_meta)
 
-        async with run_slot.lock:
-            user_msg, tool_schemas = await run_slot.env.reset(
-                task_meta=task_meta,
-                task_spec=task_spec,
-                run_ctx=run_ctx,
-                timeouts=timeouts,
-            )
-            run_slot.last_used_ts = time.time()
-            return {"user_msg": user_msg, "tool_schemas": tool_schemas}
+        success = False
+        try:
+            async with run_slot.lock:
+                user_msg, tool_schemas = await run_slot.env.reset(
+                    task_meta=task_meta,
+                    task_spec=task_spec,
+                    run_ctx=run_ctx,
+                    timeouts=timeouts,
+                )
+                success = True
+                return {"user_msg": user_msg, "tool_schemas": tool_schemas}
+        finally:
+            await self._finish_run_op(run_slot, "reset", success=success)
 
     async def exec_tool(
         self, run_lease_id: str, tool_name: str, arguments: dict[str, Any] | None = None
     ) -> str:
-        async with self._lock:
-            run_slot = self._get_run_slot(run_lease_id)
-        async with run_slot.lock:
-            observation = await run_slot.env.exec_tool(tool_name, arguments or {})
-            run_slot.last_used_ts = time.time()
-            return str(observation)
+        run_slot = await self._begin_run_op(run_lease_id, "exec_tool")
+        success = False
+        try:
+            async with run_slot.lock:
+                observation = await run_slot.env.exec_tool(tool_name, arguments or {})
+                success = True
+                return str(observation)
+        finally:
+            await self._finish_run_op(run_slot, "exec_tool", success=success)
 
     async def evaluate(
         self, run_lease_id: str, trajectory: dict[str, Any] | None = None
     ) -> tuple[float, dict[str, Any] | None]:
-        async with self._lock:
-            run_slot = self._get_run_slot(run_lease_id)
-        async with run_slot.lock:
-            score = await run_slot.env.evaluate(trajectory)
-            details = run_slot.env.last_eval_details()
-            run_slot.last_used_ts = time.time()
-            return float(score), details
+        run_slot = await self._begin_run_op(run_lease_id, "evaluate")
+        success = False
+        try:
+            async with run_slot.lock:
+                score = await run_slot.env.evaluate(trajectory)
+                details = run_slot.env.last_eval_details()
+                success = True
+                return float(score), details
+        finally:
+            await self._finish_run_op(run_slot, "evaluate", success=success)
 
-    async def close_run(self, run_lease_id: str) -> bool:
+    async def close_run(self, run_lease_id: str, *, reason: str = "external_close") -> bool:
+        close_now: tuple[str, str, RunSlot] | None = None
         async with self._lock:
-            task_key = self._run_to_task.pop(run_lease_id, None)
+            task_key = self._run_to_task.get(run_lease_id)
             if task_key is None:
                 logger.debug(
                     "close_run: lease %s already gone, nothing to do.", run_lease_id
                 )
                 return False
             task_slot = self._tasks.get(task_key)
-            run_slot = task_slot.runs.pop(run_lease_id, None) if task_slot else None
-            if task_slot is not None and not task_slot.runs:
-                self._tasks.pop(task_key, None)
-                logger.info("Removed empty task slot: %s", task_key)
+            run_slot = task_slot.runs.get(run_lease_id) if task_slot else None
+            if run_slot is None:
+                return False
 
-        if run_slot is not None:
-            self._schedule_close(
-                task_key, run_lease_id, run_slot, reason="Closing run slot"
+            if run_slot.close_requested:
+                logger.info(
+                    "close_run: duplicate close ignored lease=%s task=%s phase=%s "
+                    "in_flight=%d reason=%s %s",
+                    run_lease_id,
+                    task_key,
+                    run_slot.phase,
+                    run_slot.in_flight_ops,
+                    run_slot.close_reason,
+                    self._run_slot_container_ref(run_slot),
+                )
+                return True
+
+            run_slot.close_requested = True
+            run_slot.close_reason = reason
+            run_slot.close_requested_ts = time.time()
+            stack = "".join(traceback.format_stack(limit=8))
+            logger.warning(
+                "close_run requested lease=%s task=%s phase=%s in_flight=%d "
+                "first_step=%s evaluate_done=%s reason=%s %s\nClose request stack:\n%s",
+                run_lease_id,
+                task_key,
+                run_slot.phase,
+                run_slot.in_flight_ops,
+                run_slot.first_step_ts is not None,
+                run_slot.evaluate_completed_ts is not None,
+                reason,
+                self._run_slot_container_ref(run_slot),
+                stack,
             )
+            if run_slot.in_flight_ops > 0 or run_slot.lock.locked():
+                run_slot.phase = "closing_requested"
+                return True
+
+            popped = self._pop_run_slot_locked(run_lease_id)
+            if popped is not None:
+                close_now = popped
+
+        if close_now is not None:
+            task_key, run_lease_id, run_slot = close_now
+            self._schedule_close(task_key, run_lease_id, run_slot, reason="Closing run slot")
         return True
 
     async def status(self) -> dict[str, Any]:
@@ -675,8 +859,23 @@ class WorkerPool:
             }
             tasks_info: dict[str, Any] = {}
             total_runs = 0
+            in_flight_runs = 0
+            closing_requested_runs = 0
             for tk, ts in self._tasks.items():
-                tasks_info[tk] = {"active_runs": len(ts.runs)}
+                run_details = {}
+                for rid, rslot in ts.runs.items():
+                    if rslot.in_flight_ops > 0:
+                        in_flight_runs += 1
+                    if rslot.close_requested:
+                        closing_requested_runs += 1
+                    run_details[rid] = {
+                        "phase": rslot.phase,
+                        "in_flight_ops": rslot.in_flight_ops,
+                        "active_op": rslot.active_op,
+                        "close_requested": rslot.close_requested,
+                        "age_sec": round(now - rslot.last_used_ts, 1),
+                    }
+                tasks_info[tk] = {"active_runs": len(ts.runs), "runs": run_details}
                 total_runs += len(ts.runs)
 
             return {
@@ -684,6 +883,8 @@ class WorkerPool:
                 "active_tasks": len(self._tasks),
                 "max_runs_per_task": self.max_runs_per_task,
                 "total_active_runs": total_runs,
+                "in_flight_runs": in_flight_runs,
+                "closing_requested_runs": closing_requested_runs,
                 "pending_closes": len(self._closing_tasks),
                 "pending_close_age_sec": pending_close_age_sec,
                 "tasks": tasks_info,
@@ -1069,7 +1270,7 @@ async def reset(request: Request) -> JSONResponse:
     except Exception as exc:
         logger.exception("Reset failed for lease_id=%s", lease_id)
         try:
-            await POOL.close_run(str(lease_id))
+            await POOL.close_run(str(lease_id), reason="reset_failure")
         except Exception:
             logger.exception("Failed to schedule cleanup after reset failure for %s", lease_id)
         return JSONResponse({"ok": False, "error": str(exc)}, status_code=500)
@@ -1160,7 +1361,7 @@ async def close(request: Request) -> JSONResponse:
         )
 
     try:
-        found = await POOL.close_run(str(lease_id))
+        found = await POOL.close_run(str(lease_id), reason="http_close")
         return JSONResponse({"ok": True, "found": found})
     except Exception as exc:
         return JSONResponse({"ok": False, "error": str(exc)}, status_code=500)

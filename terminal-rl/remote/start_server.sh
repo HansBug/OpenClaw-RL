@@ -9,6 +9,17 @@ set -euo pipefail
 REPO_ROOT="${REPO_ROOT:-/mnt/shared-storage-user/puyuan/code/OpenClaw-RL}"
 cd "${REPO_ROOT}"
 
+REMOTE_LOG_ROOT="${REMOTE_LOG_ROOT:-${REPO_ROOT}/tmp_doc_latest/remote_logs}"
+CPU_WORKER_ID="${CPU_WORKER_ID:-$(hostname -f 2>/dev/null || hostname 2>/dev/null || echo unknown-worker)}"
+CPU_WORKER_ID="$(printf '%s' "${CPU_WORKER_ID}" | tr -c 'A-Za-z0-9_.-' '_')"
+OPENCLAW_REMOTE_RUN_ID="${OPENCLAW_REMOTE_RUN_ID:-$(date +%Y%m%d_%H%M%S)_pid$$}"
+OPENCLAW_REMOTE_LOG_DIR="${OPENCLAW_REMOTE_LOG_DIR:-${REMOTE_LOG_ROOT}/${CPU_WORKER_ID}/${OPENCLAW_REMOTE_RUN_ID}}"
+export REMOTE_LOG_ROOT CPU_WORKER_ID OPENCLAW_REMOTE_RUN_ID OPENCLAW_REMOTE_LOG_DIR
+export CPU_POOL_LOG="${CPU_POOL_LOG:-${OPENCLAW_REMOTE_LOG_DIR}/cpu_pool.log}"
+export CPU_ERR_LOG="${CPU_ERR_LOG:-${OPENCLAW_REMOTE_LOG_DIR}/cpu_err.log}"
+mkdir -p "${OPENCLAW_REMOTE_LOG_DIR}"
+ln -sfn "${OPENCLAW_REMOTE_LOG_DIR}" "${REMOTE_LOG_ROOT}/${CPU_WORKER_ID}/latest_server" 2>/dev/null || true
+
 if [ -f "${REPO_ROOT}/.venv/bin/activate" ]; then
     # shellcheck disable=SC1091
     source "${REPO_ROOT}/.venv/bin/activate"
@@ -61,6 +72,11 @@ echo "  OpenClaw pool_server"
 echo "  repo:                 ${REPO_ROOT}"
 echo "  python:               $(command -v python || true)"
 echo "  port:                 ${ENV_SERVER_PORT}"
+echo "  worker_id:            ${CPU_WORKER_ID}"
+echo "  run_id:               ${OPENCLAW_REMOTE_RUN_ID}"
+echo "  log_dir:              ${OPENCLAW_REMOTE_LOG_DIR}"
+echo "  server_log:           ${CPU_POOL_LOG}"
+echo "  err_log:              ${CPU_ERR_LOG}"
 echo "  max_tasks:            ${WORKER_MAX_TASKS}"
 echo "  max_runs_per_task:    ${WORKER_MAX_RUNS_PER_TASK}"
 echo "  concurrent_closes:    ${WORKER_MAX_CONCURRENT_CLOSES}"
