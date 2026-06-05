@@ -305,6 +305,15 @@ task_container_ids() {
     task_container_lines | awk -F '\t' '{print $1}'
 }
 
+task_container_ids_oldest_first() {
+    timeout "${DOCKER_CLI_TIMEOUT}" docker ps --format '{{.CreatedAt}}\t{{.ID}}\t{{.Names}}\t{{.Image}}' 2>/dev/null \
+        | awk -F '\t' -v name_re="${TASK_CONTAINER_REGEX}" -v image_re="${TASK_IMAGE_REGEX}" '
+            $3 ~ name_re || $4 ~ image_re {print $0}
+        ' \
+        | sort \
+        | awk -F '\t' '{print $2}'
+}
+
 task_container_count() {
     task_container_lines | wc -l
 }
@@ -355,7 +364,7 @@ kill_task_containers_for_pressure() {
     local ids n
 
     if [ "${limit}" -gt 0 ] 2>/dev/null; then
-        ids="$(task_container_ids | head -n "${limit}" 2>/dev/null || true)"
+        ids="$(task_container_ids_oldest_first | head -n "${limit}" 2>/dev/null || true)"
     else
         ids="$(task_container_ids 2>/dev/null || true)"
     fi
@@ -404,7 +413,9 @@ repair_stuck_pool_pending_closes() {
     if [ "${active}" -eq 0 ] 2>/dev/null \
        || [ "${POOL_PENDING_CLOSES_KILL_CONTAINERS_WHEN_ACTIVE}" = "1" ]; then
         log "POOL_REPAIR: ${reason}; reaping task containers with broad matcher"
-        kill_task_containers_for_pressure "${reason}" "${POOL_PENDING_CLOSES_REAP_LIMIT}" || matched=0
+        if kill_task_containers_for_pressure "${reason}" "${POOL_PENDING_CLOSES_REAP_LIMIT}"; then
+            matched=1
+        fi
         timeout 30 docker container prune -f --filter "until=0s" >/dev/null 2>&1 || true
         timeout 30 docker network prune -f >/dev/null 2>&1 || true
     else
@@ -697,6 +708,7 @@ monitor_pod_cgroup() {
 LAST_POOL_ACTIVE="?"
 LAST_POOL_PENDING="?"
 LAST_BRIDGE_NETS="?"
+LAST_POOL_STATUS_TS=0
 check_pool_server() {
     local health_tmp health_code
     health_tmp="$(mktemp /tmp/pool_health.XXXXXX 2>/dev/null || echo /tmp/pool_health.$$)"
@@ -706,6 +718,7 @@ check_pool_server() {
         log "WARN: pool_server /healthz unreachable"
         LAST_POOL_ACTIVE="down"
         LAST_POOL_PENDING="down"
+        LAST_POOL_STATUS_TS=0
         rm -f "$health_tmp" 2>/dev/null || true
         return 1
     fi
@@ -737,6 +750,7 @@ except Exception:
         active="${active:-0}"
         LAST_POOL_PENDING="$pending"
         LAST_POOL_ACTIVE="$active"
+        LAST_POOL_STATUS_TS="$(date +%s)"
         if [ "$pending" -gt "$POOL_PENDING_CLOSES_WARN" ] 2>/dev/null; then
             POOL_PENDING_HIGH_COUNT=$((POOL_PENDING_HIGH_COUNT + 1))
             log "WARN: pool_server pending_closes=${pending} (active_runs=${active_runs}, active_tasks=${active_tasks}, high_count=${POOL_PENDING_HIGH_COUNT}/${POOL_PENDING_CLOSES_STUCK_CHECKS})"
@@ -749,6 +763,10 @@ except Exception:
         else
             POOL_PENDING_HIGH_COUNT=0
         fi
+    else
+        LAST_POOL_ACTIVE="unknown"
+        LAST_POOL_PENDING="unknown"
+        LAST_POOL_STATUS_TS=0
     fi
 
     local nets
@@ -918,23 +936,53 @@ monitor_docker_disk() {
 # ── 运行容器数上限（双闸门，排除 pool_server）─────────────────────────
 # 副作用：更新 LAST_RUNNING_TASKS 供 heartbeat 复用
 LAST_RUNNING_TASKS="?"
+pool_status_age_seconds() {
+    local now
+    now=$(date +%s)
+    if [ "${LAST_POOL_STATUS_TS:-0}" -le 0 ] 2>/dev/null; then
+        echo "unknown"
+        return 0
+    fi
+    echo $((now - LAST_POOL_STATUS_TS))
+}
+
+pool_status_allows_task_container_reap() {
+    local age max_age
+    [[ "${LAST_POOL_ACTIVE}" =~ ^[0-9]+$ ]] || return 1
+    age="$(pool_status_age_seconds)"
+    [[ "${age}" =~ ^[0-9]+$ ]] || return 1
+    max_age=$((POOL_CHECK_INTERVAL * 3))
+    [ "${age}" -le "${max_age}" ] 2>/dev/null || return 1
+    [ "${LAST_POOL_ACTIVE}" -eq 0 ] 2>/dev/null
+}
+
 enforce_container_limit() {
-    local running
+    local running status_age
     # 只统计 task 容器（带数字前缀 + client/helper 后缀），不算 pool_server 等基础容器
     running=$(task_container_count 2>/dev/null || echo 0)
     LAST_RUNNING_TASKS="$running"
 
     if [ "${running}" -gt "${HARD_KILL_THRESHOLD}" ]; then
         local excess=$((running - MAX_RUNNING_CONTAINERS))
-        log "HARD LIMIT: ${running} task containers > ${HARD_KILL_THRESHOLD}, killing ${excess} oldest"
-        kill_task_containers_for_pressure "hard task container limit ${running}>${HARD_KILL_THRESHOLD}" "${excess}" || true
+        if pool_status_allows_task_container_reap; then
+            log "HARD LIMIT: ${running} task containers > ${HARD_KILL_THRESHOLD}, pool active=${LAST_POOL_ACTIVE}, killing ${excess} oldest"
+            kill_task_containers_for_pressure "hard task container limit ${running}>${HARD_KILL_THRESHOLD}" "${excess}" || true
+        else
+            status_age="$(pool_status_age_seconds)"
+            log "HARD LIMIT suppressed: ${running} task containers > ${HARD_KILL_THRESHOLD}, but pool active=${LAST_POOL_ACTIVE} status_age=${status_age}s; not killing active rollout containers"
+        fi
         return
     fi
 
     if [ "${running}" -gt "${MAX_RUNNING_CONTAINERS}" ]; then
         local excess=$((running - MAX_RUNNING_CONTAINERS))
-        log "Soft limit: ${running} task containers > ${MAX_RUNNING_CONTAINERS}, killing ${excess} oldest"
-        kill_task_containers_for_pressure "soft task container limit ${running}>${MAX_RUNNING_CONTAINERS}" "${excess}" || true
+        if pool_status_allows_task_container_reap; then
+            log "Soft limit: ${running} task containers > ${MAX_RUNNING_CONTAINERS}, pool active=${LAST_POOL_ACTIVE}, killing ${excess} oldest"
+            kill_task_containers_for_pressure "soft task container limit ${running}>${MAX_RUNNING_CONTAINERS}" "${excess}" || true
+        else
+            status_age="$(pool_status_age_seconds)"
+            log "Soft limit suppressed: ${running} task containers > ${MAX_RUNNING_CONTAINERS}, but pool active=${LAST_POOL_ACTIVE} status_age=${status_age}s; not killing active rollout containers"
+        fi
     fi
 }
 
