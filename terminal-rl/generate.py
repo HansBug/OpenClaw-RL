@@ -39,7 +39,7 @@ from safety_reward import (
 
 logger = logging.getLogger(__name__)
 
-_DIRECT_SCORE_DATA_SOURCES = {"agent_safetybench", "agentharm"}
+_DIRECT_SCORE_DATA_SOURCES = {"agent_safetybench", "agentharm", "tau2"}
 
 
 def _env_bool(name: str, default: bool = False) -> bool:
@@ -1227,6 +1227,56 @@ class _LocalAgentHarmClient:
         await self._env.close()
 
 
+class _LocalTau2Client:
+    def __init__(self) -> None:
+        from remote.tau2_env import Tau2Env
+
+        self._env = Tau2Env()
+        self.last_evaluate_details: dict[str, Any] | None = None
+
+    async def reset(
+        self,
+        lease_id: str,
+        task_meta: dict[str, Any],
+        run_ctx: dict[str, Any],
+        task_timeouts: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        _ = (lease_id, task_timeouts)
+        local_run_ctx = RunContext(
+            uid=str(run_ctx.get("uid", "local")),
+            group_index=int(run_ctx.get("group_index", 0) or 0),
+            sample_index=int(run_ctx.get("sample_index", 0) or 0),
+            log_dir=Path(str(run_ctx.get("log_dir", "build_outputs"))),
+        )
+        user_msg, tool_schemas = await self._env.reset(
+            task_meta=task_meta,
+            task_spec=_make_task_spec(task_meta),
+            run_ctx=local_run_ctx,
+        )
+        return {"user_msg": user_msg, "tool_schemas": tool_schemas}
+
+    async def heartbeat(self, lease_id: str) -> None:
+        _ = lease_id
+
+    async def exec_tool(
+        self, lease_id: str, tool_name: str, arguments: dict[str, Any]
+    ) -> str:
+        _ = lease_id
+        return await self._env.exec_tool(tool_name, arguments)
+
+    async def evaluate(
+        self, lease_id: str, trajectory: dict[str, Any] | None = None
+    ) -> float:
+        _ = lease_id
+        score = await self._env.evaluate(trajectory)
+        self.last_evaluate_details = getattr(self._env, "_last_eval", None)
+        return score
+
+    async def close(self, lease_id: str) -> None:
+        _ = lease_id
+        await self._env.close()
+
+
 async def _create_env_client(
     task_spec: TaskSpec,
     run_ctx: RunContext,
@@ -1255,6 +1305,18 @@ async def _create_env_client(
             task_spec.task_path,
         )
         return _LocalAgentHarmClient(), "local-agentharm"
+
+    if (
+        isinstance(task_meta, dict)
+        and task_meta.get("data_source") == "tau2"
+        and os.getenv("TAU2_REMOTE_ENV", "0") != "1"
+    ):
+        logger.info(
+            "Using local tau2 env backend for task=%s path=%s",
+            task_spec.task_name,
+            task_spec.task_path,
+        )
+        return _LocalTau2Client(), "local-tau2"
 
     env_server_url = os.getenv("ENV_SERVER_URL", "")
     if not env_server_url:

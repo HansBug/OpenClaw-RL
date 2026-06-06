@@ -113,9 +113,9 @@ esac
 export ALGO
 DATASET="${DATASET:-seta}"
 case "${DATASET}" in
-  seta|safety|agentharm|mixed) ;;
+  seta|safety|agentharm|mixed|tau2) ;;
   *)
-    echo "[ERROR] Unknown DATASET=${DATASET}. Use: seta|safety|agentharm|mixed"
+    echo "[ERROR] Unknown DATASET=${DATASET}. Use: seta|safety|agentharm|mixed|tau2"
     exit 1
     ;;
 esac
@@ -182,6 +182,14 @@ sanitize_run_part() {
   printf '%s' "$1" | tr -c 'A-Za-z0-9_.-' '-' | sed 's/-\\{1,\\}/-/g; s/^-//; s/-$//'
 }
 
+default_tau2_task_split() {
+  case "${1:-telecom}" in
+    telecom) echo "train" ;;
+    mock) echo "base" ;;
+    *) echo "train" ;;
+  esac
+}
+
 build_dataset_tag() {
   case "${DATASET}" in
     seta)
@@ -192,6 +200,12 @@ build_dataset_tag() {
       ;;
     agentharm)
       echo "agentharm-$(short_mode "${AGENTHARM_REWARD}")"
+      ;;
+    tau2)
+      local tau2_domain tau2_split
+      tau2_domain="${TAU2_DOMAIN:-telecom}"
+      tau2_split="${TAU2_TASK_SPLIT:-$(default_tau2_task_split "${tau2_domain}")}"
+      echo "tau2-${tau2_domain}-${tau2_split}-${TAU2_POLICY_TYPE:-manual}"
       ;;
     mixed)
       local seta_ratio safety_ratio agentharm_ratio
@@ -372,6 +386,7 @@ source "${SLIME_DIR}/scripts/models/qwen3-8B.sh"
 #   seta    = seta_env only (capability tasks, Docker-based evaluation)
 #   safety  = Agent-SafetyBench only (safety tasks, no Docker needed)
 #   agentharm = inspect_evals/agentharm only (safety tool tasks, no Docker needed)
+#   tau2    = tau2-bench solo-compatible tasks (telecom / mock, no Docker needed)
 #   mixed   = configurable mix of seta / safety / agentharm
 #
 # SETA_SAFETY: safety reward mode for seta_env data
@@ -410,6 +425,16 @@ AGENT_SAFETYBENCH_ROOT="${AGENT_SAFETYBENCH_ROOT:-/mnt/shared-storage-user/puyua
 AGENTHARM_REWARD="${AGENTHARM_REWARD:-rule}"
 AGENTHARM_REMOTE_ENV="${AGENTHARM_REMOTE_ENV:-0}"
 AGENTHARM_ROOT="${AGENTHARM_ROOT:-/mnt/shared-storage-user/puyuan/code/inspect_evals/src/inspect_evals/agentharm}"
+TAU2_DOMAIN="${TAU2_DOMAIN:-telecom}"
+TAU2_TASK_SPLIT="${TAU2_TASK_SPLIT:-}"
+TAU2_POLICY_TYPE="${TAU2_POLICY_TYPE:-manual}"
+TAU2_REMOTE_ENV="${TAU2_REMOTE_ENV:-0}"
+TAU2_NUM_TASKS="${TAU2_NUM_TASKS:-}"
+TAU2_BENCH_ROOT_DEFAULT="$(cd "${REPO_ROOT}/.." && pwd)/tau2-bench"
+TAU2_BENCH_ROOT="${TAU2_BENCH_ROOT:-${TAU2_BENCH_ROOT_DEFAULT}}"
+if [[ -z "${TAU2_TASK_SPLIT}" ]]; then
+  TAU2_TASK_SPLIT="$(default_tau2_task_split "${TAU2_DOMAIN}")"
+fi
 
 SETA_DATA="${SCRIPT_DIR}/dataset/seta_env_convert/train.jsonl"
 SAFETY_DATA="${SCRIPT_DIR}/dataset/agent_safetybench_convert/train.jsonl"
@@ -426,9 +451,38 @@ ensure_agentharm_dataset() {
     --output-dir "${SCRIPT_DIR}/dataset/agentharm_convert"
 }
 
+ensure_tau2_dataset() {
+  case "${TAU2_DOMAIN}" in
+    telecom|mock) ;;
+    *)
+      echo "[ERROR] Unsupported TAU2_DOMAIN=${TAU2_DOMAIN}. Use: telecom|mock"
+      exit 1
+      ;;
+  esac
+  if [[ ! -d "${TAU2_BENCH_ROOT}" ]]; then
+    echo "[ERROR] TAU2_BENCH_ROOT not found: ${TAU2_BENCH_ROOT}"
+    exit 1
+  fi
+
+  TAU2_DATA_DIR="${SCRIPT_DIR}/dataset/tau2_${TAU2_DOMAIN}_${TAU2_TASK_SPLIT}_solo"
+  TAU2_DATA="${TAU2_DATA_DIR}/train.jsonl"
+  TAU2_ARGS=(
+    --tau2-root "${TAU2_BENCH_ROOT}"
+    --domain "${TAU2_DOMAIN}"
+    --task-split "${TAU2_TASK_SPLIT}"
+    --policy-type "${TAU2_POLICY_TYPE}"
+    --output-dir "${TAU2_DATA_DIR}"
+  )
+  if [[ -n "${TAU2_NUM_TASKS}" ]]; then
+    TAU2_ARGS+=(--num-tasks "${TAU2_NUM_TASKS}")
+  fi
+  python "${SCRIPT_DIR}/data_utils/convert_tau2_to_dataset.py" "${TAU2_ARGS[@]}"
+}
+
 INCLUDES_SETA="0"
 INCLUDES_SAFETY="0"
 INCLUDES_AGENTHARM="0"
+INCLUDES_TAU2="0"
 
 case "${DATASET}" in
   seta)
@@ -443,6 +497,11 @@ case "${DATASET}" in
     INCLUDES_AGENTHARM="1"
     ensure_agentharm_dataset
     ROLLOUT_PROMPT_DATA="${ROLLOUT_PROMPT_DATA:-${AGENTHARM_DATA}}"
+    ;;
+  tau2)
+    INCLUDES_TAU2="1"
+    ensure_tau2_dataset
+    ROLLOUT_PROMPT_DATA="${ROLLOUT_PROMPT_DATA:-${TAU2_DATA}}"
     ;;
   mixed)
     if [[ -n "${MIX_AGENTHARM_RATIO:-}" ]]; then
@@ -513,7 +572,7 @@ case "${DATASET}" in
     ROLLOUT_PROMPT_DATA="${ROLLOUT_PROMPT_DATA:-${MIXED_DATA}}"
     ;;
   *)
-    echo "[ERROR] Unknown DATASET=${DATASET}. Use: seta|safety|agentharm|mixed"
+    echo "[ERROR] Unknown DATASET=${DATASET}. Use: seta|safety|agentharm|mixed|tau2"
     exit 1
     ;;
 esac
@@ -527,7 +586,10 @@ if [[ ! -f "${ROLLOUT_PROMPT_DATA}" ]]; then
   exit 1
 fi
 echo "[config] ALGO=${ALGO} DATASET=${DATASET} SETA_SAFETY=${SETA_SAFETY} SAFETY_BENCH_REWARD=${SAFETY_BENCH_REWARD} AGENTHARM_REWARD=${AGENTHARM_REWARD}"
-echo "[config] sources seta=${INCLUDES_SETA} safety=${INCLUDES_SAFETY} agentharm=${INCLUDES_AGENTHARM}"
+echo "[config] sources seta=${INCLUDES_SETA} safety=${INCLUDES_SAFETY} agentharm=${INCLUDES_AGENTHARM} tau2=${INCLUDES_TAU2}"
+if [[ "${INCLUDES_TAU2}" == "1" ]]; then
+  echo "[config] tau2 domain=${TAU2_DOMAIN} split=${TAU2_TASK_SPLIT} policy_type=${TAU2_POLICY_TYPE} root=${TAU2_BENCH_ROOT}"
+fi
 echo "[config] data=${ROLLOUT_PROMPT_DATA}"
 
 NEEDS_ENV_ROUTER="0"
@@ -605,6 +667,11 @@ export AGENT_SAFETYBENCH_REMOTE_ENV
 export AGENTHARM_REMOTE_ENV
 export AGENTHARM_ROOT
 export AGENTHARM_REWARD
+export TAU2_REMOTE_ENV
+export TAU2_BENCH_ROOT
+export TAU2_DOMAIN
+export TAU2_TASK_SPLIT
+export TAU2_POLICY_TYPE
 
 ROUTER_HOST="${ROUTER_HOST:-0.0.0.0}"
 ROUTER_PORT="${ROUTER_PORT:-${ENV_SERVER_PORT}}"
