@@ -15,9 +15,9 @@
 #   bash terminal-rl/remote/run_pool_server_pu_v2.sh
 #
 # Key env vars:
-#   WORKER_MAX_TASKS            (default 64)   — pool_server --max-tasks
-#   WORKER_MAX_RUNS_PER_TASK    (default 16)   — pool_server --max-runs-per-task
-#   WORKER_MAX_CONCURRENT_CLOSES (default 32)  — pool_server --max-concurrent-closes
+#   WORKER_MAX_TASKS            (default 16)   — pool_server --max-tasks
+#   WORKER_MAX_RUNS_PER_TASK    (default 8)    — pool_server --max-runs-per-task
+#   WORKER_MAX_CONCURRENT_CLOSES (default 16)  — pool_server --max-concurrent-closes
 #   ENV_SERVER_PORT             (default 18081)
 #   SKIP_PREFLIGHT_CLEANUP      (default 0)    — set 1 to skip orphan cleanup
 #   PROXY_ENV_FILE              (default /etc/seta_build_proxy.env)
@@ -28,8 +28,9 @@
 #   WORKER_MIN_DOCKER_FREE_GB   (default 50) — refuse start/admission below this
 #   WORKER_MAX_DOCKER_USED_PCT  (default 85) — refuse start/admission above this
 #   WORKER_MAX_DOCKER_INODE_PCT (default 80) — refuse start/admission above this
-#   WORKER_MAX_CONCURRENT_BUILDS (default 8) — cap concurrent docker compose builds
+#   WORKER_MAX_CONCURRENT_BUILDS (default 2) — cap concurrent docker compose builds
 #   WORKER_PRESSURE_GUARD_ENABLED (default 1) — pids/shim/docker-cli admission guard
+#   CONTAINER_PIDS_LIMIT        (default 64) — docker update --pids-limit per task container
 #
 # Logs written:
 #   tmp_doc_latest/cpu_pool.log   — full stdout/stderr
@@ -45,11 +46,12 @@ log() { echo "[$(date +'%F %T')] $*"; }
 
 # ── Configuration ─────────────────────────────────────────────────────────────
 # 坑1: capacity must cover rollout-batch-size × n-samples-per-prompt
-# Default 8B run: batch=16 × n=8 = 128 demand → 64×16=1024 total slots (8× headroom)
-WORKER_MAX_TASKS="${WORKER_MAX_TASKS:-64}"
-WORKER_MAX_RUNS_PER_TASK="${WORKER_MAX_RUNS_PER_TASK:-16}"
-# 坑2: close concurrency ~1.5× peak-close-rate (GRPO batch ≈ 16)
-WORKER_MAX_CONCURRENT_CLOSES="${WORKER_MAX_CONCURRENT_CLOSES:-32}"
+# Default 8B run: batch=16 × n=8 = 128 demand. Keep worker-side
+# Docker concurrency close to demand; raise explicitly after pids headroom is proven.
+WORKER_MAX_TASKS="${WORKER_MAX_TASKS:-16}"
+WORKER_MAX_RUNS_PER_TASK="${WORKER_MAX_RUNS_PER_TASK:-8}"
+# Close/build fan-out also consumes host PIDs under pressure.
+WORKER_MAX_CONCURRENT_CLOSES="${WORKER_MAX_CONCURRENT_CLOSES:-16}"
 ENV_SERVER_PORT="${ENV_SERVER_PORT:-18081}"
 SKIP_PREFLIGHT_CLEANUP="${SKIP_PREFLIGHT_CLEANUP:-0}"
 PREFLIGHT_KILL_ORPHAN_RUNNING="${PREFLIGHT_KILL_ORPHAN_RUNNING:-1}"
@@ -66,15 +68,20 @@ WORKER_MIN_DOCKER_FREE_GB="${WORKER_MIN_DOCKER_FREE_GB:-50}"
 WORKER_MAX_DOCKER_USED_PCT="${WORKER_MAX_DOCKER_USED_PCT:-85}"
 WORKER_MAX_DOCKER_INODE_PCT="${WORKER_MAX_DOCKER_INODE_PCT:-80}"
 PREFLIGHT_DISK_CLEANUP="${PREFLIGHT_DISK_CLEANUP:-1}"
-WORKER_MAX_CONCURRENT_BUILDS="${WORKER_MAX_CONCURRENT_BUILDS:-8}"
+WORKER_MAX_CONCURRENT_BUILDS="${WORKER_MAX_CONCURRENT_BUILDS:-2}"
 WORKER_PRESSURE_GUARD_ENABLED="${WORKER_PRESSURE_GUARD_ENABLED:-1}"
 WORKER_CLOSE_TASK_TIMEOUT="${WORKER_CLOSE_TASK_TIMEOUT:-45}"
-WORKER_PIDS_PAUSE_ALLOCATE_PCT="${WORKER_PIDS_PAUSE_ALLOCATE_PCT:-75}"
-WORKER_PIDS_REJECT_RESET_PCT="${WORKER_PIDS_REJECT_RESET_PCT:-85}"
-WORKER_SHIM_PAUSE_ALLOCATE="${WORKER_SHIM_PAUSE_ALLOCATE:-256}"
-WORKER_SHIM_REJECT_RESET="${WORKER_SHIM_REJECT_RESET:-384}"
-WORKER_PENDING_CLOSES_PAUSE_ALLOCATE="${WORKER_PENDING_CLOSES_PAUSE_ALLOCATE:-50}"
-WORKER_PENDING_CLOSES_REJECT_RESET="${WORKER_PENDING_CLOSES_REJECT_RESET:-100}"
+WORKER_ALLOCATED_TTL="${WORKER_ALLOCATED_TTL:-120}"
+WORKER_RESETTING_TTL="${WORKER_RESETTING_TTL:-900}"
+WORKER_CLOSING_REQUESTED_TTL="${WORKER_CLOSING_REQUESTED_TTL:-300}"
+WORKER_PIDS_PAUSE_ALLOCATE_PCT="${WORKER_PIDS_PAUSE_ALLOCATE_PCT:-60}"
+WORKER_PIDS_REJECT_RESET_PCT="${WORKER_PIDS_REJECT_RESET_PCT:-70}"
+WORKER_PIDS_MIN_FREE_ALLOCATE="${WORKER_PIDS_MIN_FREE_ALLOCATE:-6000}"
+WORKER_PIDS_MIN_FREE_RESET="${WORKER_PIDS_MIN_FREE_RESET:-4000}"
+WORKER_SHIM_PAUSE_ALLOCATE="${WORKER_SHIM_PAUSE_ALLOCATE:-180}"
+WORKER_SHIM_REJECT_RESET="${WORKER_SHIM_REJECT_RESET:-220}"
+WORKER_PENDING_CLOSES_PAUSE_ALLOCATE="${WORKER_PENDING_CLOSES_PAUSE_ALLOCATE:-32}"
+WORKER_PENDING_CLOSES_REJECT_RESET="${WORKER_PENDING_CLOSES_REJECT_RESET:-64}"
 WORKER_DOCKER_CLI_TIMEOUT="${WORKER_DOCKER_CLI_TIMEOUT:-3}"
 WORKER_PRESSURE_CACHE_TTL="${WORKER_PRESSURE_CACHE_TTL:-5}"
 TERMINAL_ENV_FORCE_DOCKER_CLEANUP="${TERMINAL_ENV_FORCE_DOCKER_CLEANUP:-1}"
@@ -85,14 +92,22 @@ TERMINAL_ENV_FAST_CLOSE="${TERMINAL_ENV_FAST_CLOSE:-1}"
 TERMINAL_ENV_SKIP_UNBOUNDED_STOP="${TERMINAL_ENV_SKIP_UNBOUNDED_STOP:-1}"
 TERMINAL_ENV_FAST_CLOSE_STOP_TIMEOUT="${TERMINAL_ENV_FAST_CLOSE_STOP_TIMEOUT:-5}"
 WORKER_REPAIR_PENDING_CLOSES="${WORKER_REPAIR_PENDING_CLOSES:-1}"
-WORKER_REPAIR_PENDING_CLOSES_MAX_ACTIVE_RUNS="${WORKER_REPAIR_PENDING_CLOSES_MAX_ACTIVE_RUNS:-64}"
+WORKER_REPAIR_PENDING_CLOSES_MAX_ACTIVE_RUNS="${WORKER_REPAIR_PENDING_CLOSES_MAX_ACTIVE_RUNS:--1}"
 WORKER_REPAIR_PENDING_CLOSES_CANCEL_TIMEOUT="${WORKER_REPAIR_PENDING_CLOSES_CANCEL_TIMEOUT:-5}"
 WORKER_REPAIR_PENDING_CLOSES_MIN_AGE="${WORKER_REPAIR_PENDING_CLOSES_MIN_AGE:-45}"
 WORKER_DOCKER_BUILD_DEDUP="${WORKER_DOCKER_BUILD_DEDUP:-1}"
 WORKER_DOCKER_BUILD_SKIP_EXISTING="${WORKER_DOCKER_BUILD_SKIP_EXISTING:-1}"
+CONTAINER_PIDS_LIMIT="${CONTAINER_PIDS_LIMIT:-64}"
+CONTAINER_MEMORY_LIMIT="${CONTAINER_MEMORY_LIMIT:-16g}"
 CPU_POOL_LOG_MAX_BYTES="${CPU_POOL_LOG_MAX_BYTES:-209715200}"
 CPU_POOL_LOG_TAIL_BYTES="${CPU_POOL_LOG_TAIL_BYTES:-52428800}"
 CPU_ERR_SCAN_LINES="${CPU_ERR_SCAN_LINES:-5000}"
+POOL_SERVER_SUPERVISE="${POOL_SERVER_SUPERVISE:-1}"
+POOL_SERVER_MAX_RESTARTS="${POOL_SERVER_MAX_RESTARTS:-20}"
+POOL_SERVER_RESTART_BACKOFF_INITIAL="${POOL_SERVER_RESTART_BACKOFF_INITIAL:-5}"
+POOL_SERVER_RESTART_BACKOFF_MAX="${POOL_SERVER_RESTART_BACKOFF_MAX:-300}"
+POOL_SERVER_RESTART_RESET_WINDOW="${POOL_SERVER_RESTART_RESET_WINDOW:-1800}"
+POOL_SERVER_CHILD_EXIT_CLEANUP="${POOL_SERVER_CHILD_EXIT_CLEANUP:-1}"
 
 # ── Log paths ─────────────────────────────────────────────────────────────────
 TMP_DOC_LATEST="${REPO_ROOT}/tmp_doc_latest"
@@ -141,12 +156,15 @@ log "  port=${ENV_SERVER_PORT}  skip_cleanup=${SKIP_PREFLIGHT_CLEANUP}"
 log "  preflight_kill_orphan_running=${PREFLIGHT_KILL_ORPHAN_RUNNING} final_docker_cleanup=${FINAL_DOCKER_CLEANUP}"
 log "  total_capacity=$((WORKER_MAX_TASKS * WORKER_MAX_RUNS_PER_TASK)) slots"
 log "  docker_data_root=${DOCKER_DATA_ROOT} disk_guard=${WORKER_DISK_GUARD_ENABLED}"
-log "  pressure_guard=${WORKER_PRESSURE_GUARD_ENABLED} pids_pause=${WORKER_PIDS_PAUSE_ALLOCATE_PCT}% pids_reset=${WORKER_PIDS_REJECT_RESET_PCT}%"
+log "  pressure_guard=${WORKER_PRESSURE_GUARD_ENABLED} pids_pause=${WORKER_PIDS_PAUSE_ALLOCATE_PCT}% pids_reset=${WORKER_PIDS_REJECT_RESET_PCT}% pids_free_allocate=${WORKER_PIDS_MIN_FREE_ALLOCATE} pids_free_reset=${WORKER_PIDS_MIN_FREE_RESET}"
 log "  pressure_guard shim_pause=${WORKER_SHIM_PAUSE_ALLOCATE} shim_reset=${WORKER_SHIM_REJECT_RESET} pending_pause=${WORKER_PENDING_CLOSES_PAUSE_ALLOCATE} pending_reset=${WORKER_PENDING_CLOSES_REJECT_RESET}"
+log "  container_limits pids=${CONTAINER_PIDS_LIMIT} memory=${CONTAINER_MEMORY_LIMIT}"
+log "  stale_ttl allocated=${WORKER_ALLOCATED_TTL}s resetting=${WORKER_RESETTING_TTL}s closing_requested=${WORKER_CLOSING_REQUESTED_TTL}s"
 log "  force_cleanup=${TERMINAL_ENV_FORCE_DOCKER_CLEANUP} broad=${TERMINAL_ENV_FORCE_DOCKER_CLEANUP_BROAD} always=${TERMINAL_ENV_FORCE_DOCKER_CLEANUP_ALWAYS} timeout=${TERMINAL_ENV_FORCE_DOCKER_CLEANUP_TIMEOUT}s"
 log "  fast_close=${TERMINAL_ENV_FAST_CLOSE} skip_unbounded_stop=${TERMINAL_ENV_SKIP_UNBOUNDED_STOP} stop_timeout=${TERMINAL_ENV_FAST_CLOSE_STOP_TIMEOUT}s"
 log "  pending_close_repair=${WORKER_REPAIR_PENDING_CLOSES} max_active=${WORKER_REPAIR_PENDING_CLOSES_MAX_ACTIVE_RUNS} cancel_timeout=${WORKER_REPAIR_PENDING_CLOSES_CANCEL_TIMEOUT}s min_age=${WORKER_REPAIR_PENDING_CLOSES_MIN_AGE}s"
 log "  docker_build_dedup=${WORKER_DOCKER_BUILD_DEDUP} skip_existing=${WORKER_DOCKER_BUILD_SKIP_EXISTING}"
+log "  supervise=${POOL_SERVER_SUPERVISE} max_restarts=${POOL_SERVER_MAX_RESTARTS} backoff=${POOL_SERVER_RESTART_BACKOFF_INITIAL}-${POOL_SERVER_RESTART_BACKOFF_MAX}s reset_window=${POOL_SERVER_RESTART_RESET_WINDOW}s child_exit_cleanup=${POOL_SERVER_CHILD_EXIT_CLEANUP}"
 
 if [[ "${SKIP_PROXY_ENV}" != "1" && -f "${PROXY_ENV_FILE}" ]]; then
     # shellcheck disable=SC1090
@@ -473,8 +491,13 @@ export WORKER_MAX_DOCKER_INODE_PCT
 export WORKER_MAX_CONCURRENT_BUILDS
 export WORKER_PRESSURE_GUARD_ENABLED
 export WORKER_CLOSE_TASK_TIMEOUT
+export WORKER_ALLOCATED_TTL
+export WORKER_RESETTING_TTL
+export WORKER_CLOSING_REQUESTED_TTL
 export WORKER_PIDS_PAUSE_ALLOCATE_PCT
 export WORKER_PIDS_REJECT_RESET_PCT
+export WORKER_PIDS_MIN_FREE_ALLOCATE
+export WORKER_PIDS_MIN_FREE_RESET
 export WORKER_SHIM_PAUSE_ALLOCATE
 export WORKER_SHIM_REJECT_RESET
 export WORKER_PENDING_CLOSES_PAUSE_ALLOCATE
@@ -494,6 +517,8 @@ export WORKER_REPAIR_PENDING_CLOSES_CANCEL_TIMEOUT
 export WORKER_REPAIR_PENDING_CLOSES_MIN_AGE
 export WORKER_DOCKER_BUILD_DEDUP
 export WORKER_DOCKER_BUILD_SKIP_EXISTING
+export CONTAINER_PIDS_LIMIT
+export CONTAINER_MEMORY_LIMIT
 
 if [ -d "${REPO_ROOT}/.venv" ]; then
     source .venv/bin/activate
@@ -514,20 +539,62 @@ import sys
 print("  pool_server python version:", sys.version.replace("\n", " "))
 PY
 
-# Use stdbuf for line-buffered output (real-time log visibility). Do not use
-# exec here: the launcher owns cleanup traps and must survive the child process.
-stdbuf -oL -eL \
-    "${POOL_SERVER_PYTHON}" -m terminal-rl.remote.pool_server \
-    --host 0.0.0.0 \
-    --port "${ENV_SERVER_PORT}" \
-    --max-tasks "${WORKER_MAX_TASKS}" \
-    --max-runs-per-task "${WORKER_MAX_RUNS_PER_TASK}" \
-    --max-concurrent-closes "${WORKER_MAX_CONCURRENT_CLOSES}" \
-    --output-root "${TBENCH_OUTPUT_ROOT}" &
-POOL_SERVER_PID=$!
-set +e
-wait "${POOL_SERVER_PID}"
-POOL_SERVER_RC=$?
-set -e
-POOL_SERVER_PID=""
-exit "${POOL_SERVER_RC}"
+start_pool_server_child() {
+  # Use stdbuf for line-buffered output (real-time log visibility). Do not use
+  # exec here: the launcher owns cleanup traps and must survive the child process.
+  stdbuf -oL -eL \
+      "${POOL_SERVER_PYTHON}" -m terminal-rl.remote.pool_server \
+      --host 0.0.0.0 \
+      --port "${ENV_SERVER_PORT}" \
+      --max-tasks "${WORKER_MAX_TASKS}" \
+      --max-runs-per-task "${WORKER_MAX_RUNS_PER_TASK}" \
+      --max-concurrent-closes "${WORKER_MAX_CONCURRENT_CLOSES}" \
+      --output-root "${TBENCH_OUTPUT_ROOT}" &
+  POOL_SERVER_PID=$!
+  log "pool_server child started PID=${POOL_SERVER_PID}"
+}
+
+restart_count=0
+backoff="${POOL_SERVER_RESTART_BACKOFF_INITIAL}"
+
+while true; do
+  child_started_ts="$(date +%s)"
+  start_pool_server_child
+
+  set +e
+  wait "${POOL_SERVER_PID}"
+  POOL_SERVER_RC=$?
+  set -e
+  POOL_SERVER_PID=""
+
+  child_stopped_ts="$(date +%s)"
+  child_runtime=$((child_stopped_ts - child_started_ts))
+  log "pool_server child exited rc=${POOL_SERVER_RC} runtime=${child_runtime}s"
+
+  if [[ "${POOL_SERVER_SUPERVISE}" != "1" ]]; then
+    exit "${POOL_SERVER_RC}"
+  fi
+
+  if [[ "${POOL_SERVER_CHILD_EXIT_CLEANUP}" == "1" ]]; then
+    cleanup_task_docker_objects "child_exit_rc_${POOL_SERVER_RC}"
+  fi
+
+  if [[ "${child_runtime}" -ge "${POOL_SERVER_RESTART_RESET_WINDOW}" ]] 2>/dev/null; then
+    restart_count=0
+    backoff="${POOL_SERVER_RESTART_BACKOFF_INITIAL}"
+  fi
+
+  restart_count=$((restart_count + 1))
+  if [[ "${POOL_SERVER_MAX_RESTARTS}" -gt 0 ]] 2>/dev/null \
+     && [[ "${restart_count}" -gt "${POOL_SERVER_MAX_RESTARTS}" ]]; then
+    log "pool_server restart limit exceeded (${restart_count}/${POOL_SERVER_MAX_RESTARTS}); exiting rc=${POOL_SERVER_RC}"
+    exit "${POOL_SERVER_RC}"
+  fi
+
+  log "Restarting pool_server after ${backoff}s (attempt=${restart_count}/${POOL_SERVER_MAX_RESTARTS})"
+  sleep "${backoff}"
+  backoff=$((backoff * 2))
+  if [[ "${backoff}" -gt "${POOL_SERVER_RESTART_BACKOFF_MAX}" ]] 2>/dev/null; then
+    backoff="${POOL_SERVER_RESTART_BACKOFF_MAX}"
+  fi
+done

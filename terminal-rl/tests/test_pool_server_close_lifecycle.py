@@ -52,9 +52,16 @@ class _FastAPI:
 
 
 class _JSONResponse(dict):
-    def __init__(self, content=None, status_code=200):
+    def __init__(self, content=None, status_code=200, headers=None):
         super().__init__(content or {})
         self.status_code = status_code
+        self.headers = headers or {}
+
+
+class _Response:
+    def __init__(self, content="", media_type=None):
+        self.body = content
+        self.media_type = media_type
 
 
 class _DummyEnv:
@@ -90,6 +97,7 @@ def _install_import_stubs(monkeypatch):
     fastapi_mod.Request = object
     responses_mod = types.ModuleType("fastapi.responses")
     responses_mod.JSONResponse = _JSONResponse
+    responses_mod.Response = _Response
 
     custom_types_mod = types.ModuleType("terminal-rl.custom_types")
     custom_types_mod.TaskSpec = _TaskSpec
@@ -129,6 +137,72 @@ def _new_pool(pool_server_mod, env: _DummyEnv, tmp_path: Path):
         default_timeouts=_TaskTimeouts(),
         max_concurrent_closes=2,
     )
+
+
+def test_pressure_guard_rejects_allocate_on_low_pids_headroom(monkeypatch):
+    pool_server = _install_import_stubs(monkeypatch)
+    monkeypatch.setenv("WORKER_DISK_GUARD_ENABLED", "0")
+    monkeypatch.setenv("WORKER_PIDS_PAUSE_ALLOCATE_PCT", "99")
+    monkeypatch.setenv("WORKER_PIDS_MIN_FREE_ALLOCATE", "6000")
+    monkeypatch.setattr(
+        pool_server,
+        "worker_pressure_stats",
+        lambda *args, **kwargs: {
+            "procs": 100,
+            "tasks": 10000,
+            "pids_current": 10000,
+            "pids_max": 15511,
+            "pids_pct": 20.0,
+            "zombies": 0,
+            "dockerd": 1,
+            "containerd": 1,
+            "shim": 0,
+            "runc": 0,
+            "docker_cli_procs": 0,
+            "docker_cli_ok": True,
+        },
+    )
+
+    try:
+        pool_server.assert_worker_has_capacity_for_docker(phase="allocate")
+    except pool_server.ResourcePressureError as exc:
+        assert exc.code == "WORKER_PIDS_HEADROOM_LOW"
+        assert exc.details["pids_free"] == 5511
+    else:
+        raise AssertionError("expected low pids headroom to reject allocate")
+
+
+def test_pressure_guard_rejects_reset_on_low_pids_headroom(monkeypatch):
+    pool_server = _install_import_stubs(monkeypatch)
+    monkeypatch.setenv("WORKER_DISK_GUARD_ENABLED", "0")
+    monkeypatch.setenv("WORKER_PIDS_REJECT_RESET_PCT", "99")
+    monkeypatch.setenv("WORKER_PIDS_MIN_FREE_RESET", "4000")
+    monkeypatch.setattr(
+        pool_server,
+        "worker_pressure_stats",
+        lambda *args, **kwargs: {
+            "procs": 100,
+            "tasks": 12511,
+            "pids_current": 12511,
+            "pids_max": 15511,
+            "pids_pct": 20.0,
+            "zombies": 0,
+            "dockerd": 1,
+            "containerd": 1,
+            "shim": 0,
+            "runc": 0,
+            "docker_cli_procs": 0,
+            "docker_cli_ok": True,
+        },
+    )
+
+    try:
+        pool_server.assert_worker_has_capacity_for_docker(phase="reset")
+    except pool_server.ResourcePressureError as exc:
+        assert exc.code == "WORKER_PIDS_HEADROOM_LOW"
+        assert exc.details["pids_free"] == 3000
+    else:
+        raise AssertionError("expected low pids headroom to reject reset")
 
 
 def test_close_allocated_run_cleans_up_without_unpack_error(monkeypatch, tmp_path):
@@ -215,5 +289,124 @@ def test_close_during_reset_is_deferred_until_in_flight_finishes(monkeypatch, tm
 
         assert lease_id not in pool._run_to_task
         assert env.close_count == 1
+
+    asyncio.run(_case())
+
+
+def test_status_and_readyz_report_stale_allocated_run(monkeypatch, tmp_path):
+    async def _case():
+        pool_server = _install_import_stubs(monkeypatch)
+        monkeypatch.setenv("WORKER_DISK_GUARD_ENABLED", "0")
+        monkeypatch.setenv("WORKER_PRESSURE_GUARD_ENABLED", "0")
+        monkeypatch.setenv("WORKER_ALLOCATED_TTL", "10")
+        env = _DummyEnv()
+        pool = _new_pool(pool_server, env, tmp_path)
+
+        lease = await pool.allocate("task")
+        lease_id = lease["lease_id"]
+        async with pool._lock:
+            run_slot = pool._get_run_slot(lease_id)
+            run_slot.created_ts = time.time() - 20
+
+        status = await pool.status()
+        assert status["phase_counts"] == {"allocated": 1}
+        assert status["stale_runs"][0]["lease_id"] == lease_id
+        assert status["stale_runs"][0]["reason"] == "allocated_ttl_exceeded"
+
+        pool_server.POOL = pool
+        response = await pool_server.readyz()
+        assert response.status_code == 503
+        assert response["code"] == "WORKER_STALE_RUNS"
+
+    asyncio.run(_case())
+
+
+def test_reaper_removes_stale_allocated_run(monkeypatch, tmp_path):
+    async def _case():
+        pool_server = _install_import_stubs(monkeypatch)
+        monkeypatch.setenv("WORKER_ALLOCATED_TTL", "10")
+        env = _DummyEnv()
+        pool = _new_pool(pool_server, env, tmp_path)
+
+        lease = await pool.allocate("task")
+        lease_id = lease["lease_id"]
+        async with pool._lock:
+            run_slot = pool._get_run_slot(lease_id)
+            run_slot.created_ts = time.time() - 20
+            expired = pool._reap_idle_locked()
+
+        assert len(expired) == 1
+        assert expired[0][1] == lease_id
+        assert lease_id not in pool._run_to_task
+
+        for task_key, run_id, run_slot in expired:
+            pool._schedule_close(task_key, run_id, run_slot, reason="test stale reap")
+        if pool._closing_tasks:
+            await asyncio.gather(*pool._closing_tasks, return_exceptions=False)
+        assert env.close_count == 1
+
+    asyncio.run(_case())
+
+
+def test_pending_close_repair_allows_negative_active_limit(monkeypatch, tmp_path):
+    async def _case():
+        pool_server = _install_import_stubs(monkeypatch)
+        env = _DummyEnv()
+        pool = _new_pool(pool_server, env, tmp_path)
+        await pool.allocate("task")
+
+        sleeper = asyncio.create_task(asyncio.sleep(3600))
+        pool._closing_tasks.add(sleeper)
+        pool._closing_task_started[sleeper] = time.time() - 60
+        try:
+            result = await pool.repair_pending_closes(
+                reason="test",
+                max_active_runs=-1,
+                cancel_timeout=0.1,
+                min_age=0,
+            )
+        finally:
+            sleeper.cancel()
+            await asyncio.gather(sleeper, return_exceptions=True)
+
+        assert result["repaired"] is True
+        assert result["cancelled"] == 1
+        assert result["pending_after"] == 0
+
+    asyncio.run(_case())
+
+
+def test_rollout_probe_resets_executes_and_closes(monkeypatch, tmp_path):
+    async def _case():
+        pool_server = _install_import_stubs(monkeypatch)
+        monkeypatch.setenv("WORKER_DISK_GUARD_ENABLED", "0")
+        monkeypatch.setenv("WORKER_PRESSURE_GUARD_ENABLED", "0")
+        env = _DummyEnv()
+        env.release_reset.set()
+        pool = _new_pool(pool_server, env, tmp_path)
+        pool_server.POOL = pool
+
+        async def _payload(_request):
+            return {
+                "task_key": "probe-task",
+                "task_meta": {
+                    "task_name": "probe-task",
+                    "task_path": "probe-task",
+                    "instruction": "probe",
+                },
+                "run_ctx": {"uid": "probe", "log_dir": str(tmp_path)},
+                "tool_call": {"name": "noop", "arguments": {}},
+            }
+
+        pool_server.json_payload = _payload
+        response = await pool_server.probe_rollout(object())
+
+        assert response.status_code == 200
+        assert response["ok"] is True
+        assert response["exec"]["tool_name"] == "noop"
+        if pool._closing_tasks:
+            await asyncio.gather(*pool._closing_tasks, return_exceptions=False)
+        assert env.close_count == 1
+        assert response["lease_id"] not in pool._run_to_task
 
     asyncio.run(_case())

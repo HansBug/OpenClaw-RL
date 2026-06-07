@@ -27,7 +27,7 @@ set -uo pipefail
 
 # ── 可调参数 ──────────────────────────────────────────────────────────
 MAX_RUNNING_CONTAINERS="${MAX_RUNNING_CONTAINERS:-80}"
-HARD_KILL_THRESHOLD="${HARD_KILL_THRESHOLD:-120}"
+HARD_KILL_THRESHOLD="${HARD_KILL_THRESHOLD:-128}"
 CLEANUP_INTERVAL="${CLEANUP_INTERVAL:-60}"
 HEALTH_CHECK_INTERVAL="${HEALTH_CHECK_INTERVAL:-30}"
 CGROUP_MONITOR_INTERVAL="${CGROUP_MONITOR_INTERVAL:-15}"
@@ -36,8 +36,9 @@ DOCKER_CLI_CHECK_INTERVAL="${DOCKER_CLI_CHECK_INTERVAL:-30}"
 PROXY_CHECK_INTERVAL="${PROXY_CHECK_INTERVAL:-300}"
 POOL_CHECK_INTERVAL="${POOL_CHECK_INTERVAL:-30}"
 DEEP_PROBE_INTERVAL="${DEEP_PROBE_INTERVAL:-300}"
-PIDS_WARN_PCT="${PIDS_WARN_PCT:-75}"
-PIDS_EMERGENCY_PCT="${PIDS_EMERGENCY_PCT:-90}"
+PIDS_WARN_PCT="${PIDS_WARN_PCT:-55}"
+PIDS_EMERGENCY_PCT="${PIDS_EMERGENCY_PCT:-70}"
+PIDS_EMERGENCY_MIN_FREE="${PIDS_EMERGENCY_MIN_FREE:-3500}"
 PROC_WARN_COOLDOWN_S="${PROC_WARN_COOLDOWN_S:-60}"
 PIDS_RELIEF_COOLDOWN_S="${PIDS_RELIEF_COOLDOWN_S:-30}"
 DOCKER_PROC_WARN="${DOCKER_PROC_WARN:-512}"
@@ -75,13 +76,21 @@ POOL_PENDING_CLOSES_WARN="${POOL_PENDING_CLOSES_WARN:-50}"
 POOL_PENDING_CLOSES_REPAIR="${POOL_PENDING_CLOSES_REPAIR:-1}"
 POOL_PENDING_CLOSES_REPAIR_THRESHOLD="${POOL_PENDING_CLOSES_REPAIR_THRESHOLD:-${POOL_PENDING_CLOSES_WARN}}"
 POOL_PENDING_CLOSES_STUCK_CHECKS="${POOL_PENDING_CLOSES_STUCK_CHECKS:-5}"
-POOL_PENDING_CLOSES_ACTIVE_MAX="${POOL_PENDING_CLOSES_ACTIVE_MAX:-64}"
+POOL_PENDING_CLOSES_ACTIVE_MAX="${POOL_PENDING_CLOSES_ACTIVE_MAX:--1}"
 POOL_PENDING_CLOSES_REAP_LIMIT="${POOL_PENDING_CLOSES_REAP_LIMIT:-0}"
 POOL_PENDING_CLOSES_REPAIR_COOLDOWN_S="${POOL_PENDING_CLOSES_REPAIR_COOLDOWN_S:-300}"
 POOL_PENDING_CLOSES_CANCEL_API="${POOL_PENDING_CLOSES_CANCEL_API:-1}"
 POOL_PENDING_CLOSES_CANCEL_TIMEOUT="${POOL_PENDING_CLOSES_CANCEL_TIMEOUT:-5}"
 POOL_PENDING_CLOSES_CANCEL_MIN_AGE="${POOL_PENDING_CLOSES_CANCEL_MIN_AGE:-90}"
 POOL_PENDING_CLOSES_KILL_CONTAINERS_WHEN_ACTIVE="${POOL_PENDING_CLOSES_KILL_CONTAINERS_WHEN_ACTIVE:-0}"
+POOL_READY_FAILS_RESTART="${POOL_READY_FAILS_RESTART:-6}"
+POOL_RESTART_ACTIVE_MAX="${POOL_RESTART_ACTIVE_MAX:-0}"
+POOL_RESTART_COOLDOWN_S="${POOL_RESTART_COOLDOWN_S:-300}"
+WATCHDOG_STOP_POOL_LAUNCHER="${WATCHDOG_STOP_POOL_LAUNCHER:-0}"
+POOL_E2E_PROBE_INTERVAL="${POOL_E2E_PROBE_INTERVAL:-0}"
+POOL_E2E_PROBE_PAYLOAD_FILE="${POOL_E2E_PROBE_PAYLOAD_FILE:-}"
+POOL_E2E_PROBE_TIMEOUT="${POOL_E2E_PROBE_TIMEOUT:-600}"
+POOL_E2E_PROBE_FAILS_RESTART="${POOL_E2E_PROBE_FAILS_RESTART:-2}"
 BRIDGE_NETS_WARN="${BRIDGE_NETS_WARN:-200}"
 EMERGENCY_COOLDOWN_S="${EMERGENCY_COOLDOWN_S:-60}"
 POOL_SERVER_NAME_REGEX="${POOL_SERVER_NAME_REGEX:-openclaw_pool_server}"
@@ -199,14 +208,32 @@ nonnegative_int_or_default() {
     fi
 }
 
+integer_or_default() {
+    local name="$1"
+    local value="$2"
+    local default="$3"
+    if [[ "${value}" =~ ^-?[0-9]+$ ]]; then
+        printf '%s' "${value}"
+    else
+        echo "$(date '+%F %T') ${LOG_PREFIX} WARN: invalid ${name}=${value}; using ${default}" >&2
+        printf '%s' "${default}"
+    fi
+}
+
 POOL_PENDING_CLOSES_WARN="$(positive_int_or_default POOL_PENDING_CLOSES_WARN "${POOL_PENDING_CLOSES_WARN}" 50)"
 POOL_PENDING_CLOSES_REPAIR_THRESHOLD="$(positive_int_or_default POOL_PENDING_CLOSES_REPAIR_THRESHOLD "${POOL_PENDING_CLOSES_REPAIR_THRESHOLD}" "${POOL_PENDING_CLOSES_WARN}")"
 POOL_PENDING_CLOSES_STUCK_CHECKS="$(positive_int_or_default POOL_PENDING_CLOSES_STUCK_CHECKS "${POOL_PENDING_CLOSES_STUCK_CHECKS}" 5)"
-POOL_PENDING_CLOSES_ACTIVE_MAX="$(nonnegative_int_or_default POOL_PENDING_CLOSES_ACTIVE_MAX "${POOL_PENDING_CLOSES_ACTIVE_MAX}" 64)"
+POOL_PENDING_CLOSES_ACTIVE_MAX="$(integer_or_default POOL_PENDING_CLOSES_ACTIVE_MAX "${POOL_PENDING_CLOSES_ACTIVE_MAX}" -1)"
 POOL_PENDING_CLOSES_REAP_LIMIT="$(nonnegative_int_or_default POOL_PENDING_CLOSES_REAP_LIMIT "${POOL_PENDING_CLOSES_REAP_LIMIT}" 0)"
 POOL_PENDING_CLOSES_REPAIR_COOLDOWN_S="$(nonnegative_int_or_default POOL_PENDING_CLOSES_REPAIR_COOLDOWN_S "${POOL_PENDING_CLOSES_REPAIR_COOLDOWN_S}" 300)"
 POOL_PENDING_CLOSES_CANCEL_TIMEOUT="$(positive_int_or_default POOL_PENDING_CLOSES_CANCEL_TIMEOUT "${POOL_PENDING_CLOSES_CANCEL_TIMEOUT}" 5)"
 POOL_PENDING_CLOSES_CANCEL_MIN_AGE="$(nonnegative_int_or_default POOL_PENDING_CLOSES_CANCEL_MIN_AGE "${POOL_PENDING_CLOSES_CANCEL_MIN_AGE}" 90)"
+POOL_READY_FAILS_RESTART="$(positive_int_or_default POOL_READY_FAILS_RESTART "${POOL_READY_FAILS_RESTART}" 6)"
+POOL_RESTART_ACTIVE_MAX="$(nonnegative_int_or_default POOL_RESTART_ACTIVE_MAX "${POOL_RESTART_ACTIVE_MAX}" 0)"
+POOL_RESTART_COOLDOWN_S="$(nonnegative_int_or_default POOL_RESTART_COOLDOWN_S "${POOL_RESTART_COOLDOWN_S}" 300)"
+POOL_E2E_PROBE_INTERVAL="$(nonnegative_int_or_default POOL_E2E_PROBE_INTERVAL "${POOL_E2E_PROBE_INTERVAL}" 0)"
+POOL_E2E_PROBE_TIMEOUT="$(positive_int_or_default POOL_E2E_PROBE_TIMEOUT "${POOL_E2E_PROBE_TIMEOUT}" 600)"
+POOL_E2E_PROBE_FAILS_RESTART="$(positive_int_or_default POOL_E2E_PROBE_FAILS_RESTART "${POOL_E2E_PROBE_FAILS_RESTART}" 2)"
 
 docker_alive() {
     timeout 3 curl -fsS --max-time 2 \
@@ -340,19 +367,32 @@ task_container_count() {
     task_container_lines | wc -l
 }
 
+proc_cmdline_text() {
+    local proc_dir="$1"
+    tr '\0' ' ' < "${proc_dir}/cmdline" 2>/dev/null || true
+}
+
 stop_pool_server_for_pressure() {
     local reason="$1"
+    local include_launcher="${2:-${WATCHDOG_STOP_POOL_LAUNCHER}}"
     local proc_dir pid cmdline pids killed=0
 
     for proc_dir in /proc/[0-9]*; do
         [ -r "${proc_dir}/cmdline" ] || continue
         pid="${proc_dir##*/}"
-        cmdline="$(< "${proc_dir}/cmdline")"
+        cmdline="$(proc_cmdline_text "${proc_dir}")"
         case "${cmdline}" in
-            *terminal-rl.remote.pool_server*|*remote.pool_server*|*pool_server.py*|*run_pool_server_pu_v2.sh*)
+            *terminal-rl.remote.pool_server*|*remote.pool_server*|*pool_server.py*)
                 log "PRESSURE: stopping pool_server pid=${pid} reason=${reason}"
                 kill "${pid}" 2>/dev/null || true
                 killed=$((killed + 1))
+                ;;
+            *run_pool_server_pu_v2.sh*)
+                if [ "${include_launcher}" = "1" ]; then
+                    log "PRESSURE: stopping pool_server launcher pid=${pid} reason=${reason}"
+                    kill "${pid}" 2>/dev/null || true
+                    killed=$((killed + 1))
+                fi
                 ;;
         esac
     done
@@ -367,10 +407,15 @@ stop_pool_server_for_pressure() {
     for proc_dir in /proc/[0-9]*; do
         [ -r "${proc_dir}/cmdline" ] || continue
         pid="${proc_dir##*/}"
-        cmdline="$(< "${proc_dir}/cmdline")"
+        cmdline="$(proc_cmdline_text "${proc_dir}")"
         case "${cmdline}" in
-            *terminal-rl.remote.pool_server*|*remote.pool_server*|*pool_server.py*|*run_pool_server_pu_v2.sh*)
+            *terminal-rl.remote.pool_server*|*remote.pool_server*|*pool_server.py*)
                 pids="${pids} ${pid}"
+                ;;
+            *run_pool_server_pu_v2.sh*)
+                if [ "${include_launcher}" = "1" ]; then
+                    pids="${pids} ${pid}"
+                fi
                 ;;
         esac
     done
@@ -656,9 +701,20 @@ monitor_proc_pressure() {
     local docker_related
     docker_related=$((LAST_DOCKERD_PROCS + LAST_CONTAINERD_PROCS + LAST_SHIM_PROCS + LAST_RUNC_PROCS + LAST_DOCKER_CLI_PROCS))
 
+    local pids_free
+    pids_free=-1
+    if [ -n "${LAST_PIDS_CUR}" ] && [ -n "${LAST_PIDS_MAX}" ] && [ "${LAST_PIDS_MAX}" -gt 0 ] 2>/dev/null; then
+        pids_free=$((LAST_PIDS_MAX - LAST_PIDS_CUR))
+    fi
+
     if [ "${LAST_PIDS_PCT}" != "?" ] && [ "${LAST_PIDS_PCT}" -ge "${PIDS_EMERGENCY_PCT}" ] 2>/dev/null; then
         pids_pressure_relief "pids pressure ${LAST_PIDS_CUR}/${LAST_PIDS_MAX} (${LAST_PIDS_PCT}%) before fork failure"
         trigger_repair "pids pressure ${LAST_PIDS_CUR}/${LAST_PIDS_MAX} (${LAST_PIDS_PCT}%) before fork failure"
+        return 0
+    fi
+    if [ "${pids_free}" -ge 0 ] 2>/dev/null && [ "${pids_free}" -lt "${PIDS_EMERGENCY_MIN_FREE}" ] 2>/dev/null; then
+        pids_pressure_relief "pids free headroom ${pids_free}<${PIDS_EMERGENCY_MIN_FREE} (${LAST_PIDS_CUR}/${LAST_PIDS_MAX}, ${LAST_PIDS_PCT}%) before fork failure"
+        trigger_repair "pids free headroom ${pids_free}<${PIDS_EMERGENCY_MIN_FREE} (${LAST_PIDS_CUR}/${LAST_PIDS_MAX}, ${LAST_PIDS_PCT}%) before fork failure"
         return 0
     fi
     if [ "${LAST_ZOMBIES}" -ge "${ZOMBIE_EMERGENCY}" ] 2>/dev/null; then
@@ -696,12 +752,19 @@ monitor_pod_cgroup() {
         read -r cur < "$CGROUP_PIDS_CUR_FILE" 2>/dev/null
         if [ -n "$cur" ] && [ "$cur" -ge 0 ] 2>/dev/null; then
             local pct=$(( cur * 100 / CGROUP_PIDS_MAX_VAL ))
+            local free=$((CGROUP_PIDS_MAX_VAL - cur))
             if [ "$pct" -ge "$PIDS_EMERGENCY_PCT" ]; then
                 LAST_PIDS_CUR="$cur"
                 LAST_PIDS_MAX="$CGROUP_PIDS_MAX_VAL"
                 LAST_PIDS_PCT="$pct"
                 pids_pressure_relief "cgroup PIDs ${cur}/${CGROUP_PIDS_MAX_VAL} (${pct}%)"
                 trigger_repair "cgroup PIDs ${cur}/${CGROUP_PIDS_MAX_VAL} (${pct}%)"
+            elif [ "$free" -lt "$PIDS_EMERGENCY_MIN_FREE" ] 2>/dev/null; then
+                LAST_PIDS_CUR="$cur"
+                LAST_PIDS_MAX="$CGROUP_PIDS_MAX_VAL"
+                LAST_PIDS_PCT="$pct"
+                pids_pressure_relief "cgroup PIDs free headroom ${free}<${PIDS_EMERGENCY_MIN_FREE} (${cur}/${CGROUP_PIDS_MAX_VAL}, ${pct}%)"
+                trigger_repair "cgroup PIDs free headroom ${free}<${PIDS_EMERGENCY_MIN_FREE} (${cur}/${CGROUP_PIDS_MAX_VAL}, ${pct}%)"
             elif [ "$pct" -ge "$PIDS_WARN_PCT" ]; then
                 log "WARN: PIDs ${cur}/${CGROUP_PIDS_MAX_VAL} (${pct}%) — aggressive cleanup"
                 timeout 20 docker container prune -f --filter "until=30s" >/dev/null 2>&1 || true
@@ -733,12 +796,18 @@ LAST_POOL_PROTECTED_COUNT=0
 LAST_BRIDGE_NETS="?"
 LAST_POOL_STATUS_TS=0
 check_pool_server() {
-    local health_tmp health_code
-    health_tmp="$(mktemp /tmp/pool_health.XXXXXX 2>/dev/null || echo /tmp/pool_health.$$)"
-    health_code=$(timeout 5 curl -sS --noproxy '*' -o "$health_tmp" -w '%{http_code}' \
-        "http://${POOL_HOST}:${POOL_PORT}/healthz" 2>/dev/null || echo "000")
-    if [ "$health_code" = "000" ]; then
-        log "WARN: pool_server /healthz unreachable"
+    local ready_tmp ready_code ready_path ready_failed=0
+    ready_path="/readyz"
+    ready_tmp="$(mktemp /tmp/pool_ready.XXXXXX 2>/dev/null || echo /tmp/pool_ready.$$)"
+    ready_code=$(timeout 5 curl -sS --noproxy '*' -o "$ready_tmp" -w '%{http_code}' \
+        "http://${POOL_HOST}:${POOL_PORT}${ready_path}" 2>/dev/null || echo "000")
+    if [ "$ready_code" = "404" ]; then
+        ready_path="/healthz"
+        ready_code=$(timeout 5 curl -sS --noproxy '*' -o "$ready_tmp" -w '%{http_code}' \
+            "http://${POOL_HOST}:${POOL_PORT}${ready_path}" 2>/dev/null || echo "000")
+    fi
+    if [ "$ready_code" = "000" ]; then
+        log "WARN: pool_server ${ready_path} unreachable"
         LAST_POOL_ACTIVE="down"
         LAST_POOL_PENDING="down"
         LAST_POOL_PROTECTED_COUNT=0
@@ -746,13 +815,14 @@ check_pool_server() {
         : > "${WATCHDOG_PROTECTED_IDS_FILE}" 2>/dev/null || true
         : > "${WATCHDOG_PROTECTED_NAMES_FILE}" 2>/dev/null || true
         : > "${WATCHDOG_PROTECTED_TRIALS_FILE}" 2>/dev/null || true
-        rm -f "$health_tmp" 2>/dev/null || true
+        rm -f "$ready_tmp" 2>/dev/null || true
         return 1
     fi
-    if [ "$health_code" -ge 400 ] 2>/dev/null; then
-        log "WARN: pool_server /healthz returned HTTP ${health_code}: $(head -c 300 "$health_tmp" 2>/dev/null)"
+    if [ "$ready_code" -ge 400 ] 2>/dev/null; then
+        ready_failed=1
+        log "WARN: pool_server ${ready_path} returned HTTP ${ready_code}: $(head -c 300 "$ready_tmp" 2>/dev/null)"
     fi
-    rm -f "$health_tmp" 2>/dev/null || true
+    rm -f "$ready_tmp" 2>/dev/null || true
 
     local body pending=0 active=0 active_tasks=0 active_runs=0 protected_count=0
     body=$(timeout 3 curl -fsS --noproxy '*' "http://${POOL_HOST}:${POOL_PORT}/status" 2>/dev/null)
@@ -847,11 +917,16 @@ PY
         fi
         rm -f "$status_tmp" "$ids_tmp" "$names_tmp" "$trials_tmp" 2>/dev/null || true
         if [ "$pending" -gt "$POOL_PENDING_CLOSES_WARN" ] 2>/dev/null; then
+            local active_allows_repair=0
+            if [ "$POOL_PENDING_CLOSES_ACTIVE_MAX" -lt 0 ] 2>/dev/null \
+               || [ "$active" -le "$POOL_PENDING_CLOSES_ACTIVE_MAX" ] 2>/dev/null; then
+                active_allows_repair=1
+            fi
             POOL_PENDING_HIGH_COUNT=$((POOL_PENDING_HIGH_COUNT + 1))
             log "WARN: pool_server pending_closes=${pending} (active_runs=${active_runs}, active_tasks=${active_tasks}, protected=${protected_count}, high_count=${POOL_PENDING_HIGH_COUNT}/${POOL_PENDING_CLOSES_STUCK_CHECKS})"
             if [ "$pending" -ge "$POOL_PENDING_CLOSES_REPAIR_THRESHOLD" ] 2>/dev/null \
                && [ "$POOL_PENDING_HIGH_COUNT" -ge "$POOL_PENDING_CLOSES_STUCK_CHECKS" ] 2>/dev/null \
-               && [ "$active" -le "$POOL_PENDING_CLOSES_ACTIVE_MAX" ] 2>/dev/null; then
+               && [ "$active_allows_repair" = "1" ]; then
                 repair_stuck_pool_pending_closes "$pending" "$active"
                 POOL_PENDING_HIGH_COUNT=0
             fi
@@ -875,7 +950,33 @@ PY
         log "WARN: ${nets} bridge networks, address-pool risk; pruning"
         timeout 30 docker network prune -f >/dev/null 2>&1 || true
     fi
-    return 0
+    return "${ready_failed}"
+}
+
+check_pool_e2e_probe() {
+    local probe_tmp probe_code
+    if [ "${POOL_E2E_PROBE_INTERVAL}" -le 0 ] 2>/dev/null; then
+        return 0
+    fi
+    if [ -z "${POOL_E2E_PROBE_PAYLOAD_FILE}" ] || [ ! -r "${POOL_E2E_PROBE_PAYLOAD_FILE}" ]; then
+        log "WARN: pool E2E probe enabled but payload file is not readable: ${POOL_E2E_PROBE_PAYLOAD_FILE:-<unset>}"
+        return 1
+    fi
+
+    probe_tmp="$(mktemp /tmp/pool_e2e_probe.XXXXXX 2>/dev/null || echo /tmp/pool_e2e_probe.$$)"
+    probe_code=$(timeout "${POOL_E2E_PROBE_TIMEOUT}" curl -sS --noproxy '*' \
+        -o "${probe_tmp}" -w '%{http_code}' \
+        -X POST -H 'Content-Type: application/json' \
+        --data-binary @"${POOL_E2E_PROBE_PAYLOAD_FILE}" \
+        "http://${POOL_HOST}:${POOL_PORT}/probe/rollout" 2>/dev/null || echo "000")
+    if [ "${probe_code}" -ge 200 ] 2>/dev/null && [ "${probe_code}" -lt 300 ] 2>/dev/null; then
+        log "POOL_E2E: probe ok: $(head -c 300 "${probe_tmp}" 2>/dev/null)"
+        rm -f "${probe_tmp}" 2>/dev/null || true
+        return 0
+    fi
+    log "WARN: pool E2E probe failed HTTP ${probe_code}: $(head -c 500 "${probe_tmp}" 2>/dev/null)"
+    rm -f "${probe_tmp}" 2>/dev/null || true
+    return 1
 }
 
 monitor_docker_cli() {
@@ -1499,12 +1600,14 @@ log "  pool every ${POOL_CHECK_INTERVAL}s; deep probe every ${DEEP_PROBE_INTERVA
 log "  heartbeat every ${HEARTBEAT_INTERVAL}s"
 log "  disk every ${DISK_CHECK_INTERVAL}s; warn=${DISK_WARN_PCT}% emerg=${DISK_EMERGENCY_PCT}% min_free=${DISK_MIN_FREE_GB}GB inode_warn=${DISK_INODE_WARN_PCT}% inode_emerg=${DISK_INODE_EMERGENCY_PCT}%"
 log "  pool_stop_on_disk_emergency=${POOL_STOP_ON_DISK_EMERGENCY}"
-log "  PIDs warn=${PIDS_WARN_PCT}% emerg=${PIDS_EMERGENCY_PCT}%"
+log "  PIDs warn=${PIDS_WARN_PCT}% emerg=${PIDS_EMERGENCY_PCT}% emerg_min_free=${PIDS_EMERGENCY_MIN_FREE}"
 log "  proc warn: docker_related=${DOCKER_PROC_WARN} shim=${SHIM_PROC_WARN} runc=${RUNC_PROC_WARN} zombies=${ZOMBIE_WARN}"
 log "  proc emerg: docker_related=${DOCKER_PROC_EMERGENCY} shim=${SHIM_PROC_EMERGENCY} runc=${RUNC_PROC_EMERGENCY} zombies=${ZOMBIE_EMERGENCY}"
 log "  docker_down_shim_relief=${DOCKER_DOWN_SHIM_RELIEF} kill_shims_on_docker_down=${WATCHDOG_KILL_SHIMS_ON_DOCKER_DOWN}"
 log "  Mem  warn=${MEM_WARN_PCT}% emerg=${MEM_EMERGENCY_PCT}%"
 log "  pool=${POOL_HOST}:${POOL_PORT}  pool_server_regex=${POOL_SERVER_NAME_REGEX}"
+log "  pool_ready restart_failures=${POOL_READY_FAILS_RESTART} restart_active_max=${POOL_RESTART_ACTIVE_MAX} restart_cooldown=${POOL_RESTART_COOLDOWN_S}s stop_launcher=${WATCHDOG_STOP_POOL_LAUNCHER}"
+log "  pool_e2e interval=${POOL_E2E_PROBE_INTERVAL}s timeout=${POOL_E2E_PROBE_TIMEOUT}s fail_trigger=${POOL_E2E_PROBE_FAILS_RESTART} payload=${POOL_E2E_PROBE_PAYLOAD_FILE:-<unset>}"
 log "  pool_pending repair=${POOL_PENDING_CLOSES_REPAIR} warn=${POOL_PENDING_CLOSES_WARN} threshold=${POOL_PENDING_CLOSES_REPAIR_THRESHOLD} stuck_checks=${POOL_PENDING_CLOSES_STUCK_CHECKS} active_max=${POOL_PENDING_CLOSES_ACTIVE_MAX} reap_limit=${POOL_PENDING_CLOSES_REAP_LIMIT} cooldown=${POOL_PENDING_CLOSES_REPAIR_COOLDOWN_S}s cancel_api=${POOL_PENDING_CLOSES_CANCEL_API} cancel_timeout=${POOL_PENDING_CLOSES_CANCEL_TIMEOUT}s kill_when_active=${POOL_PENDING_CLOSES_KILL_CONTAINERS_WHEN_ACTIVE}"
 log "  task_container_regex=${TASK_CONTAINER_REGEX}"
 log "  task_image_regex=${TASK_IMAGE_REGEX}"
@@ -1531,11 +1634,15 @@ LAST_PROC_CHECK=0
 LAST_DOCKER_CLI_CHECK=0
 LAST_PROXY_CHECK=0
 LAST_POOL_CHECK=0
+LAST_POOL_E2E_PROBE_TS=0
 LAST_DISK_CHECK=0
 LAST_HEARTBEAT_TS=0
 HEALTH_FAILS=0
 DOCKER_CLI_FAILS=0
 DEEP_PROBE_FAILS=0
+POOL_READY_FAILS=0
+POOL_E2E_PROBE_FAILS=0
+LAST_POOL_RESTART_TS=0
 LAST_DOCKER_CLI_STATUS="?"
 LAST_PROXY_STATUS="?"
 
@@ -1601,24 +1708,69 @@ while true; do
 
     # 7) pool_server 监控
     if [ $((NOW - LAST_POOL_CHECK)) -ge "${POOL_CHECK_INTERVAL}" ]; then
-        check_pool_server || true
+        if check_pool_server; then
+            POOL_READY_FAILS=0
+        else
+            POOL_READY_FAILS=$((POOL_READY_FAILS + 1))
+            log "WARN: pool_server readiness failed (${POOL_READY_FAILS}/${POOL_READY_FAILS_RESTART}) active=${LAST_POOL_ACTIVE} pending_closes=${LAST_POOL_PENDING}"
+            if [ "${POOL_READY_FAILS}" -ge "${POOL_READY_FAILS_RESTART}" ] 2>/dev/null; then
+                if [ "${LAST_POOL_ACTIVE}" != "down" ] \
+                   && [ "${LAST_POOL_ACTIVE}" != "unknown" ] \
+                   && [ "${LAST_POOL_ACTIVE}" -gt "${POOL_RESTART_ACTIVE_MAX}" ] 2>/dev/null; then
+                    log "POOL_RESTART deferred: active_runs=${LAST_POOL_ACTIVE} > restart_active_max=${POOL_RESTART_ACTIVE_MAX}"
+                elif [ $((NOW - LAST_POOL_RESTART_TS)) -lt "${POOL_RESTART_COOLDOWN_S}" ]; then
+                    log "POOL_RESTART suppressed: cooldown ${POOL_RESTART_COOLDOWN_S}s active"
+                else
+                    log "POOL_RESTART: stopping pool_server child after ${POOL_READY_FAILS} readiness failures"
+                    stop_pool_server_for_pressure "pool readiness failed ${POOL_READY_FAILS} consecutive checks" 0
+                    LAST_POOL_RESTART_TS="$NOW"
+                    POOL_READY_FAILS=0
+                fi
+            fi
+        fi
         LAST_POOL_CHECK="$NOW"
     fi
 
-    # 8) 容器清理 + 上限
+    # 8) 可选 E2E rollout 探活：真实 allocate + reset + optional exec + close
+    if [ "${POOL_E2E_PROBE_INTERVAL}" -gt 0 ] 2>/dev/null \
+       && [ $((NOW - LAST_POOL_E2E_PROBE_TS)) -ge "${POOL_E2E_PROBE_INTERVAL}" ]; then
+        if check_pool_e2e_probe; then
+            POOL_E2E_PROBE_FAILS=0
+        else
+            POOL_E2E_PROBE_FAILS=$((POOL_E2E_PROBE_FAILS + 1))
+            log "WARN: pool E2E probe failed (${POOL_E2E_PROBE_FAILS}/${POOL_E2E_PROBE_FAILS_RESTART}) active=${LAST_POOL_ACTIVE} pending_closes=${LAST_POOL_PENDING}"
+            if [ "${POOL_E2E_PROBE_FAILS}" -ge "${POOL_E2E_PROBE_FAILS_RESTART}" ] 2>/dev/null; then
+                if [ "${LAST_POOL_ACTIVE}" != "down" ] \
+                   && [ "${LAST_POOL_ACTIVE}" != "unknown" ] \
+                   && [ "${LAST_POOL_ACTIVE}" -gt "${POOL_RESTART_ACTIVE_MAX}" ] 2>/dev/null; then
+                    log "POOL_E2E restart deferred: active_runs=${LAST_POOL_ACTIVE} > restart_active_max=${POOL_RESTART_ACTIVE_MAX}"
+                elif [ $((NOW - LAST_POOL_RESTART_TS)) -lt "${POOL_RESTART_COOLDOWN_S}" ]; then
+                    log "POOL_E2E restart suppressed: cooldown ${POOL_RESTART_COOLDOWN_S}s active"
+                else
+                    log "POOL_E2E restart: stopping pool_server child after ${POOL_E2E_PROBE_FAILS} E2E failures"
+                    stop_pool_server_for_pressure "pool E2E probe failed ${POOL_E2E_PROBE_FAILS} consecutive checks" 0
+                    LAST_POOL_RESTART_TS="$NOW"
+                    POOL_E2E_PROBE_FAILS=0
+                fi
+            fi
+        fi
+        LAST_POOL_E2E_PROBE_TS="$NOW"
+    fi
+
+    # 9) 容器清理 + 上限
     if [ $((NOW - LAST_CLEANUP)) -ge "${CLEANUP_INTERVAL}" ]; then
         cleanup_stopped
         enforce_container_limit
         LAST_CLEANUP="$NOW"
     fi
 
-    # 9) Docker data-root 磁盘压力监控
+    # 10) Docker data-root 磁盘压力监控
     if [ $((NOW - LAST_DISK_CHECK)) -ge "${DISK_CHECK_INTERVAL}" ]; then
         monitor_docker_disk
         LAST_DISK_CHECK="$NOW"
     fi
 
-    # 10) 低频心跳（默认 10 min）—— 复用上面已采集的指标，不发起新的 docker / curl
+    # 11) 低频心跳（默认 10 min）—— 复用上面已采集的指标，不发起新的 docker / curl
     if [ $((NOW - LAST_HEARTBEAT_TS)) -ge "${HEARTBEAT_INTERVAL}" ]; then
         log "OK: dockerd alive | docker_cli=${LAST_DOCKER_CLI_STATUS} proxy=${LAST_PROXY_STATUS} | pids=${LAST_PIDS_CUR:-?}/${LAST_PIDS_MAX:-?} (${LAST_PIDS_PCT:-?}%) tasks=${LAST_PROC_TASKS:-?} zombies=${LAST_ZOMBIES:-?} shim=${LAST_SHIM_PROCS:-?} runc=${LAST_RUNC_PROCS:-?} | pool active=${LAST_POOL_ACTIVE} pending_closes=${LAST_POOL_PENDING} | bridges=${LAST_BRIDGE_NETS} | task_containers=${LAST_RUNNING_TASKS}"
         LAST_HEARTBEAT_TS="$NOW"

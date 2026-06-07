@@ -1031,10 +1031,14 @@ async def eval_rollout_single_dataset(
     for coro in asyncio.as_completed(tasks):
         sample = await coro
         if do_print:
+            example_sample = sample[0] if isinstance(sample, list) and sample else sample
+            example_prompt = getattr(example_sample, "prompt", "<empty sample>")
+            example_response = getattr(example_sample, "response", "") or ""
+            example_reward = getattr(example_sample, "reward", None)
             logger.info(
                 "eval_rollout_single_dataset example data: "
-                f"{[str(sample.prompt) + sample.response]} "
-                f"reward={sample.reward}"
+                f"{[str(example_prompt) + example_response]} "
+                f"reward={example_reward}"
             )
             do_print = False
         if isinstance(sample, list):

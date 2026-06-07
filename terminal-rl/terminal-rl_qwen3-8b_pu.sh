@@ -52,7 +52,6 @@ else
   ray stop --force || true
   pkill -9 ray || true
   pkill -9 -f "terminal-rl.router_server" || true
-  pkill -9 python || true
   sleep 2
 fi
 
@@ -338,7 +337,24 @@ A3S_CODE_THINKING_BUDGET="${A3S_CODE_THINKING_BUDGET:-}"
 A3S_CODE_EXTERNAL_TOOL_ERRORS_AS_RESULTS="${A3S_CODE_EXTERNAL_TOOL_ERRORS_AS_RESULTS:-1}"
 A3S_CODE_LOCAL_WORKSPACE_GUARD="${A3S_CODE_LOCAL_WORKSPACE_GUARD:-1}"
 A3S_CODE_PIP_PACKAGE="${A3S_CODE_PIP_PACKAGE:-a3s-code==3.3.0}"
+ENV_HTTP_MAX_RETRIES="${ENV_HTTP_MAX_RETRIES:-10}"
+ENV_ALLOCATE_MAX_RETRIES="${ENV_ALLOCATE_MAX_RETRIES:-100}"
+ENV_ALLOCATE_RETRY_BASE_DELAY="${ENV_ALLOCATE_RETRY_BASE_DELAY:-2.0}"
+ENV_ALLOCATE_RETRY_MAX_DELAY="${ENV_ALLOCATE_RETRY_MAX_DELAY:-30.0}"
+ENV_ALLOCATE_RETRY_BACKOFF="${ENV_ALLOCATE_RETRY_BACKOFF:-2.0}"
+ENV_ALLOCATE_RETRY_JITTER="${ENV_ALLOCATE_RETRY_JITTER:-0.25}"
 ENV_EVALUATE_MAX_RETRIES="${ENV_EVALUATE_MAX_RETRIES:-3}"
+ENV_CLOSE_MAX_RETRIES="${ENV_CLOSE_MAX_RETRIES:-3}"
+ENV_EXEC_TOOL_MAX_RETRIES="${ENV_EXEC_TOOL_MAX_RETRIES:-3}"
+ENV_ALLOCATE_HTTP_TIMEOUT="${ENV_ALLOCATE_HTTP_TIMEOUT:-300}"
+ENV_RESET_HTTP_TIMEOUT="${ENV_RESET_HTTP_TIMEOUT:-330}"
+ENV_CLOSE_HTTP_TIMEOUT="${ENV_CLOSE_HTTP_TIMEOUT:-90}"
+ENV_REMOTE_MAX_ACTIVE_TASKS="${ENV_REMOTE_MAX_ACTIVE_TASKS:-12}"
+ENV_REMOTE_MAX_ACTIVE_RUNS="${ENV_REMOTE_MAX_ACTIVE_RUNS:-0}"
+ENV_REMOTE_MAX_RUNS_PER_TASK="${ENV_REMOTE_MAX_RUNS_PER_TASK:-8}"
+ENV_REMOTE_ADMISSION_TIMEOUT="${ENV_REMOTE_ADMISSION_TIMEOUT:-900}"
+ENV_REMOTE_ADMISSION_LOG_INTERVAL="${ENV_REMOTE_ADMISSION_LOG_INTERVAL:-30}"
+ENV_REMOTE_MAX_CONCURRENT_CLOSES="${ENV_REMOTE_MAX_CONCURRENT_CLOSES:-8}"
 
 a3s_code_import_check() {
   mkdir -p "${RUN_LOG_DIR}"
@@ -782,6 +798,39 @@ ROUTER_HOST="${ROUTER_HOST:-0.0.0.0}"
 ROUTER_PORT="${ROUTER_PORT:-${ENV_SERVER_PORT}}"
 CHECK_HOST="${CHECK_HOST:-127.0.0.1}"
 CHECK_WAIT_SECS="${CHECK_WAIT_SECS:-60}"
+READY_PROBE_TIMEOUT="${READY_PROBE_TIMEOUT:-5}"
+ROUTER_REQUIRE_READY="${ROUTER_REQUIRE_READY:-1}"
+WORKER_PREFLIGHT_REQUIRE_READY="${WORKER_PREFLIGHT_REQUIRE_READY:-1}"
+WORKER_PREFLIGHT_TIMEOUT="${WORKER_PREFLIGHT_TIMEOUT:-5}"
+export ROUTER_READYZ_WORKER_TIMEOUT="${ROUTER_READYZ_WORKER_TIMEOUT:-${WORKER_PREFLIGHT_TIMEOUT}}"
+
+probe_ready_endpoint() {
+  local base_url="$1"
+  local label="$2"
+  local timeout_s="${3:-${READY_PROBE_TIMEOUT}}"
+  local tmp code path body
+
+  tmp="$(mktemp /tmp/openclaw_ready.XXXXXX 2>/dev/null || printf '/tmp/openclaw_ready.%s' "$$")"
+  path="/readyz"
+  code="$(curl -sS --max-time "${timeout_s}" --noproxy '*' \
+    -o "${tmp}" -w '%{http_code}' "${base_url}${path}" 2>/dev/null || echo "000")"
+  if [[ "${code}" == "404" ]]; then
+    path="/healthz"
+    code="$(curl -sS --max-time "${timeout_s}" --noproxy '*' \
+      -o "${tmp}" -w '%{http_code}' "${base_url}${path}" 2>/dev/null || echo "000")"
+  fi
+
+  if [[ "${code}" =~ ^2[0-9][0-9]$ ]]; then
+    log "  [OK] ${label}${path}"
+    rm -f "${tmp}" 2>/dev/null || true
+    return 0
+  fi
+
+  body="$(head -c 300 "${tmp}" 2>/dev/null || true)"
+  log "  [WARN] ${label}${path} not ready HTTP ${code}${body:+: ${body}}"
+  rm -f "${tmp}" 2>/dev/null || true
+  return 1
+}
 
 # ── Robustness knobs (informed by issue #3 postmortem) ───────────────
 # Router forward to pool_server (tuned for burst of docker-compose down/up):
@@ -1114,6 +1163,7 @@ require_cmd curl
 if [[ "${NEEDS_ENV_ROUTER}" == "1" ]]; then
   log "Starting router on ${ROUTER_HOST}:${ROUTER_PORT} -> ${WORKER_URLS} (python=${ROUTER_PYTHON})"
   log "  forward_timeout=${ROUTER_FORWARD_TIMEOUT}s retries=${ROUTER_FORWARD_RETRIES} backoff=${ROUTER_FORWARD_RETRY_BACKOFF}s pressure_cooldown=${ROUTER_PRESSURE_COOLDOWN}s no_proxy=${NO_PROXY}"
+  log "  readiness require_router=${ROUTER_REQUIRE_READY} require_worker=${WORKER_PREFLIGHT_REQUIRE_READY} probe_timeout=${READY_PROBE_TIMEOUT}s worker_timeout=${ROUTER_READYZ_WORKER_TIMEOUT}s"
   (
     cd "${REPO_ROOT}"
     "${ROUTER_PYTHON}" -m terminal-rl.router_server \
@@ -1124,14 +1174,27 @@ if [[ "${NEEDS_ENV_ROUTER}" == "1" ]]; then
   ROUTER_PID="$(cat "${RUN_LOG_DIR}/router.pid")"
   log "Router PID=${ROUTER_PID}, log=${ROUTER_LOG}"
 
-  # Wait for router healthz
+  # Wait for router readiness. /readyz validates at least one env worker; /healthz
+  # is only used as fallback for older router implementations.
+  ROUTER_READY=0
   for ((i=1; i<=CHECK_WAIT_SECS; i++)); do
-    if curl -fsS "http://${CHECK_HOST}:${ROUTER_PORT}/healthz" >/dev/null 2>&1; then
+    if probe_ready_endpoint "http://${CHECK_HOST}:${ROUTER_PORT}" "router http://${CHECK_HOST}:${ROUTER_PORT}" "${READY_PROBE_TIMEOUT}"; then
       log "router ready (attempt ${i})"
+      ROUTER_READY=1
+      break
+    fi
+    if [[ -n "${ROUTER_PID}" ]] && ! kill -0 "${ROUTER_PID}" 2>/dev/null; then
+      log "ERROR: router process exited before becoming ready; see ${ROUTER_LOG}"
       break
     fi
     sleep 1
   done
+  if [[ "${ROUTER_READY}" != "1" ]]; then
+    log "ERROR: router not ready after ${CHECK_WAIT_SECS}s"
+    if [[ "${ROUTER_REQUIRE_READY}" == "1" ]]; then
+      exit 1
+    fi
+  fi
   curl -fsS "http://${CHECK_HOST}:${ROUTER_PORT}/status" || true
   echo
 else
@@ -1182,13 +1245,17 @@ fi
 if [[ "${NEEDS_ENV_ROUTER}" == "1" ]]; then
   log "Probing worker endpoints..."
   IFS=',' read -r -a _WORKERS <<< "${WORKER_URLS}"
+  READY_WORKERS=0
   for _w in "${_WORKERS[@]}"; do
-    if curl -fsS --max-time 5 --noproxy '*' "${_w}/healthz" >/dev/null 2>&1; then
-      log "  [OK] ${_w}/healthz"
-    else
-      log "  [WARN] ${_w}/healthz unreachable — router will retry on forward"
+    if probe_ready_endpoint "${_w}" "${_w}" "${WORKER_PREFLIGHT_TIMEOUT}"; then
+      READY_WORKERS=$((READY_WORKERS + 1))
     fi
   done
+  log "Worker readiness: ${READY_WORKERS}/${#_WORKERS[@]} ready"
+  if [[ "${READY_WORKERS}" -le 0 && "${WORKER_PREFLIGHT_REQUIRE_READY}" == "1" ]]; then
+    log "ERROR: no ready docker env worker; aborting before Ray job submit"
+    exit 1
+  fi
 fi
 
 # ── NVLink detection ─────────────────────────────────────────────────
@@ -1241,6 +1308,16 @@ cat > "${RUN_DIR}/config/run_config.json" <<CFGEOF
   "env_server_url": "${ENV_SERVER_URL}",
   "needs_env_router": "${NEEDS_ENV_ROUTER}",
   "router_pressure_cooldown": "${ROUTER_PRESSURE_COOLDOWN}",
+  "router_require_ready": "${ROUTER_REQUIRE_READY}",
+  "router_readyz_worker_timeout": "${ROUTER_READYZ_WORKER_TIMEOUT}",
+  "worker_preflight_require_ready": "${WORKER_PREFLIGHT_REQUIRE_READY}",
+  "env_http_max_retries": "${ENV_HTTP_MAX_RETRIES}",
+  "env_allocate_max_retries": "${ENV_ALLOCATE_MAX_RETRIES}",
+  "env_reset_http_timeout": "${ENV_RESET_HTTP_TIMEOUT}",
+  "env_close_http_timeout": "${ENV_CLOSE_HTTP_TIMEOUT}",
+  "env_remote_max_active_tasks": "${ENV_REMOTE_MAX_ACTIVE_TASKS}",
+  "env_remote_max_active_runs": "${ENV_REMOTE_MAX_ACTIVE_RUNS}",
+  "env_remote_max_runs_per_task": "${ENV_REMOTE_MAX_RUNS_PER_TASK}",
   "agent_safetybench_remote_env": "${AGENT_SAFETYBENCH_REMOTE_ENV}",
   "agentharm_remote_env": "${AGENTHARM_REMOTE_ENV}",
   "safety_reward_enable": "${CLAWSENTRY_NEEDED}",
@@ -1414,8 +1491,7 @@ if [[ "${HARNESS_OPTION}" == "a3s-code" ]]; then
     \"A3S_CODE_PLANNING_MODE\": \"${A3S_CODE_PLANNING_MODE}\",
     \"A3S_CODE_THINKING_BUDGET\": \"${A3S_CODE_THINKING_BUDGET}\",
     \"A3S_CODE_EXTERNAL_TOOL_ERRORS_AS_RESULTS\": \"${A3S_CODE_EXTERNAL_TOOL_ERRORS_AS_RESULTS}\",
-    \"A3S_CODE_LOCAL_WORKSPACE_GUARD\": \"${A3S_CODE_LOCAL_WORKSPACE_GUARD}\",
-    \"ENV_EVALUATE_MAX_RETRIES\": \"${ENV_EVALUATE_MAX_RETRIES}\""
+    \"A3S_CODE_LOCAL_WORKSPACE_GUARD\": \"${A3S_CODE_LOCAL_WORKSPACE_GUARD}\""
 fi
 
 RUNTIME_ENV_JSON="{
@@ -1432,6 +1508,24 @@ RUNTIME_ENV_JSON="{
     \"PYTORCH_CUDA_ALLOC_CONF\": \"${PYTORCH_CUDA_ALLOC_CONF}\",
     \"USE_REMOTE_ENV\": \"${USE_REMOTE_ENV}\",
     \"ENV_SERVER_URL\": \"${ENV_SERVER_URL}\",
+    \"ENV_HTTP_MAX_RETRIES\": \"${ENV_HTTP_MAX_RETRIES}\",
+    \"ENV_ALLOCATE_MAX_RETRIES\": \"${ENV_ALLOCATE_MAX_RETRIES}\",
+    \"ENV_ALLOCATE_RETRY_BASE_DELAY\": \"${ENV_ALLOCATE_RETRY_BASE_DELAY}\",
+    \"ENV_ALLOCATE_RETRY_MAX_DELAY\": \"${ENV_ALLOCATE_RETRY_MAX_DELAY}\",
+    \"ENV_ALLOCATE_RETRY_BACKOFF\": \"${ENV_ALLOCATE_RETRY_BACKOFF}\",
+    \"ENV_ALLOCATE_RETRY_JITTER\": \"${ENV_ALLOCATE_RETRY_JITTER}\",
+    \"ENV_EVALUATE_MAX_RETRIES\": \"${ENV_EVALUATE_MAX_RETRIES}\",
+    \"ENV_CLOSE_MAX_RETRIES\": \"${ENV_CLOSE_MAX_RETRIES}\",
+    \"ENV_EXEC_TOOL_MAX_RETRIES\": \"${ENV_EXEC_TOOL_MAX_RETRIES}\",
+    \"ENV_ALLOCATE_HTTP_TIMEOUT\": \"${ENV_ALLOCATE_HTTP_TIMEOUT}\",
+    \"ENV_RESET_HTTP_TIMEOUT\": \"${ENV_RESET_HTTP_TIMEOUT}\",
+    \"ENV_CLOSE_HTTP_TIMEOUT\": \"${ENV_CLOSE_HTTP_TIMEOUT}\",
+    \"ENV_REMOTE_MAX_ACTIVE_TASKS\": \"${ENV_REMOTE_MAX_ACTIVE_TASKS}\",
+    \"ENV_REMOTE_MAX_ACTIVE_RUNS\": \"${ENV_REMOTE_MAX_ACTIVE_RUNS}\",
+    \"ENV_REMOTE_MAX_RUNS_PER_TASK\": \"${ENV_REMOTE_MAX_RUNS_PER_TASK}\",
+    \"ENV_REMOTE_ADMISSION_TIMEOUT\": \"${ENV_REMOTE_ADMISSION_TIMEOUT}\",
+    \"ENV_REMOTE_ADMISSION_LOG_INTERVAL\": \"${ENV_REMOTE_ADMISSION_LOG_INTERVAL}\",
+    \"ENV_REMOTE_MAX_CONCURRENT_CLOSES\": \"${ENV_REMOTE_MAX_CONCURRENT_CLOSES}\",
     \"AGENT_SAFETYBENCH_REMOTE_ENV\": \"${AGENT_SAFETYBENCH_REMOTE_ENV}\",
     \"AGENTHARM_REMOTE_ENV\": \"${AGENTHARM_REMOTE_ENV}\",
     \"NO_PROXY\": \"${NO_PROXY}\",

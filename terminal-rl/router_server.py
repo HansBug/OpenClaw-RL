@@ -43,6 +43,17 @@ def _status_from_payload(payload: dict[str, Any], default: int) -> int:
     return default
 
 
+def _env_float(name: str, default: float) -> float:
+    raw = os.getenv(name)
+    if raw is None or raw == "":
+        return default
+    try:
+        return float(raw)
+    except ValueError:
+        logger.warning("Invalid %s=%r; using %.3f", name, raw, default)
+        return default
+
+
 def _retryable_allocate_failure(payload: dict[str, Any], status: int) -> bool:
     code = str(payload.get("code", "") or "")
     if code in RETRYABLE_ALLOCATE_CODES:
@@ -139,6 +150,7 @@ class Router:
         path: str,
         payload: dict[str, Any] | None,
         timeout: float | None,
+        retries: int | None = None,
     ) -> tuple[dict[str, Any], int]:
         if self._session is None:
             raise RuntimeError("Router HTTP session is not initialized")
@@ -149,7 +161,8 @@ class Router:
         if timeout is not None:
             kwargs["timeout"] = aiohttp.ClientTimeout(total=float(timeout))
 
-        max_attempts = self.forward_retries + 1
+        max_retries = self.forward_retries if retries is None else max(0, int(retries))
+        max_attempts = max_retries + 1
         for attempt in range(1, max_attempts + 1):
             try:
                 async with self._session.request(
@@ -210,6 +223,19 @@ class Router:
     ) -> tuple[dict[str, Any], int]:
         return await self._request("GET", worker_url, "/status", None, timeout)
 
+    async def worker_readiness(
+        self, worker_url: str, timeout: float = 5.0
+    ) -> tuple[dict[str, Any], int, str]:
+        data, status = await self._request(
+            "GET", worker_url, "/readyz", None, timeout, retries=0
+        )
+        if status == 404:
+            data, status = await self._request(
+                "GET", worker_url, "/healthz", None, timeout, retries=0
+            )
+            return data, status, "/healthz"
+        return data, status, "/readyz"
+
 
 ROUTER: Router | None = None
 
@@ -240,6 +266,61 @@ def _worker_unreachable(
 @app.get("/healthz")
 async def healthz() -> dict[str, Any]:
     return {"ok": True}
+
+
+@app.get("/readyz")
+async def readyz() -> JSONResponse:
+    if ROUTER is None:
+        return JSONResponse(
+            {
+                "ok": False,
+                "code": "ROUTER_NOT_INITIALIZED",
+                "error": "Router is not initialized",
+            },
+            status_code=503,
+        )
+
+    timeout = _env_float("ROUTER_READYZ_WORKER_TIMEOUT", 5.0)
+
+    async def _fetch(idx: int, url: str) -> dict[str, Any]:
+        try:
+            data, status_code, path = await ROUTER.worker_readiness(url, timeout=timeout)
+            ready = 200 <= status_code < 300 and bool(data.get("ok", False))
+            return {
+                "worker_idx": idx,
+                "url": url,
+                "ready": ready,
+                "status": status_code,
+                "path": path,
+                "response": data,
+            }
+        except Exception as exc:
+            return {
+                "worker_idx": idx,
+                "url": url,
+                "ready": False,
+                "error": _format_error(exc),
+            }
+
+    workers = await asyncio.gather(
+        *[_fetch(idx, url) for idx, url in enumerate(ROUTER.workers)]
+    )
+    ready_workers = [worker for worker in workers if worker.get("ready")]
+    payload = {
+        "ok": bool(ready_workers),
+        "num_workers": ROUTER.num_workers,
+        "ready_workers": len(ready_workers),
+        "workers": workers,
+    }
+    if not ready_workers:
+        payload.update(
+            {
+                "code": "NO_READY_WORKERS",
+                "error": "No env worker is ready",
+            }
+        )
+        return JSONResponse(payload, status_code=503)
+    return JSONResponse(payload)
 
 
 @app.get("/status")

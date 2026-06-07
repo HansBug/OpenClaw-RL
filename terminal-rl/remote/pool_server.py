@@ -15,7 +15,7 @@ from typing import Any
 
 import uvicorn
 from fastapi import FastAPI, Request
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, Response
 
 from ..custom_types import RunContext, TaskSpec, TaskTimeouts
 from ..request_utils import json_payload
@@ -148,6 +148,52 @@ def docker_data_root_stats() -> dict[str, Any]:
 _PRESSURE_CACHE: tuple[float, dict[str, Any]] | None = None
 
 
+def _read_cgroup_pids_stats() -> dict[str, Any] | None:
+    try:
+        lines = Path("/proc/self/cgroup").read_text().splitlines()
+    except OSError:
+        return None
+
+    search_roots: list[Path] = []
+    for line in lines:
+        parts = line.split(":", 2)
+        if len(parts) != 3:
+            continue
+        controllers = parts[1]
+        rel = parts[2].strip("/")
+        if controllers == "":
+            search_roots.append(Path("/sys/fs/cgroup") / rel)
+        elif "pids" in controllers.split(","):
+            search_roots.append(Path("/sys/fs/cgroup/pids") / rel)
+            search_roots.append(Path("/sys/fs/cgroup") / rel)
+
+    for start in search_roots:
+        cur = start
+        while True:
+            current_file = cur / "pids.current"
+            max_file = cur / "pids.max"
+            if current_file.is_file() and max_file.is_file():
+                try:
+                    current = int(current_file.read_text().strip())
+                    raw_max = max_file.read_text().strip()
+                    if raw_max == "max":
+                        return None
+                    maximum = int(raw_max)
+                except (OSError, ValueError):
+                    return None
+                if maximum > 0:
+                    return {
+                        "pids_current": current,
+                        "pids_max": maximum,
+                        "pids_source": str(cur),
+                    }
+                return None
+            if cur == cur.parent:
+                break
+            cur = cur.parent
+    return None
+
+
 def _read_proc_pressure_stats() -> dict[str, Any]:
     total_procs = 0
     total_tasks = 0
@@ -194,12 +240,24 @@ def _read_proc_pressure_stats() -> dict[str, Any]:
         pids_max = int(Path("/proc/sys/kernel/threads-max").read_text().strip())
     except (OSError, ValueError):
         pids_max = 0
-    pids_pct = (total_tasks * 100.0 / pids_max) if pids_max > 0 else 0.0
+    pids_current = total_tasks
+    pids_source = "/proc"
+    cgroup_pids = _read_cgroup_pids_stats()
+    if cgroup_pids is not None:
+        cgroup_max = int(cgroup_pids.get("pids_max") or 0)
+        if cgroup_max > 0 and (pids_max <= 0 or cgroup_max <= pids_max):
+            pids_current = int(cgroup_pids.get("pids_current") or total_tasks)
+            pids_max = cgroup_max
+            pids_source = str(cgroup_pids.get("pids_source") or "cgroup")
+
+    pids_pct = (pids_current * 100.0 / pids_max) if pids_max > 0 else 0.0
     return {
         "procs": total_procs,
         "tasks": total_tasks,
+        "pids_current": pids_current,
         "pids_max": pids_max,
         "pids_pct": pids_pct,
+        "pids_source": pids_source,
         "zombies": zombies,
         "dockerd": dockerd,
         "containerd": containerd,
@@ -292,14 +350,27 @@ def assert_worker_has_capacity_for_docker(
         return
 
     pressure = worker_pressure_stats()
-    pids_pause_pct = _env_float("WORKER_PIDS_PAUSE_ALLOCATE_PCT", 75.0)
-    pids_reject_reset_pct = _env_float("WORKER_PIDS_REJECT_RESET_PCT", 85.0)
+    pids_pause_pct = _env_float("WORKER_PIDS_PAUSE_ALLOCATE_PCT", 60.0)
+    pids_reject_reset_pct = _env_float("WORKER_PIDS_REJECT_RESET_PCT", 70.0)
+    pids_min_free_allocate = _env_int("WORKER_PIDS_MIN_FREE_ALLOCATE", 6000)
+    pids_min_free_reset = _env_int("WORKER_PIDS_MIN_FREE_RESET", 4000)
     shim_pause = _env_int("WORKER_SHIM_PAUSE_ALLOCATE", 256)
     shim_reject_reset = _env_int("WORKER_SHIM_REJECT_RESET", 384)
     pending_pause = _env_int("WORKER_PENDING_CLOSES_PAUSE_ALLOCATE", 50)
     pending_reject_reset = _env_int("WORKER_PENDING_CLOSES_REJECT_RESET", 100)
 
-    details = {**pressure, "phase": phase, "pending_closes": pending_closes}
+    pids_current = int(pressure.get("pids_current") or pressure.get("tasks") or 0)
+    pids_max = int(pressure.get("pids_max") or 0)
+    pids_free = max(pids_max - pids_current, 0) if pids_max > 0 else -1
+
+    details = {
+        **pressure,
+        "phase": phase,
+        "pending_closes": pending_closes,
+        "pids_free": pids_free,
+        "pids_min_free_allocate": pids_min_free_allocate,
+        "pids_min_free_reset": pids_min_free_reset,
+    }
     if not bool(pressure.get("docker_cli_ok", False)):
         raise ResourcePressureError(
             "WORKER_DOCKER_CLI_UNHEALTHY",
@@ -314,6 +385,15 @@ def assert_worker_has_capacity_for_docker(
                 (
                     f"Worker pids pressure {pressure['pids_pct']:.1f}% "
                     f">= reset threshold {pids_reject_reset_pct:.1f}%"
+                ),
+                details,
+            )
+        if pids_free >= 0 and pids_free < pids_min_free_reset:
+            raise ResourcePressureError(
+                "WORKER_PIDS_HEADROOM_LOW",
+                (
+                    f"Worker pids free headroom {pids_free} "
+                    f"< reset threshold {pids_min_free_reset}"
                 ),
                 details,
             )
@@ -341,6 +421,15 @@ def assert_worker_has_capacity_for_docker(
                 ),
                 details,
             )
+        if pids_free >= 0 and pids_free < pids_min_free_allocate:
+            raise ResourcePressureError(
+                "WORKER_PIDS_HEADROOM_LOW",
+                (
+                    f"Worker pids free headroom {pids_free} "
+                    f"< allocate threshold {pids_min_free_allocate}"
+                ),
+                details,
+            )
         if pressure["shim"] >= shim_pause:
             raise ResourcePressureError(
                 "WORKER_SHIM_PRESSURE",
@@ -360,6 +449,7 @@ class RunSlot:
     run_lease_id: str
     task_key: str
     env: TerminalEnv
+    created_ts: float = field(default_factory=time.time)
     last_used_ts: float = field(default_factory=time.time)
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     phase: str = "allocated"
@@ -656,6 +746,7 @@ class WorkerPool:
     def _reap_idle_locked(self) -> list[tuple[str, str, RunSlot]]:
         now = time.time()
         expired_slots: list[tuple[str, str, RunSlot]] = []
+        allocated_ttl = _env_float("WORKER_ALLOCATED_TTL", 120.0)
 
         expired_idem = [
             k
@@ -671,6 +762,13 @@ class WorkerPool:
                 if rslot.in_flight_ops > 0 or rslot.lock.locked():
                     continue
                 if rslot.close_requested:
+                    continue
+                if (
+                    rslot.phase == "allocated"
+                    and allocated_ttl > 0
+                    and now - rslot.created_ts > allocated_ttl
+                ):
+                    expired_runs.append(rid)
                     continue
                 if now - rslot.last_used_ts > self.run_idle_ttl:
                     expired_runs.append(rid)
@@ -715,6 +813,13 @@ class WorkerPool:
                 if cached is not None:
                     run_lease_id, _ = cached
                     if run_lease_id in self._run_to_task:
+                        logger.info(
+                            "allocate_ok lease_id=%s task_key=%s request_id=%s reused=%s",
+                            run_lease_id,
+                            task_key,
+                            request_id,
+                            True,
+                        )
                         return {"lease_id": run_lease_id, "reused": True}
 
             task_slot = self._tasks.get(task_key)
@@ -746,6 +851,13 @@ class WorkerPool:
         for tk, rid, rslot in expired_slots:
             self._schedule_close(tk, rid, rslot, reason="Reaping idle run slot")
 
+        logger.info(
+            "allocate_ok lease_id=%s task_key=%s request_id=%s reused=%s",
+            run_lease_id,
+            task_key,
+            request_id or "",
+            False,
+        )
         return {"lease_id": run_lease_id, "reused": False}
 
     async def heartbeat(self, run_lease_id: str) -> None:
@@ -878,6 +990,9 @@ class WorkerPool:
         async with self._lock:
             self._prune_done_closing_tasks()
             now = time.time()
+            allocated_ttl = _env_float("WORKER_ALLOCATED_TTL", 120.0)
+            resetting_ttl = _env_float("WORKER_RESETTING_TTL", 900.0)
+            closing_ttl = _env_float("WORKER_CLOSING_REQUESTED_TTL", 300.0)
             close_ages = [
                 now - started for started in self._closing_task_started.values()
             ]
@@ -892,12 +1007,15 @@ class WorkerPool:
             active_container_ids: set[str] = set()
             active_container_names: set[str] = set()
             active_trial_names: set[str] = set()
+            phase_counts: dict[str, int] = {}
+            stale_runs: list[dict[str, Any]] = []
             total_runs = 0
             in_flight_runs = 0
             closing_requested_runs = 0
             for tk, ts in self._tasks.items():
                 run_details = {}
                 for rid, rslot in ts.runs.items():
+                    phase_counts[rslot.phase] = phase_counts.get(rslot.phase, 0) + 1
                     if rslot.in_flight_ops > 0:
                         in_flight_runs += 1
                     if rslot.close_requested:
@@ -913,12 +1031,65 @@ class WorkerPool:
                     trial_name = container_info.get("trial_name")
                     if isinstance(trial_name, str) and trial_name:
                         active_trial_names.add(trial_name)
+                    created_age_sec = now - rslot.created_ts
+                    reset_age_sec = (
+                        now - rslot.reset_started_ts
+                        if rslot.reset_started_ts is not None
+                        else 0.0
+                    )
+                    close_age_sec = (
+                        now - rslot.close_requested_ts
+                        if rslot.close_requested_ts is not None
+                        else 0.0
+                    )
+                    stale_reason = ""
+                    stale_age_sec = 0.0
+                    if (
+                        rslot.phase == "allocated"
+                        and allocated_ttl > 0
+                        and created_age_sec >= allocated_ttl
+                    ):
+                        stale_reason = "allocated_ttl_exceeded"
+                        stale_age_sec = created_age_sec
+                    elif (
+                        rslot.phase == "resetting"
+                        and resetting_ttl > 0
+                        and reset_age_sec >= resetting_ttl
+                    ):
+                        stale_reason = "resetting_ttl_exceeded"
+                        stale_age_sec = reset_age_sec
+                    elif (
+                        rslot.close_requested
+                        and closing_ttl > 0
+                        and close_age_sec >= closing_ttl
+                    ):
+                        stale_reason = "closing_requested_ttl_exceeded"
+                        stale_age_sec = close_age_sec
+                    if stale_reason:
+                        stale_runs.append(
+                            {
+                                "lease_id": rid,
+                                "task_key": tk,
+                                "phase": rslot.phase,
+                                "reason": stale_reason,
+                                "age_sec": round(stale_age_sec, 1),
+                                "in_flight_ops": rslot.in_flight_ops,
+                                "active_op": rslot.active_op,
+                                "close_requested": rslot.close_requested,
+                                "container": container_info,
+                            }
+                        )
                     run_details[rid] = {
                         "phase": rslot.phase,
                         "in_flight_ops": rslot.in_flight_ops,
                         "active_op": rslot.active_op,
                         "close_requested": rslot.close_requested,
                         "age_sec": round(now - rslot.last_used_ts, 1),
+                        "created_age_sec": round(created_age_sec, 1),
+                        "reset_age_sec": round(reset_age_sec, 1),
+                        "close_requested_age_sec": round(close_age_sec, 1),
+                        "first_step": rslot.first_step_ts is not None,
+                        "evaluate_done": rslot.evaluate_completed_ts is not None,
                         "container": container_info,
                     }
                 tasks_info[tk] = {"active_runs": len(ts.runs), "runs": run_details}
@@ -933,6 +1104,8 @@ class WorkerPool:
                 "closing_requested_runs": closing_requested_runs,
                 "pending_closes": len(self._closing_tasks),
                 "pending_close_age_sec": pending_close_age_sec,
+                "phase_counts": phase_counts,
+                "stale_runs": stale_runs,
                 "active_container_ids": sorted(active_container_ids),
                 "active_container_names": sorted(active_container_names),
                 "active_trial_names": sorted(active_trial_names),
@@ -954,7 +1127,7 @@ class WorkerPool:
             pruned_done = self._prune_done_closing_tasks()
             active_runs = sum(len(ts.runs) for ts in self._tasks.values())
             pending_before_cancel = len(self._closing_tasks)
-            if active_runs > max_active_runs:
+            if max_active_runs >= 0 and active_runs > max_active_runs:
                 return {
                     "repaired": False,
                     "reason": "active_runs_above_limit",
@@ -1202,6 +1375,228 @@ async def status() -> JSONResponse:
             "admission_error": disk_error,
         }
     )
+
+
+@app.get("/readyz")
+async def readyz() -> JSONResponse:
+    if POOL is None:
+        return JSONResponse(
+            {
+                "ok": False,
+                "code": "POOL_NOT_INITIALIZED",
+                "error": "Pool is not initialized",
+            },
+            status_code=503,
+        )
+
+    pool_status = await POOL.status()
+    try:
+        assert_worker_has_capacity_for_docker(
+            phase="health",
+            pending_closes=int(pool_status.get("pending_closes", 0)),
+        )
+    except ResourcePressureError as exc:
+        return JSONResponse(
+            {
+                "ok": False,
+                "code": exc.code,
+                "error": exc.message,
+                "details": exc.details,
+                "pool": pool_status,
+            },
+            status_code=503,
+        )
+
+    stale_runs = pool_status.get("stale_runs", [])
+    if stale_runs:
+        return JSONResponse(
+            {
+                "ok": False,
+                "code": "WORKER_STALE_RUNS",
+                "error": f"Worker has {len(stale_runs)} stale run(s)",
+                "stale_runs": stale_runs[:20],
+                "pool": pool_status,
+            },
+            status_code=503,
+        )
+
+    return JSONResponse({"ok": True, "pool": pool_status})
+
+
+@app.get("/metrics")
+async def metrics() -> Response:
+    lines = [
+        "# HELP openclaw_worker_up Worker process is serving HTTP.",
+        "# TYPE openclaw_worker_up gauge",
+        "openclaw_worker_up 1",
+    ]
+    if POOL is None:
+        lines.extend(
+            [
+                "# HELP openclaw_worker_pool_initialized Worker pool initialization state.",
+                "# TYPE openclaw_worker_pool_initialized gauge",
+                "openclaw_worker_pool_initialized 0",
+            ]
+        )
+        return Response("\n".join(lines) + "\n", media_type="text/plain")
+
+    pool_status = await POOL.status()
+    gauges = {
+        "active_tasks": pool_status.get("active_tasks", 0),
+        "total_active_runs": pool_status.get("total_active_runs", 0),
+        "in_flight_runs": pool_status.get("in_flight_runs", 0),
+        "closing_requested_runs": pool_status.get("closing_requested_runs", 0),
+        "pending_closes": pool_status.get("pending_closes", 0),
+        "stale_runs": len(pool_status.get("stale_runs", []) or []),
+    }
+    lines.extend(
+        [
+            "# HELP openclaw_worker_pool_initialized Worker pool initialization state.",
+            "# TYPE openclaw_worker_pool_initialized gauge",
+            "openclaw_worker_pool_initialized 1",
+            "# HELP openclaw_worker_pool_gauge Worker pool gauges.",
+            "# TYPE openclaw_worker_pool_gauge gauge",
+        ]
+    )
+    for name, value in gauges.items():
+        lines.append(
+            f'openclaw_worker_pool_gauge{{name="{name}"}} {int(value or 0)}'
+        )
+
+    phase_counts = pool_status.get("phase_counts", {})
+    if isinstance(phase_counts, dict):
+        lines.extend(
+            [
+                "# HELP openclaw_worker_run_phase_count Active run count by phase.",
+                "# TYPE openclaw_worker_run_phase_count gauge",
+            ]
+        )
+        for phase, count in sorted(phase_counts.items()):
+            lines.append(
+                f'openclaw_worker_run_phase_count{{phase="{phase}"}} {int(count or 0)}'
+            )
+
+    try:
+        pressure = worker_pressure_stats()
+    except Exception as exc:
+        lines.append(f'# worker_pressure_stats_error="{exc}"')
+    else:
+        lines.extend(
+            [
+                "# HELP openclaw_worker_pressure Worker pressure gauges.",
+                "# TYPE openclaw_worker_pressure gauge",
+            ]
+        )
+        for name in ("tasks", "procs", "zombies", "shim", "runc", "docker_cli_procs"):
+            value = pressure.get(name)
+            if isinstance(value, (int, float)):
+                lines.append(f'openclaw_worker_pressure{{name="{name}"}} {value}')
+        pids_pct = pressure.get("pids_pct")
+        if isinstance(pids_pct, (int, float)):
+            lines.append(f'openclaw_worker_pressure{{name="pids_pct"}} {pids_pct}')
+        docker_cli_ok = 1 if pressure.get("docker_cli_ok") else 0
+        lines.append(f'openclaw_worker_pressure{{name="docker_cli_ok"}} {docker_cli_ok}')
+
+    return Response("\n".join(lines) + "\n", media_type="text/plain")
+
+
+@app.post("/probe/rollout")
+async def probe_rollout(request: Request) -> JSONResponse:
+    if POOL is None:
+        return JSONResponse(
+            {
+                "ok": False,
+                "code": "POOL_NOT_INITIALIZED",
+                "error": "Pool is not initialized",
+            },
+            status_code=503,
+        )
+
+    data = await json_payload(request)
+    task_meta = data.get("task_meta")
+    if not isinstance(task_meta, dict):
+        return JSONResponse(
+            {"ok": False, "error": "task_meta dict is required"},
+            status_code=400,
+        )
+
+    task_key = str(
+        data.get("task_key") or f"probe:{task_meta.get('task_name', 'unknown')}"
+    )
+    run_ctx_payload = (
+        data.get("run_ctx") if isinstance(data.get("run_ctx"), dict) else {}
+    )
+    task_timeouts = data.get("task_timeouts")
+    tool_call = data.get("tool_call")
+    request_id = str(data.get("request_id") or f"probe-{uuid.uuid4().hex[:16]}")
+    lease_id: str | None = None
+    started_ts = time.time()
+    exec_result: dict[str, Any] | None = None
+
+    try:
+        pool_status = await POOL.status()
+        assert_worker_has_capacity_for_docker(
+            phase="allocate",
+            pending_closes=int(pool_status.get("pending_closes", 0)),
+        )
+        allocated = await POOL.allocate(task_key=task_key, request_id=request_id)
+        lease_id = str(allocated["lease_id"])
+        await POOL.reset(
+            run_lease_id=lease_id,
+            task_meta=task_meta,
+            run_ctx_payload=run_ctx_payload,
+            task_timeouts=task_timeouts if isinstance(task_timeouts, dict) else None,
+        )
+        if isinstance(tool_call, dict):
+            tool_name = tool_call.get("name")
+            arguments = tool_call.get("arguments")
+            if isinstance(tool_name, str) and tool_name:
+                observation = await POOL.exec_tool(
+                    lease_id,
+                    tool_name,
+                    arguments=arguments if isinstance(arguments, dict) else None,
+                )
+                exec_result = {
+                    "tool_name": tool_name,
+                    "observation_len": len(observation),
+                }
+        return JSONResponse(
+            {
+                "ok": True,
+                "lease_id": lease_id,
+                "duration_sec": round(time.time() - started_ts, 3),
+                "exec": exec_result,
+            }
+        )
+    except ResourcePressureError as exc:
+        return JSONResponse(
+            {
+                "ok": False,
+                "code": exc.code,
+                "error": exc.message,
+                "details": exc.details,
+                "duration_sec": round(time.time() - started_ts, 3),
+            },
+            status_code=503,
+        )
+    except Exception as exc:
+        logger.exception(
+            "Rollout probe failed lease_id=%s task_key=%s", lease_id, task_key
+        )
+        return JSONResponse(
+            {
+                "ok": False,
+                "error": str(exc),
+                "duration_sec": round(time.time() - started_ts, 3),
+            },
+            status_code=500,
+        )
+    finally:
+        if lease_id:
+            try:
+                await POOL.close_run(lease_id, reason="rollout_probe_close")
+            except Exception:
+                logger.exception("Failed to close rollout probe lease_id=%s", lease_id)
 
 
 @app.post("/repair/pending_closes")

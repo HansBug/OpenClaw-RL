@@ -281,6 +281,7 @@ def prepare_task_docker_image(
 
 
 _DEFAULT_CONTAINER_MEMORY_LIMIT = os.getenv("CONTAINER_MEMORY_LIMIT", "16g")
+_DEFAULT_CONTAINER_PIDS_LIMIT = os.getenv("CONTAINER_PIDS_LIMIT", "64")
 
 
 def _apply_container_memory_limit(
@@ -309,6 +310,51 @@ def _apply_container_memory_limit(
             logger.warning(
                 "Failed to apply memory limit to container %s: %s", container_name, exc
             )
+
+
+def _apply_container_pids_limit(
+    container_name: str,
+    pids_limit: str,
+    logger: logging.Logger | None = None,
+) -> None:
+    """Best-effort ``docker update --pids-limit`` on a running container."""
+    if not pids_limit:
+        return
+    try:
+        value = int(str(pids_limit).strip())
+    except ValueError:
+        if logger is not None:
+            logger.warning(
+                "Invalid CONTAINER_PIDS_LIMIT=%r; skipping pids limit for %s",
+                pids_limit,
+                container_name,
+            )
+        return
+    if value <= 0:
+        return
+
+    cmd = ["docker", "update", f"--pids-limit={value}", container_name]
+    try:
+        subprocess.run(cmd, check=True, capture_output=True, text=True, timeout=30.0)
+        if logger is not None:
+            logger.info("Applied pids limit %s to container %s", value, container_name)
+    except Exception as exc:
+        if logger is not None:
+            logger.warning(
+                "Failed to apply pids limit to container %s: %s", container_name, exc
+            )
+
+
+def _apply_container_runtime_limits(
+    container_name: str,
+    logger: logging.Logger | None = None,
+) -> None:
+    _apply_container_pids_limit(
+        container_name, _DEFAULT_CONTAINER_PIDS_LIMIT, logger=logger
+    )
+    _apply_container_memory_limit(
+        container_name, _DEFAULT_CONTAINER_MEMORY_LIMIT, logger=logger
+    )
 
 
 def compose_up_no_build(
@@ -408,9 +454,7 @@ def compose_up_no_build(
                 container = compose_manager._client.containers.get(container_name)
                 terminal.container = container
                 compose_manager._client_container = container
-                _apply_container_memory_limit(
-                    container_name, _DEFAULT_CONTAINER_MEMORY_LIMIT, logger=logger
-                )
+                _apply_container_runtime_limits(container_name, logger=logger)
                 return
 
             raise RuntimeError(
@@ -435,6 +479,4 @@ def compose_up_no_build(
     container = compose_manager._client.containers.get(container_name)
     terminal.container = container
     compose_manager._client_container = container
-    _apply_container_memory_limit(
-        container_name, _DEFAULT_CONTAINER_MEMORY_LIMIT, logger=logger
-    )
+    _apply_container_runtime_limits(container_name, logger=logger)

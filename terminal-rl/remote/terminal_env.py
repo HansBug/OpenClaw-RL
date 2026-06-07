@@ -360,13 +360,11 @@ class TerminalEnv:
                     self._terminal.start()
                 try:
                     from .docker_compose_utils import (
-                        _DEFAULT_CONTAINER_MEMORY_LIMIT,
-                        _apply_container_memory_limit,
+                        _apply_container_runtime_limits,
                     )
 
-                    _apply_container_memory_limit(
+                    _apply_container_runtime_limits(
                         self._trial_handler.client_container_name,
-                        _DEFAULT_CONTAINER_MEMORY_LIMIT,
                         logger=logger,
                     )
                 except Exception:
