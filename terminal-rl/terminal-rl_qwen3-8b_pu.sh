@@ -155,8 +155,10 @@ EXPLORE_INTRINSIC_ENABLED="${EXPLORE_INTRINSIC_ENABLED:-${EXPLORE_INTRINSIC}}"
 EXPLORE_INTRINSIC_COEF="${EXPLORE_INTRINSIC_COEF:-0.1}"
 EXPLORE_INTRINSIC_SCHEDULE="${EXPLORE_INTRINSIC_SCHEDULE:-constant}"
 EXPLORE_INTRINSIC_DECAY_STEPS="${EXPLORE_INTRINSIC_DECAY_STEPS:-0}"
+EXPLORE_INTRINSIC_REDUCER="${EXPLORE_INTRINSIC_REDUCER:-sum}"
 EXPLORE_INTRINSIC_GRANULARITY="${EXPLORE_INTRINSIC_GRANULARITY:-raw}"
 EXPLORE_INTRINSIC_SCOPE="${EXPLORE_INTRINSIC_SCOPE:-process}"
+EXPLORE_SCORE_BONUS_COMPONENTS="${EXPLORE_SCORE_BONUS_COMPONENTS:-legacy}"
 EXPLORE_SAFETY_FILTER="${EXPLORE_SAFETY_FILTER:-0}"
 EXPLORE_SAFETY_FILTER_ENABLED="${EXPLORE_SAFETY_FILTER_ENABLED:-${EXPLORE_SAFETY_FILTER}}"
 EXPLORE_SAFETY_FILTER_COEF="${EXPLORE_SAFETY_FILTER_COEF:--0.5}"
@@ -174,6 +176,9 @@ EXPLORE_AGENT57_ARM_BETAS="${EXPLORE_AGENT57_ARM_BETAS:-0,0.003,0.006,0.01,0.015
 EXPLORE_AGENT57_COMBINE_MODE="${EXPLORE_AGENT57_COMBINE_MODE:-add}"
 EXPLORE_AGENT57_NGU_MOD_CLIP="${EXPLORE_AGENT57_NGU_MOD_CLIP:-5.0}"
 EXPLORE_AGENT57_NGU_EPISODIC_SOURCE="${EXPLORE_AGENT57_NGU_EPISODIC_SOURCE:-signature_intrinsic}"
+EXPLORE_AGENT57_NGU_EPISODIC_REDUCER="${EXPLORE_AGENT57_NGU_EPISODIC_REDUCER:-${EXPLORE_INTRINSIC_REDUCER}}"
+EXPLORE_AGENT57_NGU_LIFE_MOD_MODE="${EXPLORE_AGENT57_NGU_LIFE_MOD_MODE:-linear}"
+EXPLORE_AGENT57_NGU_LIFE_MOD_STD_CLIP="${EXPLORE_AGENT57_NGU_LIFE_MOD_STD_CLIP:-5.0}"
 EXPLORE_AGENT57_MAX_BONUS="${EXPLORE_AGENT57_MAX_BONUS:-0}"
 EXPLORE_AGENT57_ARM_TEMPERATURES="${EXPLORE_AGENT57_ARM_TEMPERATURES:-}"
 EXPLORE_AGENT57_ARM_TOP_PS="${EXPLORE_AGENT57_ARM_TOP_PS:-}"
@@ -203,18 +208,32 @@ EXPLORE_AGENT57_LIFELONG_ENABLED="${EXPLORE_AGENT57_LIFELONG_ENABLED:-${EXPLORE_
 EXPLORE_AGENT57_LIFELONG_COEF="${EXPLORE_AGENT57_LIFELONG_COEF:-0.01}"
 EXPLORE_AGENT57_LIFELONG_CLIP="${EXPLORE_AGENT57_LIFELONG_CLIP:-2.0}"
 EXPLORE_AGENT57_LIFELONG_WARMUP="${EXPLORE_AGENT57_LIFELONG_WARMUP:-64}"
+EXPLORE_AGENT57_LIFELONG_COUNT_DECAY="${EXPLORE_AGENT57_LIFELONG_COUNT_DECAY:-1.0}"
+EXPLORE_AGENT57_LIFELONG_CAPACITY="${EXPLORE_AGENT57_LIFELONG_CAPACITY:-0}"
 EXPLORE_AGENT57_LIFELONG_BACKEND="${EXPLORE_AGENT57_LIFELONG_BACKEND:-local}"
 EXPLORE_AGENT57_LIFELONG_KEY_VERSION="${EXPLORE_AGENT57_LIFELONG_KEY_VERSION:-v1}"
 EXPLORE_AGENT57_LIFELONG_INCLUDE_DATASET="${EXPLORE_AGENT57_LIFELONG_INCLUDE_DATASET:-1}"
 EXPLORE_AGENT57_LIFELONG_INCLUDE_TASK="${EXPLORE_AGENT57_LIFELONG_INCLUDE_TASK:-0}"
 EXPLORE_AGENT57_LIFELONG_INCLUDE_TURN="${EXPLORE_AGENT57_LIFELONG_INCLUDE_TURN:-0}"
+EXPLORE_AGENT57_LIFELONG_OBS_MODE="${EXPLORE_AGENT57_LIFELONG_OBS_MODE:-fingerprint}"
+EXPLORE_AGENT57_TRUST_GATE="${EXPLORE_AGENT57_TRUST_GATE:-hard}"
+EXPLORE_AGENT57_TRUST_COMPLETED="${EXPLORE_AGENT57_TRUST_COMPLETED:-1.0}"
+EXPLORE_AGENT57_TRUST_TRUNCATED="${EXPLORE_AGENT57_TRUST_TRUNCATED:-0.3}"
+EXPLORE_AGENT57_TRUST_FAILED="${EXPLORE_AGENT57_TRUST_FAILED:-0.1}"
+EXPLORE_AGENT57_TRUST_PARSE_ERROR="${EXPLORE_AGENT57_TRUST_PARSE_ERROR:-0.1}"
+EXPLORE_AGENT57_TRUST_WARMUP="${EXPLORE_AGENT57_TRUST_WARMUP:-0.3}"
 EXPLORE_AGENT57_STATE_PATH="${EXPLORE_AGENT57_STATE_PATH:-}"
 EXPLORE_AGENT57_SUCCESS_THRESHOLD="${EXPLORE_AGENT57_SUCCESS_THRESHOLD:-0.0}"
 EXPLORE_ADVANTAGE_BONUS="${EXPLORE_ADVANTAGE_BONUS:-0}"
 EXPLORE_ADVANTAGE_BONUS_ENABLED="${EXPLORE_ADVANTAGE_BONUS_ENABLED:-${EXPLORE_ADVANTAGE_BONUS}}"
+EXPLORE_ADVANTAGE_BONUS_MODE="${EXPLORE_ADVANTAGE_BONUS_MODE:-component}"
 EXPLORE_ADVANTAGE_BONUS_COMPONENTS="${EXPLORE_ADVANTAGE_BONUS_COMPONENTS:-explore_intrinsic_scaled}"
 EXPLORE_ADVANTAGE_BONUS_COEF="${EXPLORE_ADVANTAGE_BONUS_COEF:-1.0}"
 EXPLORE_ADVANTAGE_BONUS_CLIP="${EXPLORE_ADVANTAGE_BONUS_CLIP:-0.25}"
+EXPLORE_ADVANTAGE_INTRINSIC_KEY="${EXPLORE_ADVANTAGE_INTRINSIC_KEY:-explore_agent57_intrinsic_signal}"
+EXPLORE_ADVANTAGE_LAMBDA="${EXPLORE_ADVANTAGE_LAMBDA:-${EXPLORE_ADVANTAGE_BONUS_COEF}}"
+EXPLORE_ADVANTAGE_ARM_WEIGHT_MODE="${EXPLORE_ADVANTAGE_ARM_WEIGHT_MODE:-normalized_beta}"
+EXPLORE_ADVANTAGE_TRUST_KEY="${EXPLORE_ADVANTAGE_TRUST_KEY:-explore_agent57_trust}"
 EXPLORE_CDE_ACTOR="${EXPLORE_CDE_ACTOR:-0}"
 EXPLORE_CDE_ACTOR_ENABLED="${EXPLORE_CDE_ACTOR_ENABLED:-${EXPLORE_CDE_ACTOR}}"
 EXPLORE_CDE_ACTOR_OMEGA="${EXPLORE_CDE_ACTOR_OMEGA:-0.05}"
@@ -338,11 +357,14 @@ A3S_CODE_EXTERNAL_TOOL_ERRORS_AS_RESULTS="${A3S_CODE_EXTERNAL_TOOL_ERRORS_AS_RES
 A3S_CODE_LOCAL_WORKSPACE_GUARD="${A3S_CODE_LOCAL_WORKSPACE_GUARD:-1}"
 A3S_CODE_PIP_PACKAGE="${A3S_CODE_PIP_PACKAGE:-a3s-code==3.3.0}"
 ENV_HTTP_MAX_RETRIES="${ENV_HTTP_MAX_RETRIES:-10}"
-ENV_ALLOCATE_MAX_RETRIES="${ENV_ALLOCATE_MAX_RETRIES:-100}"
+ENV_ALLOCATE_MAX_RETRIES="${ENV_ALLOCATE_MAX_RETRIES:-20}"
 ENV_ALLOCATE_RETRY_BASE_DELAY="${ENV_ALLOCATE_RETRY_BASE_DELAY:-2.0}"
 ENV_ALLOCATE_RETRY_MAX_DELAY="${ENV_ALLOCATE_RETRY_MAX_DELAY:-30.0}"
 ENV_ALLOCATE_RETRY_BACKOFF="${ENV_ALLOCATE_RETRY_BACKOFF:-2.0}"
 ENV_ALLOCATE_RETRY_JITTER="${ENV_ALLOCATE_RETRY_JITTER:-0.25}"
+HTTP_RETRY_LOG_EVERY_N="${HTTP_RETRY_LOG_EVERY_N:-25}"
+HTTP_RETRY_LOG_RESPONSE_CHARS="${HTTP_RETRY_LOG_RESPONSE_CHARS:-512}"
+TERMINAL_RL_GENERATE_FAILURE_TRACEBACK="${TERMINAL_RL_GENERATE_FAILURE_TRACEBACK:-0}"
 ENV_EVALUATE_MAX_RETRIES="${ENV_EVALUATE_MAX_RETRIES:-3}"
 ENV_CLOSE_MAX_RETRIES="${ENV_CLOSE_MAX_RETRIES:-3}"
 ENV_EXEC_TOOL_MAX_RETRIES="${ENV_EXEC_TOOL_MAX_RETRIES:-3}"
@@ -800,9 +822,18 @@ CHECK_HOST="${CHECK_HOST:-127.0.0.1}"
 CHECK_WAIT_SECS="${CHECK_WAIT_SECS:-60}"
 READY_PROBE_TIMEOUT="${READY_PROBE_TIMEOUT:-5}"
 ROUTER_REQUIRE_READY="${ROUTER_REQUIRE_READY:-1}"
+ROUTER_READY_WAIT_FOREVER="${ROUTER_READY_WAIT_FOREVER:-0}"
 WORKER_PREFLIGHT_REQUIRE_READY="${WORKER_PREFLIGHT_REQUIRE_READY:-1}"
 WORKER_PREFLIGHT_TIMEOUT="${WORKER_PREFLIGHT_TIMEOUT:-5}"
 export ROUTER_READYZ_WORKER_TIMEOUT="${ROUTER_READYZ_WORKER_TIMEOUT:-${WORKER_PREFLIGHT_TIMEOUT}}"
+AUTO_CLOSE_STALE_WORKER_RUNS="${AUTO_CLOSE_STALE_WORKER_RUNS:-1}"
+STALE_WORKER_CLOSE_INTERVAL="${STALE_WORKER_CLOSE_INTERVAL:-10}"
+STALE_WORKER_CLOSE_TIMEOUT="${STALE_WORKER_CLOSE_TIMEOUT:-10}"
+STALE_WORKER_REPAIR_MIN_AGE="${STALE_WORKER_REPAIR_MIN_AGE:-0}"
+STALE_WORKER_REPAIR_MAX_REPAIRS="${STALE_WORKER_REPAIR_MAX_REPAIRS:-20}"
+if ! [[ "${STALE_WORKER_CLOSE_INTERVAL}" =~ ^[0-9]+$ ]] || [[ "${STALE_WORKER_CLOSE_INTERVAL}" -le 0 ]]; then
+  STALE_WORKER_CLOSE_INTERVAL=10
+fi
 
 probe_ready_endpoint() {
   local base_url="$1"
@@ -830,6 +861,133 @@ probe_ready_endpoint() {
   log "  [WARN] ${label}${path} not ready HTTP ${code}${body:+: ${body}}"
   rm -f "${tmp}" 2>/dev/null || true
   return 1
+}
+
+extract_stale_lease_ids() {
+  local json_path="$1"
+  python3 - "${json_path}" <<'PY'
+import json
+import sys
+
+path = sys.argv[1]
+try:
+    with open(path, "r", encoding="utf-8", errors="ignore") as f:
+        data = json.load(f)
+except Exception:
+    sys.exit(0)
+
+seen = set()
+out = []
+
+def walk(obj):
+    if isinstance(obj, dict):
+        stale_runs = obj.get("stale_runs")
+        if isinstance(stale_runs, list):
+            for item in stale_runs:
+                if not isinstance(item, dict):
+                    continue
+                lease_id = item.get("lease_id")
+                if isinstance(lease_id, str) and lease_id and lease_id not in seen:
+                    seen.add(lease_id)
+                    out.append(lease_id)
+        for value in obj.values():
+            walk(value)
+    elif isinstance(obj, list):
+        for value in obj:
+            walk(value)
+
+walk(data)
+for lease_id in out:
+    print(lease_id)
+PY
+}
+
+close_stale_worker_runs() {
+  local base_url="$1"
+  local label="$2"
+  local timeout_s="${3:-${STALE_WORKER_CLOSE_TIMEOUT}}"
+  local tmp ids_tmp path code lease_id close_tmp close_code close_body count repair_tmp repair_code repair_body
+
+  if [[ "${AUTO_CLOSE_STALE_WORKER_RUNS}" != "1" ]]; then
+    return 1
+  fi
+  if ! command -v python3 >/dev/null 2>&1; then
+    log "  [WARN] stale-run cleanup skipped for ${label}: python3 not found"
+    return 1
+  fi
+
+  tmp="$(mktemp /tmp/openclaw_stale_ready.XXXXXX 2>/dev/null || printf '/tmp/openclaw_stale_ready.%s' "$$")"
+  ids_tmp="$(mktemp /tmp/openclaw_stale_ids.XXXXXX 2>/dev/null || printf '/tmp/openclaw_stale_ids.%s' "$$")"
+  : > "${ids_tmp}"
+  for path in /readyz /status; do
+    code="$(curl -sS --max-time "${timeout_s}" --noproxy '*' \
+      -o "${tmp}" -w '%{http_code}' "${base_url}${path}" 2>/dev/null || echo "000")"
+    if [[ "${code}" =~ ^[0-9][0-9][0-9]$ ]]; then
+      extract_stale_lease_ids "${tmp}" >> "${ids_tmp}" || true
+    fi
+  done
+
+  if [[ ! -s "${ids_tmp}" ]]; then
+    rm -f "${tmp}" "${ids_tmp}" 2>/dev/null || true
+    return 1
+  fi
+
+  repair_tmp="$(mktemp /tmp/openclaw_stale_repair.XXXXXX 2>/dev/null || printf '/tmp/openclaw_stale_repair.%s' "$$")"
+  repair_code="$(curl -sS --max-time "${timeout_s}" --noproxy '*' \
+    -X POST -H 'Content-Type: application/json' \
+    --data "{\"reason\":\"startup_readyz_repair\",\"min_age\":${STALE_WORKER_REPAIR_MIN_AGE},\"max_repairs\":${STALE_WORKER_REPAIR_MAX_REPAIRS}}" \
+    -o "${repair_tmp}" -w '%{http_code}' "${base_url}/repair/stale_runs" 2>/dev/null || echo "000")"
+  repair_body="$(head -c 320 "${repair_tmp}" 2>/dev/null || true)"
+  if [[ "${repair_code}" =~ ^2[0-9][0-9]$ ]]; then
+    log "  [REPAIR] ${label}: repair stale runs HTTP ${repair_code}${repair_body:+: ${repair_body}}"
+    rm -f "${tmp}" "${ids_tmp}" "${repair_tmp}" 2>/dev/null || true
+    return 0
+  elif [[ "${repair_code}" != "404" && "${repair_code}" != "000" ]]; then
+    log "  [WARN] ${label}: repair stale runs endpoint HTTP ${repair_code}${repair_body:+: ${repair_body}}"
+  else
+    log "  [WARN] ${label}: /repair/stale_runs unavailable; falling back to duplicate /close requests. Restart worker to load the repair endpoint if stale in-flight runs persist."
+  fi
+  rm -f "${repair_tmp}" 2>/dev/null || true
+
+  count=0
+  while IFS= read -r lease_id; do
+    [[ -n "${lease_id}" ]] || continue
+    close_tmp="$(mktemp /tmp/openclaw_stale_close.XXXXXX 2>/dev/null || printf '/tmp/openclaw_stale_close.%s' "$$")"
+    close_code="$(curl -sS --max-time "${timeout_s}" --noproxy '*' \
+      -X POST -H 'Content-Type: application/json' \
+      --data "{\"lease_id\":\"${lease_id}\"}" \
+      -o "${close_tmp}" -w '%{http_code}' "${base_url}/close" 2>/dev/null || echo "000")"
+    close_body="$(head -c 240 "${close_tmp}" 2>/dev/null || true)"
+    log "  [REPAIR] ${label}: close stale lease=${lease_id} HTTP ${close_code}${close_body:+: ${close_body}}"
+    rm -f "${close_tmp}" 2>/dev/null || true
+    count=$((count + 1))
+  done < <(python3 - "${ids_tmp}" <<'PY'
+import sys
+seen = set()
+for line in open(sys.argv[1], "r", encoding="utf-8", errors="ignore"):
+    value = line.strip()
+    if value and value not in seen:
+        seen.add(value)
+        print(value)
+PY
+  )
+
+  rm -f "${tmp}" "${ids_tmp}" 2>/dev/null || true
+  [[ "${count}" -gt 0 ]]
+}
+
+close_stale_runs_for_all_workers() {
+  local reason="$1"
+  local repaired=0
+  local _w
+  IFS=',' read -r -a _STALE_WORKERS <<< "${WORKER_URLS}"
+  for _w in "${_STALE_WORKERS[@]}"; do
+    [[ -n "${_w}" ]] || continue
+    if close_stale_worker_runs "${_w}" "${_w} (${reason})" "${STALE_WORKER_CLOSE_TIMEOUT}"; then
+      repaired=1
+    fi
+  done
+  [[ "${repaired}" -eq 1 ]]
 }
 
 # ── Robustness knobs (informed by issue #3 postmortem) ───────────────
@@ -933,10 +1091,11 @@ else
 fi
 ROLLOUT_MAX_RESPONSE_LEN="${ROLLOUT_MAX_RESPONSE_LEN:-8192}"
 ROLLOUT_MAX_CONTEXT_LEN="${ROLLOUT_MAX_CONTEXT_LEN:-16384}"
-ROLLOUT_GENERATION_MAX_RETRIES="${ROLLOUT_GENERATION_MAX_RETRIES:--1}"
+ROLLOUT_GENERATION_MAX_RETRIES="${ROLLOUT_GENERATION_MAX_RETRIES:-3}"
 ROLLOUT_GENERATION_RETRY_INITIAL_BACKOFF="${ROLLOUT_GENERATION_RETRY_INITIAL_BACKOFF:-60}"
 ROLLOUT_GENERATION_RETRY_MAX_BACKOFF="${ROLLOUT_GENERATION_RETRY_MAX_BACKOFF:-300}"
 ROLLOUT_GENERATION_RETRY_BACKOFF_MULTIPLIER="${ROLLOUT_GENERATION_RETRY_BACKOFF_MULTIPLIER:-2.0}"
+ROLLOUT_GENERATION_ENV_STORM_MAX_RETRIES="${ROLLOUT_GENERATION_ENV_STORM_MAX_RETRIES:-3}"
 ROLLOUT_GENERATION_SKIP_ON_FAILURE="${ROLLOUT_GENERATION_SKIP_ON_FAILURE:-0}"
 
 ROLLOUT_ARGS=(
@@ -956,6 +1115,7 @@ ROLLOUT_ARGS=(
   --rollout-generation-retry-initial-backoff "${ROLLOUT_GENERATION_RETRY_INITIAL_BACKOFF}"
   --rollout-generation-retry-max-backoff "${ROLLOUT_GENERATION_RETRY_MAX_BACKOFF}"
   --rollout-generation-retry-backoff-multiplier "${ROLLOUT_GENERATION_RETRY_BACKOFF_MULTIPLIER}"
+  --rollout-generation-env-storm-max-retries "${ROLLOUT_GENERATION_ENV_STORM_MAX_RETRIES}"
 )
 if [[ "${ROLLOUT_GENERATION_SKIP_ON_FAILURE}" == "1" ]]; then
   ROLLOUT_ARGS+=(--rollout-generation-skip-on-failure)
@@ -1055,8 +1215,8 @@ if [[ -n "${ALGO_EXTRA_ARGS// }" ]]; then
   ALGO_EXTRA_ARGS_ARRAY=(${ALGO_EXTRA_ARGS})
 fi
 log "Algorithm config: ALGO=${ALGO} args=${ALGO_ARGS[*]} extra=${ALGO_EXTRA_ARGS_ARRAY[*]:-<none>}"
-log "Rollout retry config: max_retries=${ROLLOUT_GENERATION_MAX_RETRIES} initial_backoff=${ROLLOUT_GENERATION_RETRY_INITIAL_BACKOFF}s max_backoff=${ROLLOUT_GENERATION_RETRY_MAX_BACKOFF}s multiplier=${ROLLOUT_GENERATION_RETRY_BACKOFF_MULTIPLIER} skip_on_failure=${ROLLOUT_GENERATION_SKIP_ON_FAILURE}"
-log "Exploration config: profile=${EXPLORATION_PROFILE} entropy=${EXPLORE_ENTROPY_COEF} intrinsic=${EXPLORE_INTRINSIC_ENABLED}/${EXPLORE_INTRINSIC} coef=${EXPLORE_INTRINSIC_COEF} schedule=${EXPLORE_INTRINSIC_SCHEDULE}/${EXPLORE_INTRINSIC_DECAY_STEPS} granularity=${EXPLORE_INTRINSIC_GRANULARITY} scope=${EXPLORE_INTRINSIC_SCOPE} safety_filter=${EXPLORE_SAFETY_FILTER_ENABLED}/${EXPLORE_SAFETY_FILTER} lprnd=${EXPLORE_LPRND_ENABLED}/${EXPLORE_LPRND} coef=${EXPLORE_LPRND_COEF} schedule=${EXPLORE_LPRND_SCHEDULE}/${EXPLORE_LPRND_DECAY_STEPS} agent57=${EXPLORE_AGENT57_LITE_ENABLED}/${EXPLORE_AGENT57_LITE} k=${EXPLORE_AGENT57_K} controller=${EXPLORE_AGENT57_CONTROLLER} ucb_eps=${EXPLORE_AGENT57_UCB_EPSILON} ucb_min=${EXPLORE_AGENT57_UCB_MIN_PER_ARM} ucb_value=${EXPLORE_AGENT57_UCB_VALUE} dataset_aware=${EXPLORE_AGENT57_UCB_DATASET_AWARE} ucb_seed=${EXPLORE_AGENT57_UCB_RANDOM_SEED:-<legacy>} episodic=${EXPLORE_AGENT57_EPISODIC_BACKEND} combine=${EXPLORE_AGENT57_COMBINE_MODE} ngu_clip=${EXPLORE_AGENT57_NGU_MOD_CLIP} max_bonus=${EXPLORE_AGENT57_MAX_BONUS} betas=${EXPLORE_AGENT57_ARM_BETAS} temps=${EXPLORE_AGENT57_ARM_TEMPERATURES:-<inherit>} lifelong=${EXPLORE_AGENT57_LIFELONG_ENABLED}/${EXPLORE_AGENT57_LIFELONG} life_coef=${EXPLORE_AGENT57_LIFELONG_COEF} life_backend=${EXPLORE_AGENT57_LIFELONG_BACKEND} life_key=${EXPLORE_AGENT57_LIFELONG_KEY_VERSION} life_dataset=${EXPLORE_AGENT57_LIFELONG_INCLUDE_DATASET} life_task=${EXPLORE_AGENT57_LIFELONG_INCLUDE_TASK} life_turn=${EXPLORE_AGENT57_LIFELONG_INCLUDE_TURN} cde_actor=${EXPLORE_CDE_ACTOR_ENABLED}/${EXPLORE_CDE_ACTOR} omega=${EXPLORE_CDE_ACTOR_OMEGA} alpha=${EXPLORE_CDE_ACTOR_ALPHA} kappa=${EXPLORE_CDE_ACTOR_KAPPA} gate=${EXPLORE_CDE_ACTOR_REWARD_GATE} decay_steps=${EXPLORE_CDE_ACTOR_DECAY_STEPS} post_norm_bonus=${EXPLORE_ADVANTAGE_BONUS_ENABLED}/${EXPLORE_ADVANTAGE_BONUS} components=${EXPLORE_ADVANTAGE_BONUS_COMPONENTS} coef=${EXPLORE_ADVANTAGE_BONUS_COEF} clip=${EXPLORE_ADVANTAGE_BONUS_CLIP}"
+log "Rollout retry config: max_retries=${ROLLOUT_GENERATION_MAX_RETRIES} initial_backoff=${ROLLOUT_GENERATION_RETRY_INITIAL_BACKOFF}s max_backoff=${ROLLOUT_GENERATION_RETRY_MAX_BACKOFF}s multiplier=${ROLLOUT_GENERATION_RETRY_BACKOFF_MULTIPLIER} env_storm_max_retries=${ROLLOUT_GENERATION_ENV_STORM_MAX_RETRIES} skip_on_failure=${ROLLOUT_GENERATION_SKIP_ON_FAILURE}"
+log "Exploration config: profile=${EXPLORATION_PROFILE} entropy=${EXPLORE_ENTROPY_COEF} intrinsic=${EXPLORE_INTRINSIC_ENABLED}/${EXPLORE_INTRINSIC} coef=${EXPLORE_INTRINSIC_COEF} schedule=${EXPLORE_INTRINSIC_SCHEDULE}/${EXPLORE_INTRINSIC_DECAY_STEPS} reducer=${EXPLORE_INTRINSIC_REDUCER} granularity=${EXPLORE_INTRINSIC_GRANULARITY} scope=${EXPLORE_INTRINSIC_SCOPE} score_components=${EXPLORE_SCORE_BONUS_COMPONENTS} safety_filter=${EXPLORE_SAFETY_FILTER_ENABLED}/${EXPLORE_SAFETY_FILTER} lprnd=${EXPLORE_LPRND_ENABLED}/${EXPLORE_LPRND} coef=${EXPLORE_LPRND_COEF} schedule=${EXPLORE_LPRND_SCHEDULE}/${EXPLORE_LPRND_DECAY_STEPS} agent57=${EXPLORE_AGENT57_LITE_ENABLED}/${EXPLORE_AGENT57_LITE} k=${EXPLORE_AGENT57_K} controller=${EXPLORE_AGENT57_CONTROLLER} ucb_eps=${EXPLORE_AGENT57_UCB_EPSILON} ucb_min=${EXPLORE_AGENT57_UCB_MIN_PER_ARM} ucb_value=${EXPLORE_AGENT57_UCB_VALUE} dataset_aware=${EXPLORE_AGENT57_UCB_DATASET_AWARE} ucb_seed=${EXPLORE_AGENT57_UCB_RANDOM_SEED:-<legacy>} episodic=${EXPLORE_AGENT57_EPISODIC_BACKEND} combine=${EXPLORE_AGENT57_COMBINE_MODE} ngu_clip=${EXPLORE_AGENT57_NGU_MOD_CLIP} ngu_reducer=${EXPLORE_AGENT57_NGU_EPISODIC_REDUCER} life_mod=${EXPLORE_AGENT57_NGU_LIFE_MOD_MODE}/${EXPLORE_AGENT57_NGU_LIFE_MOD_STD_CLIP} max_bonus=${EXPLORE_AGENT57_MAX_BONUS} betas=${EXPLORE_AGENT57_ARM_BETAS} temps=${EXPLORE_AGENT57_ARM_TEMPERATURES:-<inherit>} lifelong=${EXPLORE_AGENT57_LIFELONG_ENABLED}/${EXPLORE_AGENT57_LIFELONG} life_coef=${EXPLORE_AGENT57_LIFELONG_COEF} life_backend=${EXPLORE_AGENT57_LIFELONG_BACKEND} life_key=${EXPLORE_AGENT57_LIFELONG_KEY_VERSION} life_dataset=${EXPLORE_AGENT57_LIFELONG_INCLUDE_DATASET} life_task=${EXPLORE_AGENT57_LIFELONG_INCLUDE_TASK} life_turn=${EXPLORE_AGENT57_LIFELONG_INCLUDE_TURN} life_obs=${EXPLORE_AGENT57_LIFELONG_OBS_MODE} life_decay=${EXPLORE_AGENT57_LIFELONG_COUNT_DECAY} life_capacity=${EXPLORE_AGENT57_LIFELONG_CAPACITY} trust=${EXPLORE_AGENT57_TRUST_GATE} cde_actor=${EXPLORE_CDE_ACTOR_ENABLED}/${EXPLORE_CDE_ACTOR} omega=${EXPLORE_CDE_ACTOR_OMEGA} alpha=${EXPLORE_CDE_ACTOR_ALPHA} kappa=${EXPLORE_CDE_ACTOR_KAPPA} gate=${EXPLORE_CDE_ACTOR_REWARD_GATE} decay_steps=${EXPLORE_CDE_ACTOR_DECAY_STEPS} post_norm_bonus=${EXPLORE_ADVANTAGE_BONUS_ENABLED}/${EXPLORE_ADVANTAGE_BONUS} mode=${EXPLORE_ADVANTAGE_BONUS_MODE} components=${EXPLORE_ADVANTAGE_BONUS_COMPONENTS} coef=${EXPLORE_ADVANTAGE_BONUS_COEF} lambda=${EXPLORE_ADVANTAGE_LAMBDA} intrinsic_key=${EXPLORE_ADVANTAGE_INTRINSIC_KEY} arm_weight=${EXPLORE_ADVANTAGE_ARM_WEIGHT_MODE} clip=${EXPLORE_ADVANTAGE_BONUS_CLIP}"
 if [[ "${ALGO}" == "dapo" ]]; then
   log "DAPO knobs: clip_low=${DAPO_EPS_CLIP_LOW} clip_high=${DAPO_EPS_CLIP_HIGH} token_loss=${DAPO_CALCULATE_PER_TOKEN_LOSS} dynamic_sampling=${DAPO_DYNAMIC_SAMPLING} failed_group_abort=${DAPO_FAILED_GROUP_ABORT_MIN_GROUPS}/${DAPO_FAILED_GROUP_ABORT_RATIO} overlong=${DAPO_OVERLONG_BUFFER_ENABLE}/${DAPO_OVERLONG_BUFFER_LEN}/${DAPO_OVERLONG_PENALTY_FACTOR}"
 fi
@@ -1161,9 +1321,13 @@ trap cleanup EXIT INT TERM
 ROUTER_LOG="${RUN_LOG_DIR}/router.log"
 require_cmd curl
 if [[ "${NEEDS_ENV_ROUTER}" == "1" ]]; then
+  if [[ "${AUTO_CLOSE_STALE_WORKER_RUNS}" == "1" ]]; then
+    log "Pre-cleaning stale worker runs before router readiness check..."
+    close_stale_runs_for_all_workers "pre_router_start" || true
+  fi
   log "Starting router on ${ROUTER_HOST}:${ROUTER_PORT} -> ${WORKER_URLS} (python=${ROUTER_PYTHON})"
   log "  forward_timeout=${ROUTER_FORWARD_TIMEOUT}s retries=${ROUTER_FORWARD_RETRIES} backoff=${ROUTER_FORWARD_RETRY_BACKOFF}s pressure_cooldown=${ROUTER_PRESSURE_COOLDOWN}s no_proxy=${NO_PROXY}"
-  log "  readiness require_router=${ROUTER_REQUIRE_READY} require_worker=${WORKER_PREFLIGHT_REQUIRE_READY} probe_timeout=${READY_PROBE_TIMEOUT}s worker_timeout=${ROUTER_READYZ_WORKER_TIMEOUT}s"
+  log "  readiness require_router=${ROUTER_REQUIRE_READY} wait_forever=${ROUTER_READY_WAIT_FOREVER} require_worker=${WORKER_PREFLIGHT_REQUIRE_READY} probe_timeout=${READY_PROBE_TIMEOUT}s worker_timeout=${ROUTER_READYZ_WORKER_TIMEOUT}s auto_close_stale=${AUTO_CLOSE_STALE_WORKER_RUNS}"
   (
     cd "${REPO_ROOT}"
     "${ROUTER_PYTHON}" -m terminal-rl.router_server \
@@ -1177,17 +1341,25 @@ if [[ "${NEEDS_ENV_ROUTER}" == "1" ]]; then
   # Wait for router readiness. /readyz validates at least one env worker; /healthz
   # is only used as fallback for older router implementations.
   ROUTER_READY=0
-  for ((i=1; i<=CHECK_WAIT_SECS; i++)); do
+  i=1
+  while true; do
     if probe_ready_endpoint "http://${CHECK_HOST}:${ROUTER_PORT}" "router http://${CHECK_HOST}:${ROUTER_PORT}" "${READY_PROBE_TIMEOUT}"; then
       log "router ready (attempt ${i})"
       ROUTER_READY=1
       break
     fi
+    if [[ "${AUTO_CLOSE_STALE_WORKER_RUNS}" == "1" && $((i % STALE_WORKER_CLOSE_INTERVAL)) -eq 0 ]]; then
+      close_stale_runs_for_all_workers "router_wait_attempt_${i}" || true
+    fi
     if [[ -n "${ROUTER_PID}" ]] && ! kill -0 "${ROUTER_PID}" 2>/dev/null; then
       log "ERROR: router process exited before becoming ready; see ${ROUTER_LOG}"
       break
     fi
+    if [[ "${ROUTER_READY_WAIT_FOREVER}" != "1" && "${i}" -ge "${CHECK_WAIT_SECS}" ]]; then
+      break
+    fi
     sleep 1
+    i=$((i + 1))
   done
   if [[ "${ROUTER_READY}" != "1" ]]; then
     log "ERROR: router not ready after ${CHECK_WAIT_SECS}s"
@@ -1249,6 +1421,8 @@ if [[ "${NEEDS_ENV_ROUTER}" == "1" ]]; then
   for _w in "${_WORKERS[@]}"; do
     if probe_ready_endpoint "${_w}" "${_w}" "${WORKER_PREFLIGHT_TIMEOUT}"; then
       READY_WORKERS=$((READY_WORKERS + 1))
+    elif [[ "${AUTO_CLOSE_STALE_WORKER_RUNS}" == "1" ]]; then
+      close_stale_worker_runs "${_w}" "${_w} (worker_preflight)" "${STALE_WORKER_CLOSE_TIMEOUT}" || true
     fi
   done
   log "Worker readiness: ${READY_WORKERS}/${#_WORKERS[@]} ready"
@@ -1303,6 +1477,7 @@ cat > "${RUN_DIR}/config/run_config.json" <<CFGEOF
   "rollout_generation_retry_max_backoff": "${ROLLOUT_GENERATION_RETRY_MAX_BACKOFF}",
   "rollout_generation_skip_on_failure": "${ROLLOUT_GENERATION_SKIP_ON_FAILURE}",
   "rollout_generation_retry_backoff_multiplier": "${ROLLOUT_GENERATION_RETRY_BACKOFF_MULTIPLIER}",
+  "rollout_generation_env_storm_max_retries": "${ROLLOUT_GENERATION_ENV_STORM_MAX_RETRIES}",
   "max_tokens_per_gpu": ${MAX_TOKENS_PER_GPU},
   "worker_urls": "${WORKER_URLS}",
   "env_server_url": "${ENV_SERVER_URL}",
@@ -1311,8 +1486,17 @@ cat > "${RUN_DIR}/config/run_config.json" <<CFGEOF
   "router_require_ready": "${ROUTER_REQUIRE_READY}",
   "router_readyz_worker_timeout": "${ROUTER_READYZ_WORKER_TIMEOUT}",
   "worker_preflight_require_ready": "${WORKER_PREFLIGHT_REQUIRE_READY}",
+  "router_ready_wait_forever": "${ROUTER_READY_WAIT_FOREVER}",
+  "auto_close_stale_worker_runs": "${AUTO_CLOSE_STALE_WORKER_RUNS}",
+  "stale_worker_close_interval": "${STALE_WORKER_CLOSE_INTERVAL}",
+  "stale_worker_close_timeout": "${STALE_WORKER_CLOSE_TIMEOUT}",
+  "stale_worker_repair_min_age": "${STALE_WORKER_REPAIR_MIN_AGE}",
+  "stale_worker_repair_max_repairs": "${STALE_WORKER_REPAIR_MAX_REPAIRS}",
   "env_http_max_retries": "${ENV_HTTP_MAX_RETRIES}",
   "env_allocate_max_retries": "${ENV_ALLOCATE_MAX_RETRIES}",
+  "http_retry_log_every_n": "${HTTP_RETRY_LOG_EVERY_N}",
+  "http_retry_log_response_chars": "${HTTP_RETRY_LOG_RESPONSE_CHARS}",
+  "terminal_rl_generate_failure_traceback": "${TERMINAL_RL_GENERATE_FAILURE_TRACEBACK}",
   "env_reset_http_timeout": "${ENV_RESET_HTTP_TIMEOUT}",
   "env_close_http_timeout": "${ENV_CLOSE_HTTP_TIMEOUT}",
   "env_remote_max_active_tasks": "${ENV_REMOTE_MAX_ACTIVE_TASKS}",
@@ -1355,8 +1539,10 @@ cat > "${RUN_DIR}/config/run_config.json" <<CFGEOF
   "explore_intrinsic_coef": "${EXPLORE_INTRINSIC_COEF}",
   "explore_intrinsic_schedule": "${EXPLORE_INTRINSIC_SCHEDULE}",
   "explore_intrinsic_decay_steps": "${EXPLORE_INTRINSIC_DECAY_STEPS}",
+  "explore_intrinsic_reducer": "${EXPLORE_INTRINSIC_REDUCER}",
   "explore_intrinsic_granularity": "${EXPLORE_INTRINSIC_GRANULARITY}",
   "explore_intrinsic_scope": "${EXPLORE_INTRINSIC_SCOPE}",
+  "explore_score_bonus_components": "${EXPLORE_SCORE_BONUS_COMPONENTS}",
   "explore_safety_filter": "${EXPLORE_SAFETY_FILTER}",
   "explore_safety_filter_enabled": "${EXPLORE_SAFETY_FILTER_ENABLED}",
   "explore_safety_filter_coef": "${EXPLORE_SAFETY_FILTER_COEF}",
@@ -1374,6 +1560,9 @@ cat > "${RUN_DIR}/config/run_config.json" <<CFGEOF
   "explore_agent57_combine_mode": "${EXPLORE_AGENT57_COMBINE_MODE}",
   "explore_agent57_ngu_mod_clip": "${EXPLORE_AGENT57_NGU_MOD_CLIP}",
   "explore_agent57_ngu_episodic_source": "${EXPLORE_AGENT57_NGU_EPISODIC_SOURCE}",
+  "explore_agent57_ngu_episodic_reducer": "${EXPLORE_AGENT57_NGU_EPISODIC_REDUCER}",
+  "explore_agent57_ngu_life_mod_mode": "${EXPLORE_AGENT57_NGU_LIFE_MOD_MODE}",
+  "explore_agent57_ngu_life_mod_std_clip": "${EXPLORE_AGENT57_NGU_LIFE_MOD_STD_CLIP}",
   "explore_agent57_max_bonus": "${EXPLORE_AGENT57_MAX_BONUS}",
   "explore_agent57_arm_temperatures": "${EXPLORE_AGENT57_ARM_TEMPERATURES}",
   "explore_agent57_arm_top_ps": "${EXPLORE_AGENT57_ARM_TOP_PS}",
@@ -1403,18 +1592,32 @@ cat > "${RUN_DIR}/config/run_config.json" <<CFGEOF
   "explore_agent57_lifelong_coef": "${EXPLORE_AGENT57_LIFELONG_COEF}",
   "explore_agent57_lifelong_clip": "${EXPLORE_AGENT57_LIFELONG_CLIP}",
   "explore_agent57_lifelong_warmup": "${EXPLORE_AGENT57_LIFELONG_WARMUP}",
+  "explore_agent57_lifelong_count_decay": "${EXPLORE_AGENT57_LIFELONG_COUNT_DECAY}",
+  "explore_agent57_lifelong_capacity": "${EXPLORE_AGENT57_LIFELONG_CAPACITY}",
   "explore_agent57_lifelong_backend": "${EXPLORE_AGENT57_LIFELONG_BACKEND}",
   "explore_agent57_lifelong_key_version": "${EXPLORE_AGENT57_LIFELONG_KEY_VERSION}",
   "explore_agent57_lifelong_include_dataset": "${EXPLORE_AGENT57_LIFELONG_INCLUDE_DATASET}",
   "explore_agent57_lifelong_include_task": "${EXPLORE_AGENT57_LIFELONG_INCLUDE_TASK}",
   "explore_agent57_lifelong_include_turn": "${EXPLORE_AGENT57_LIFELONG_INCLUDE_TURN}",
+  "explore_agent57_lifelong_obs_mode": "${EXPLORE_AGENT57_LIFELONG_OBS_MODE}",
+  "explore_agent57_trust_gate": "${EXPLORE_AGENT57_TRUST_GATE}",
+  "explore_agent57_trust_completed": "${EXPLORE_AGENT57_TRUST_COMPLETED}",
+  "explore_agent57_trust_truncated": "${EXPLORE_AGENT57_TRUST_TRUNCATED}",
+  "explore_agent57_trust_failed": "${EXPLORE_AGENT57_TRUST_FAILED}",
+  "explore_agent57_trust_parse_error": "${EXPLORE_AGENT57_TRUST_PARSE_ERROR}",
+  "explore_agent57_trust_warmup": "${EXPLORE_AGENT57_TRUST_WARMUP}",
   "explore_agent57_state_path": "${EXPLORE_AGENT57_STATE_PATH}",
   "explore_agent57_success_threshold": "${EXPLORE_AGENT57_SUCCESS_THRESHOLD}",
   "explore_advantage_bonus": "${EXPLORE_ADVANTAGE_BONUS}",
   "explore_advantage_bonus_enabled": "${EXPLORE_ADVANTAGE_BONUS_ENABLED}",
+  "explore_advantage_bonus_mode": "${EXPLORE_ADVANTAGE_BONUS_MODE}",
   "explore_advantage_bonus_components": "${EXPLORE_ADVANTAGE_BONUS_COMPONENTS}",
   "explore_advantage_bonus_coef": "${EXPLORE_ADVANTAGE_BONUS_COEF}",
   "explore_advantage_bonus_clip": "${EXPLORE_ADVANTAGE_BONUS_CLIP}",
+  "explore_advantage_intrinsic_key": "${EXPLORE_ADVANTAGE_INTRINSIC_KEY}",
+  "explore_advantage_lambda": "${EXPLORE_ADVANTAGE_LAMBDA}",
+  "explore_advantage_arm_weight_mode": "${EXPLORE_ADVANTAGE_ARM_WEIGHT_MODE}",
+  "explore_advantage_trust_key": "${EXPLORE_ADVANTAGE_TRUST_KEY}",
   "explore_cde_actor": "${EXPLORE_CDE_ACTOR}",
   "explore_cde_actor_enabled": "${EXPLORE_CDE_ACTOR_ENABLED}",
   "explore_cde_actor_omega": "${EXPLORE_CDE_ACTOR_OMEGA}",
@@ -1514,6 +1717,9 @@ RUNTIME_ENV_JSON="{
     \"ENV_ALLOCATE_RETRY_MAX_DELAY\": \"${ENV_ALLOCATE_RETRY_MAX_DELAY}\",
     \"ENV_ALLOCATE_RETRY_BACKOFF\": \"${ENV_ALLOCATE_RETRY_BACKOFF}\",
     \"ENV_ALLOCATE_RETRY_JITTER\": \"${ENV_ALLOCATE_RETRY_JITTER}\",
+    \"HTTP_RETRY_LOG_EVERY_N\": \"${HTTP_RETRY_LOG_EVERY_N}\",
+    \"HTTP_RETRY_LOG_RESPONSE_CHARS\": \"${HTTP_RETRY_LOG_RESPONSE_CHARS}\",
+    \"TERMINAL_RL_GENERATE_FAILURE_TRACEBACK\": \"${TERMINAL_RL_GENERATE_FAILURE_TRACEBACK}\",
     \"ENV_EVALUATE_MAX_RETRIES\": \"${ENV_EVALUATE_MAX_RETRIES}\",
     \"ENV_CLOSE_MAX_RETRIES\": \"${ENV_CLOSE_MAX_RETRIES}\",
     \"ENV_EXEC_TOOL_MAX_RETRIES\": \"${ENV_EXEC_TOOL_MAX_RETRIES}\",
@@ -1569,8 +1775,10 @@ RUNTIME_ENV_JSON="{
     \"EXPLORE_INTRINSIC_COEF\": \"${EXPLORE_INTRINSIC_COEF}\",
     \"EXPLORE_INTRINSIC_SCHEDULE\": \"${EXPLORE_INTRINSIC_SCHEDULE}\",
     \"EXPLORE_INTRINSIC_DECAY_STEPS\": \"${EXPLORE_INTRINSIC_DECAY_STEPS}\",
+    \"EXPLORE_INTRINSIC_REDUCER\": \"${EXPLORE_INTRINSIC_REDUCER}\",
     \"EXPLORE_INTRINSIC_GRANULARITY\": \"${EXPLORE_INTRINSIC_GRANULARITY}\",
     \"EXPLORE_INTRINSIC_SCOPE\": \"${EXPLORE_INTRINSIC_SCOPE}\",
+    \"EXPLORE_SCORE_BONUS_COMPONENTS\": \"${EXPLORE_SCORE_BONUS_COMPONENTS}\",
     \"EXPLORE_SAFETY_FILTER\": \"${EXPLORE_SAFETY_FILTER}\",
     \"EXPLORE_SAFETY_FILTER_ENABLED\": \"${EXPLORE_SAFETY_FILTER_ENABLED}\",
     \"EXPLORE_SAFETY_FILTER_COEF\": \"${EXPLORE_SAFETY_FILTER_COEF}\",
@@ -1588,6 +1796,9 @@ RUNTIME_ENV_JSON="{
     \"EXPLORE_AGENT57_COMBINE_MODE\": \"${EXPLORE_AGENT57_COMBINE_MODE}\",
     \"EXPLORE_AGENT57_NGU_MOD_CLIP\": \"${EXPLORE_AGENT57_NGU_MOD_CLIP}\",
     \"EXPLORE_AGENT57_NGU_EPISODIC_SOURCE\": \"${EXPLORE_AGENT57_NGU_EPISODIC_SOURCE}\",
+    \"EXPLORE_AGENT57_NGU_EPISODIC_REDUCER\": \"${EXPLORE_AGENT57_NGU_EPISODIC_REDUCER}\",
+    \"EXPLORE_AGENT57_NGU_LIFE_MOD_MODE\": \"${EXPLORE_AGENT57_NGU_LIFE_MOD_MODE}\",
+    \"EXPLORE_AGENT57_NGU_LIFE_MOD_STD_CLIP\": \"${EXPLORE_AGENT57_NGU_LIFE_MOD_STD_CLIP}\",
     \"EXPLORE_AGENT57_MAX_BONUS\": \"${EXPLORE_AGENT57_MAX_BONUS}\",
     \"EXPLORE_AGENT57_ARM_TEMPERATURES\": \"${EXPLORE_AGENT57_ARM_TEMPERATURES}\",
     \"EXPLORE_AGENT57_ARM_TOP_PS\": \"${EXPLORE_AGENT57_ARM_TOP_PS}\",
@@ -1617,18 +1828,32 @@ RUNTIME_ENV_JSON="{
     \"EXPLORE_AGENT57_LIFELONG_COEF\": \"${EXPLORE_AGENT57_LIFELONG_COEF}\",
     \"EXPLORE_AGENT57_LIFELONG_CLIP\": \"${EXPLORE_AGENT57_LIFELONG_CLIP}\",
     \"EXPLORE_AGENT57_LIFELONG_WARMUP\": \"${EXPLORE_AGENT57_LIFELONG_WARMUP}\",
+    \"EXPLORE_AGENT57_LIFELONG_COUNT_DECAY\": \"${EXPLORE_AGENT57_LIFELONG_COUNT_DECAY}\",
+    \"EXPLORE_AGENT57_LIFELONG_CAPACITY\": \"${EXPLORE_AGENT57_LIFELONG_CAPACITY}\",
     \"EXPLORE_AGENT57_LIFELONG_BACKEND\": \"${EXPLORE_AGENT57_LIFELONG_BACKEND}\",
     \"EXPLORE_AGENT57_LIFELONG_KEY_VERSION\": \"${EXPLORE_AGENT57_LIFELONG_KEY_VERSION}\",
     \"EXPLORE_AGENT57_LIFELONG_INCLUDE_DATASET\": \"${EXPLORE_AGENT57_LIFELONG_INCLUDE_DATASET}\",
     \"EXPLORE_AGENT57_LIFELONG_INCLUDE_TASK\": \"${EXPLORE_AGENT57_LIFELONG_INCLUDE_TASK}\",
     \"EXPLORE_AGENT57_LIFELONG_INCLUDE_TURN\": \"${EXPLORE_AGENT57_LIFELONG_INCLUDE_TURN}\",
+    \"EXPLORE_AGENT57_LIFELONG_OBS_MODE\": \"${EXPLORE_AGENT57_LIFELONG_OBS_MODE}\",
+    \"EXPLORE_AGENT57_TRUST_GATE\": \"${EXPLORE_AGENT57_TRUST_GATE}\",
+    \"EXPLORE_AGENT57_TRUST_COMPLETED\": \"${EXPLORE_AGENT57_TRUST_COMPLETED}\",
+    \"EXPLORE_AGENT57_TRUST_TRUNCATED\": \"${EXPLORE_AGENT57_TRUST_TRUNCATED}\",
+    \"EXPLORE_AGENT57_TRUST_FAILED\": \"${EXPLORE_AGENT57_TRUST_FAILED}\",
+    \"EXPLORE_AGENT57_TRUST_PARSE_ERROR\": \"${EXPLORE_AGENT57_TRUST_PARSE_ERROR}\",
+    \"EXPLORE_AGENT57_TRUST_WARMUP\": \"${EXPLORE_AGENT57_TRUST_WARMUP}\",
     \"EXPLORE_AGENT57_STATE_PATH\": \"${EXPLORE_AGENT57_STATE_PATH}\",
     \"EXPLORE_AGENT57_SUCCESS_THRESHOLD\": \"${EXPLORE_AGENT57_SUCCESS_THRESHOLD}\",
     \"EXPLORE_ADVANTAGE_BONUS\": \"${EXPLORE_ADVANTAGE_BONUS}\",
     \"EXPLORE_ADVANTAGE_BONUS_ENABLED\": \"${EXPLORE_ADVANTAGE_BONUS_ENABLED}\",
+    \"EXPLORE_ADVANTAGE_BONUS_MODE\": \"${EXPLORE_ADVANTAGE_BONUS_MODE}\",
     \"EXPLORE_ADVANTAGE_BONUS_COMPONENTS\": \"${EXPLORE_ADVANTAGE_BONUS_COMPONENTS}\",
     \"EXPLORE_ADVANTAGE_BONUS_COEF\": \"${EXPLORE_ADVANTAGE_BONUS_COEF}\",
     \"EXPLORE_ADVANTAGE_BONUS_CLIP\": \"${EXPLORE_ADVANTAGE_BONUS_CLIP}\",
+    \"EXPLORE_ADVANTAGE_INTRINSIC_KEY\": \"${EXPLORE_ADVANTAGE_INTRINSIC_KEY}\",
+    \"EXPLORE_ADVANTAGE_LAMBDA\": \"${EXPLORE_ADVANTAGE_LAMBDA}\",
+    \"EXPLORE_ADVANTAGE_ARM_WEIGHT_MODE\": \"${EXPLORE_ADVANTAGE_ARM_WEIGHT_MODE}\",
+    \"EXPLORE_ADVANTAGE_TRUST_KEY\": \"${EXPLORE_ADVANTAGE_TRUST_KEY}\",
     \"EXPLORE_CDE_ACTOR\": \"${EXPLORE_CDE_ACTOR}\",
     \"EXPLORE_CDE_ACTOR_ENABLED\": \"${EXPLORE_CDE_ACTOR_ENABLED}\",
     \"EXPLORE_CDE_ACTOR_OMEGA\": \"${EXPLORE_CDE_ACTOR_OMEGA}\",

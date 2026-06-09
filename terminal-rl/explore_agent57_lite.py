@@ -102,6 +102,9 @@ class Agent57LiteConfig:
     combine_mode: str
     ngu_mod_clip: float
     ngu_episodic_source: str
+    ngu_episodic_reducer: str
+    ngu_life_mod_mode: str
+    ngu_life_mod_std_clip: float
     episodic_backend: str
     max_bonus: float
     controller: str
@@ -117,11 +120,20 @@ class Agent57LiteConfig:
     lifelong_coef: float
     lifelong_clip: float
     lifelong_warmup: int
+    lifelong_count_decay: float
+    lifelong_capacity: int
     lifelong_backend: str
     lifelong_key_version: str
     lifelong_include_dataset: bool
     lifelong_include_task: bool
     lifelong_include_turn: bool
+    lifelong_obs_mode: str
+    trust_gate_mode: str
+    trust_completed: float
+    trust_truncated: float
+    trust_failed: float
+    trust_parse_error: float
+    trust_warmup: float
     state_path: str
     success_threshold: float
 
@@ -170,6 +182,18 @@ def config_from_env() -> Agent57LiteConfig:
     )
     if ngu_episodic_source not in {"signature_intrinsic", "intrinsic"}:
         ngu_episodic_source = "signature_intrinsic"
+    ngu_episodic_reducer = (
+        os.getenv("EXPLORE_AGENT57_NGU_EPISODIC_REDUCER")
+        or os.getenv("EXPLORE_INTRINSIC_REDUCER")
+        or "sum"
+    ).strip().lower()
+    if ngu_episodic_reducer not in {"sum", "mean"}:
+        ngu_episodic_reducer = "sum"
+    ngu_life_mod_mode = os.getenv("EXPLORE_AGENT57_NGU_LIFE_MOD_MODE", "linear").strip().lower()
+    if ngu_life_mod_mode in {"standardized", "std", "softplus"}:
+        ngu_life_mod_mode = "standardized_softplus"
+    if ngu_life_mod_mode not in {"linear", "standardized_softplus"}:
+        ngu_life_mod_mode = "linear"
     ucb_value = os.getenv("EXPLORE_AGENT57_UCB_VALUE", "legacy").strip().lower()
     if ucb_value not in {"legacy", "success", "base", "normalized_base"}:
         ucb_value = "legacy"
@@ -178,6 +202,12 @@ def config_from_env() -> Agent57LiteConfig:
     )
     if key_version not in {"v1", "v2"}:
         key_version = "v1"
+    obs_mode = os.getenv("EXPLORE_AGENT57_LIFELONG_OBS_MODE", "fingerprint").strip().lower()
+    if obs_mode not in {"fingerprint", "label", "none"}:
+        obs_mode = "fingerprint"
+    trust_gate_mode = os.getenv("EXPLORE_AGENT57_TRUST_GATE", "hard").strip().lower()
+    if trust_gate_mode not in {"hard", "soft"}:
+        trust_gate_mode = "hard"
     return Agent57LiteConfig(
         enabled=enabled,
         k=k,
@@ -185,6 +215,9 @@ def config_from_env() -> Agent57LiteConfig:
         combine_mode=combine_mode,
         ngu_mod_clip=max(1.0, _env_float("EXPLORE_AGENT57_NGU_MOD_CLIP", 5.0)),
         ngu_episodic_source=ngu_episodic_source,
+        ngu_episodic_reducer=ngu_episodic_reducer,
+        ngu_life_mod_mode=ngu_life_mod_mode,
+        ngu_life_mod_std_clip=max(0.0, _env_float("EXPLORE_AGENT57_NGU_LIFE_MOD_STD_CLIP", 5.0)),
         episodic_backend=resolve_episodic_backend_name(
             os.getenv("EXPLORE_AGENT57_EPISODIC_BACKEND")
             or os.getenv("EPISODIC_MEMORY_BACKEND")
@@ -211,6 +244,11 @@ def config_from_env() -> Agent57LiteConfig:
         lifelong_coef=max(0.0, _env_float("EXPLORE_AGENT57_LIFELONG_COEF", 0.01)),
         lifelong_clip=max(0.0, _env_float("EXPLORE_AGENT57_LIFELONG_CLIP", 2.0)),
         lifelong_warmup=max(0, _env_int("EXPLORE_AGENT57_LIFELONG_WARMUP", 64)),
+        lifelong_count_decay=min(
+            1.0,
+            max(0.0, _env_float("EXPLORE_AGENT57_LIFELONG_COUNT_DECAY", 1.0)),
+        ),
+        lifelong_capacity=max(0, _env_int("EXPLORE_AGENT57_LIFELONG_CAPACITY", 0)),
         lifelong_backend=backend,
         lifelong_key_version=key_version,
         lifelong_include_dataset=_env_bool(
@@ -222,15 +260,26 @@ def config_from_env() -> Agent57LiteConfig:
         lifelong_include_turn=_env_bool(
             "EXPLORE_AGENT57_LIFELONG_INCLUDE_TURN", False
         ),
+        lifelong_obs_mode=obs_mode,
+        trust_gate_mode=trust_gate_mode,
+        trust_completed=max(0.0, _env_float("EXPLORE_AGENT57_TRUST_COMPLETED", 1.0)),
+        trust_truncated=max(0.0, _env_float("EXPLORE_AGENT57_TRUST_TRUNCATED", 0.3)),
+        trust_failed=max(0.0, _env_float("EXPLORE_AGENT57_TRUST_FAILED", 0.1)),
+        trust_parse_error=max(0.0, _env_float("EXPLORE_AGENT57_TRUST_PARSE_ERROR", 0.1)),
+        trust_warmup=max(0.0, _env_float("EXPLORE_AGENT57_TRUST_WARMUP", 0.3)),
         state_path=_default_state_path(),
         success_threshold=_env_float("EXPLORE_AGENT57_SUCCESS_THRESHOLD", 0.0),
     )
 
 
 _LOCAL_LOCK = threading.Lock()
-_LOCAL_COUNTS: dict[str, int] = {}
+_LOCAL_COUNTS: dict[str, float] = {}
+_LOCAL_COUNT_LAST_SEEN: dict[str, int] = {}
 _LOCAL_TRAJ_SEEN = 0
 _LOCAL_ARM_EVENTS: list[dict[str, Any]] = []
+_LOCAL_LIFE_RAW_N = 0
+_LOCAL_LIFE_RAW_MEAN = 0.0
+_LOCAL_LIFE_RAW_M2 = 0.0
 _SQLITE_SCHEMA_LOCK = threading.Lock()
 _SQLITE_SCHEMA_INITIALIZED: set[str] = set()
 _UCB_RNG_LOCK = threading.Lock()
@@ -274,6 +323,12 @@ def _connect(path: str) -> sqlite3.Connection:
                     "CREATE TABLE IF NOT EXISTS lifelong_counts "
                     "(key TEXT PRIMARY KEY, count INTEGER NOT NULL)"
                 )
+                _ensure_column(
+                    conn,
+                    "lifelong_counts",
+                    "last_seen",
+                    "last_seen INTEGER NOT NULL DEFAULT 0",
+                )
                 conn.execute(
                     "CREATE TABLE IF NOT EXISTS meta "
                     "(name TEXT PRIMARY KEY, value INTEGER NOT NULL)"
@@ -302,7 +357,7 @@ def _connect(path: str) -> sqlite3.Connection:
     return conn
 
 
-def _sqlite_next_counts(config: Agent57LiteConfig, keys: Iterable[str]) -> tuple[int, list[int]]:
+def _sqlite_next_counts(config: Agent57LiteConfig, keys: Iterable[str]) -> tuple[int, list[float]]:
     unique_keys = list(dict.fromkeys(keys))
     if not unique_keys:
         return 0, []
@@ -317,20 +372,34 @@ def _sqlite_next_counts(config: Agent57LiteConfig, keys: Iterable[str]) -> tuple
             "INSERT INTO meta(name, value) VALUES('lifelong_traj_seen', 1) "
             "ON CONFLICT(name) DO UPDATE SET value=value+1"
         )
-        counts_before: list[int] = []
+        next_seen = seen + 1
+        counts_before: list[float] = []
         for key in unique_keys:
             row = conn.execute(
                 "SELECT count FROM lifelong_counts WHERE key=?", (key,)
             ).fetchone()
-            before = int(row[0]) if row else 0
+            before = float(row[0]) if row else 0.0
             counts_before.append(before)
+            after = before * config.lifelong_count_decay + 1.0
             if row:
                 conn.execute(
-                    "UPDATE lifelong_counts SET count=count+1 WHERE key=?", (key,)
+                    "UPDATE lifelong_counts SET count=?, last_seen=? WHERE key=?",
+                    (after, next_seen, key),
                 )
             else:
                 conn.execute(
-                    "INSERT INTO lifelong_counts(key, count) VALUES(?, 1)", (key,)
+                    "INSERT INTO lifelong_counts(key, count, last_seen) VALUES(?, ?, ?)",
+                    (key, after, next_seen),
+                )
+        if config.lifelong_capacity > 0:
+            row = conn.execute("SELECT COUNT(*) FROM lifelong_counts").fetchone()
+            overflow = int(row[0]) - config.lifelong_capacity if row else 0
+            if overflow > 0:
+                conn.execute(
+                    "DELETE FROM lifelong_counts WHERE key IN ("
+                    "SELECT key FROM lifelong_counts ORDER BY last_seen ASC LIMIT ?"
+                    ")",
+                    (overflow,),
                 )
         conn.execute("COMMIT")
         return seen, counts_before
@@ -344,18 +413,124 @@ def _sqlite_next_counts(config: Agent57LiteConfig, keys: Iterable[str]) -> tuple
         conn.close()
 
 
-def _local_next_counts(keys: Iterable[str]) -> tuple[int, list[int]]:
+def _local_next_counts(config: Agent57LiteConfig, keys: Iterable[str]) -> tuple[int, list[float]]:
     global _LOCAL_TRAJ_SEEN
     unique_keys = list(dict.fromkeys(keys))
     with _LOCAL_LOCK:
         seen = _LOCAL_TRAJ_SEEN
         _LOCAL_TRAJ_SEEN += 1
-        counts_before: list[int] = []
+        next_seen = _LOCAL_TRAJ_SEEN
+        counts_before: list[float] = []
         for key in unique_keys:
-            before = int(_LOCAL_COUNTS.get(key, 0))
+            before = float(_LOCAL_COUNTS.get(key, 0.0))
             counts_before.append(before)
-            _LOCAL_COUNTS[key] = before + 1
+            _LOCAL_COUNTS[key] = before * config.lifelong_count_decay + 1.0
+            _LOCAL_COUNT_LAST_SEEN[key] = next_seen
+        if config.lifelong_capacity > 0 and len(_LOCAL_COUNTS) > config.lifelong_capacity:
+            overflow = len(_LOCAL_COUNTS) - config.lifelong_capacity
+            oldest = sorted(_LOCAL_COUNT_LAST_SEEN.items(), key=lambda item: item[1])[:overflow]
+            for key, _ in oldest:
+                _LOCAL_COUNTS.pop(key, None)
+                _LOCAL_COUNT_LAST_SEEN.pop(key, None)
     return seen, counts_before
+
+
+def _sqlite_lifelong_raw_stats(config: Agent57LiteConfig, raw: float) -> tuple[int, float, float]:
+    conn = _connect(config.state_path)
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        rows = {
+            str(name): float(value)
+            for name, value in conn.execute(
+                "SELECT name, value FROM meta WHERE name IN "
+                "('lifelong_raw_n', 'lifelong_raw_mean', 'lifelong_raw_m2')"
+            )
+        }
+        n_before = int(rows.get("lifelong_raw_n", 0.0))
+        mean_before = float(rows.get("lifelong_raw_mean", 0.0))
+        m2_before = float(rows.get("lifelong_raw_m2", 0.0))
+        std_before = math.sqrt(max(0.0, m2_before / max(1, n_before - 1))) if n_before > 1 else 0.0
+
+        n_after = n_before + 1
+        delta = raw - mean_before
+        mean_after = mean_before + delta / n_after
+        delta2 = raw - mean_after
+        m2_after = m2_before + delta * delta2
+        for name, value in (
+            ("lifelong_raw_n", float(n_after)),
+            ("lifelong_raw_mean", float(mean_after)),
+            ("lifelong_raw_m2", float(m2_after)),
+        ):
+            conn.execute(
+                "INSERT INTO meta(name, value) VALUES(?, ?) "
+                "ON CONFLICT(name) DO UPDATE SET value=excluded.value",
+                (name, value),
+            )
+        conn.execute("COMMIT")
+        return n_before, mean_before, std_before
+    except Exception:
+        try:
+            conn.execute("ROLLBACK")
+        except Exception:
+            pass
+        raise
+    finally:
+        conn.close()
+
+
+def _local_lifelong_raw_stats(raw: float) -> tuple[int, float, float]:
+    global _LOCAL_LIFE_RAW_N, _LOCAL_LIFE_RAW_MEAN, _LOCAL_LIFE_RAW_M2
+    with _LOCAL_LOCK:
+        n_before = _LOCAL_LIFE_RAW_N
+        mean_before = _LOCAL_LIFE_RAW_MEAN
+        std_before = (
+            math.sqrt(max(0.0, _LOCAL_LIFE_RAW_M2 / max(1, n_before - 1)))
+            if n_before > 1
+            else 0.0
+        )
+        n_after = n_before + 1
+        delta = raw - _LOCAL_LIFE_RAW_MEAN
+        _LOCAL_LIFE_RAW_MEAN += delta / n_after
+        delta2 = raw - _LOCAL_LIFE_RAW_MEAN
+        _LOCAL_LIFE_RAW_M2 += delta * delta2
+        _LOCAL_LIFE_RAW_N = n_after
+    return n_before, mean_before, std_before
+
+
+def _lifelong_raw_stats(config: Agent57LiteConfig, raw: float) -> tuple[int, float, float]:
+    if config.lifelong_backend == "sqlite":
+        return _sqlite_lifelong_raw_stats(config, raw)
+    return _local_lifelong_raw_stats(raw)
+
+
+def _softplus(value: float) -> float:
+    if value > 40.0:
+        return value
+    if value < -40.0:
+        return math.exp(value)
+    return math.log1p(math.exp(value))
+
+
+def _life_mod_from_raw(
+    config: Agent57LiteConfig,
+    raw: float,
+    *,
+    n_before: int,
+    mean_before: float,
+    std_before: float,
+) -> tuple[float, float]:
+    if config.ngu_life_mod_mode == "standardized_softplus":
+        if n_before > 1 and std_before > 1e-8:
+            z = (raw - mean_before) / std_before
+        else:
+            z = 0.0
+        if config.ngu_life_mod_std_clip > 0:
+            z = min(max(z, -config.ngu_life_mod_std_clip), config.ngu_life_mod_std_clip)
+        life_mod = 1.0 + _softplus(z)
+    else:
+        z = 0.0
+        life_mod = 1.0 + raw
+    return min(max(life_mod, 1.0), config.ngu_mod_clip), z
 
 
 def _stable_hash(text: str, n: int = 12) -> str:
@@ -467,19 +642,56 @@ def coarse_observation_fingerprint(value: Any) -> str:
     return f"generic:{_bucket_len(text)}:{_stable_hash(normalized, 8)}"
 
 
-def _turn_result_fingerprints(turn_records: list[dict[str, Any]]) -> list[tuple[str, str]]:
+def coarse_observation_label(value: Any) -> str:
+    """Return a low-cardinality observation label for count-based lifelong keys."""
+    text = _result_text(value)
+    low = text.lower()
+    if not low.strip():
+        return "empty"
+    patterns = (
+        ("permission_denied", ("permission denied", "operation not permitted")),
+        ("not_found", ("no such file", "not found", "cannot stat")),
+        ("cmd_not_found", ("command not found",)),
+        ("timeout", ("timed out", "timeout")),
+        ("traceback", ("traceback", "exception:", "error:")),
+        ("assertion", ("assertionerror", "assertion failed")),
+        ("test_fail", ("failed", "failure", "tests failed")),
+        ("test_pass", ("all tests passed", "passed", "success")),
+        ("install", ("apt-get", "pip install", "npm install")),
+        ("build", ("building", "compiling", "make:", "cmake")),
+    )
+    for label, needles in patterns:
+        if any(needle in low for needle in needles):
+            return f"{label}:{_bucket_len(text)}"
+    return f"generic:{_bucket_len(text)}"
+
+
+def _observation_bucket(value: Any, mode: str = "fingerprint") -> str:
+    mode = (mode or "fingerprint").strip().lower()
+    if mode == "none":
+        return "obs_ignored"
+    if mode == "label":
+        return coarse_observation_label(value)
+    return coarse_observation_fingerprint(value)
+
+
+def _turn_result_fingerprints(
+    turn_records: list[dict[str, Any]],
+    *,
+    obs_mode: str = "fingerprint",
+) -> list[tuple[str, str]]:
     results: list[tuple[str, str]] = []
     for tr in turn_records or []:
         if tr.get("command"):
             result = tr.get("result") or tr.get("observation") or tr.get("output")
-            results.append((coarse_observation_fingerprint(result), exit_code_bucket(result)))
+            results.append((_observation_bucket(result, obs_mode), exit_code_bucket(result)))
         for call in tr.get("tool_calls") or []:
             if not isinstance(call, dict):
                 continue
             result = call.get("result")
             if result is None:
                 result = call.get("observation") or call.get("output")
-            results.append((coarse_observation_fingerprint(result), exit_code_bucket(result)))
+            results.append((_observation_bucket(result, obs_mode), exit_code_bucket(result)))
     return results
 
 
@@ -605,7 +817,10 @@ class V2LifelongKeyBuilder(LifelongKeyBuilder):
         turn_records: list[dict[str, Any]],
         metadata: dict[str, Any] | None = None,
     ) -> list[str]:
-        result_fps = _turn_result_fingerprints(turn_records)
+        result_fps = _turn_result_fingerprints(
+            turn_records,
+            obs_mode=self.config.lifelong_obs_mode,
+        )
         dataset = _normalize_dataset(
             _metadata_value(metadata, "agent57_dataset")
             or _metadata_value(metadata, "data_source")
@@ -670,6 +885,44 @@ def _status_value(status: Any) -> str:
     return str(value).lower()
 
 
+def _lifelong_trust_gate(
+    config: Agent57LiteConfig,
+    *,
+    status: Any,
+    parse_error_count: int,
+    seen_before: int,
+) -> tuple[float, str]:
+    status_text = _status_value(status)
+    bad_status = any(part in status_text for part in ("failed", "aborted", "truncated"))
+    if config.trust_gate_mode != "soft":
+        if bad_status:
+            return 0.0, f"status:{status_text}"
+        if parse_error_count > 0:
+            return 0.0, "parse_error"
+        if seen_before < config.lifelong_warmup:
+            return 0.0, "warmup"
+        return 1.0, ""
+
+    trust = float(config.trust_completed)
+    reasons: list[str] = []
+    if "aborted" in status_text:
+        trust = 0.0
+        reasons.append(f"status:{status_text}")
+    elif "truncated" in status_text:
+        trust = min(trust, config.trust_truncated)
+        reasons.append(f"status:{status_text}")
+    elif "failed" in status_text:
+        trust = min(trust, config.trust_failed)
+        reasons.append(f"status:{status_text}")
+    if parse_error_count > 0:
+        trust = min(trust, config.trust_parse_error)
+        reasons.append("parse_error")
+    if seen_before < config.lifelong_warmup:
+        trust = min(trust, config.trust_warmup)
+        reasons.append("warmup")
+    return max(0.0, trust), ",".join(dict.fromkeys(reasons))
+
+
 def compute_lifelong_bonus(
     *,
     config: Agent57LiteConfig,
@@ -689,6 +942,9 @@ def compute_lifelong_bonus(
         "explore_agent57_combine_mode": config.combine_mode,
         "explore_agent57_max_bonus": float(config.max_bonus),
         "explore_agent57_episodic_backend": config.episodic_backend,
+        "explore_agent57_ngu_episodic_reducer": config.ngu_episodic_reducer,
+        "explore_agent57_ngu_life_mod_mode": config.ngu_life_mod_mode,
+        "explore_agent57_ngu_life_mod_std_clip": float(config.ngu_life_mod_std_clip),
         "explore_agent57_controller": config.controller,
         "explore_agent57_ucb_c": float(config.ucb_c),
         "explore_agent57_ucb_window": int(config.ucb_window),
@@ -705,11 +961,22 @@ def compute_lifelong_bonus(
         "explore_agent57_lifelong_coef": float(config.lifelong_coef),
         "explore_agent57_lifelong_clip": float(config.lifelong_clip),
         "explore_agent57_lifelong_warmup": int(config.lifelong_warmup),
+        "explore_agent57_lifelong_count_decay": float(config.lifelong_count_decay),
+        "explore_agent57_lifelong_capacity": int(config.lifelong_capacity),
         "explore_agent57_lifelong_key_version": config.lifelong_key_version,
         "explore_agent57_lifelong_include_dataset": bool(config.lifelong_include_dataset),
         "explore_agent57_lifelong_include_task": bool(config.lifelong_include_task),
         "explore_agent57_lifelong_include_turn": bool(config.lifelong_include_turn),
+        "explore_agent57_lifelong_obs_mode": config.lifelong_obs_mode,
+        "explore_agent57_trust_gate_mode": config.trust_gate_mode,
+        "explore_agent57_trust": 0.0,
         "explore_agent57_lifelong_raw": 0.0,
+        "explore_agent57_lifelong_z": 0.0,
+        "explore_agent57_lifelong_stat_n": 0,
+        "explore_agent57_lifelong_stat_mean": 0.0,
+        "explore_agent57_lifelong_stat_std": 0.0,
+        "explore_agent57_lifelong_stat_error": "",
+        "explore_agent57_ngu_life_mod": 1.0,
         "explore_agent57_lifelong_bonus": 0.0,
         "explore_agent57_lifelong_bonus_unclipped": 0.0,
         "explore_agent57_lifelong_unique_keys": 0,
@@ -732,7 +999,7 @@ def compute_lifelong_bonus(
         if config.lifelong_backend == "sqlite":
             seen_before, counts_before = _sqlite_next_counts(config, keys)
         else:
-            seen_before, counts_before = _local_next_counts(keys)
+            seen_before, counts_before = _local_next_counts(config, keys)
     except Exception as exc:
         metrics["explore_agent57_lifelong_suppressed_reason"] = (
             f"state_error:{type(exc).__name__}"
@@ -748,21 +1015,38 @@ def compute_lifelong_bonus(
         raw = 0.0
     raw = min(config.lifelong_clip, max(0.0, raw)) if config.lifelong_clip > 0 else raw
     metrics["explore_agent57_lifelong_raw"] = float(raw)
+    try:
+        stat_n, stat_mean, stat_std = _lifelong_raw_stats(config, raw)
+    except Exception as exc:
+        stat_n, stat_mean, stat_std = 0, 0.0, 0.0
+        metrics["explore_agent57_lifelong_stat_error"] = f"{type(exc).__name__}"
+    life_mod, life_z = _life_mod_from_raw(
+        config,
+        raw,
+        n_before=stat_n,
+        mean_before=stat_mean,
+        std_before=stat_std,
+    )
+    metrics["explore_agent57_lifelong_z"] = float(life_z)
+    metrics["explore_agent57_lifelong_stat_n"] = int(stat_n)
+    metrics["explore_agent57_lifelong_stat_mean"] = float(stat_mean)
+    metrics["explore_agent57_lifelong_stat_std"] = float(stat_std)
+    metrics["explore_agent57_ngu_life_mod"] = float(life_mod)
 
-    status_text = _status_value(status)
-    bad_status = any(part in status_text for part in ("failed", "aborted", "truncated"))
-    if bad_status:
-        metrics["explore_agent57_lifelong_suppressed_reason"] = f"status:{status_text}"
-        return metrics
-    if parse_error_count > 0:
-        metrics["explore_agent57_lifelong_suppressed_reason"] = "parse_error"
-        return metrics
-    if seen_before < config.lifelong_warmup:
-        metrics["explore_agent57_lifelong_suppressed_reason"] = "warmup"
+    trust, reason = _lifelong_trust_gate(
+        config,
+        status=status,
+        parse_error_count=parse_error_count,
+        seen_before=seen_before,
+    )
+    metrics["explore_agent57_trust"] = float(trust)
+    if reason:
+        metrics["explore_agent57_lifelong_suppressed_reason"] = reason
+    if trust <= 0.0:
         return metrics
 
     metrics["explore_agent57_lifelong_eligible"] = 1.0
-    unclipped = float(beta * config.lifelong_coef * raw)
+    unclipped = float(beta * config.lifelong_coef * raw * trust)
     bonus, clipped = _clamp_bonus(unclipped, config.max_bonus)
     metrics["explore_agent57_lifelong_bonus_unclipped"] = unclipped
     metrics["explore_agent57_lifelong_bonus"] = float(bonus)
@@ -778,6 +1062,8 @@ def compute_ngu_lite_bonus(
     episodic_novelty: float,
     lifelong_raw: float,
     lifelong_eligible: bool,
+    trust_gate: float = 1.0,
+    life_mod_override: float | None = None,
 ) -> dict[str, Any]:
     """Compute the optional NGU-lite product bonus.
 
@@ -788,12 +1074,31 @@ def compute_ngu_lite_bonus(
     beta = config.beta_for_arm(arm_id)
     episodic = max(0.0, _finite_float(episodic_novelty))
     raw_life = max(0.0, _finite_float(lifelong_raw))
-    life_mod = min(max(1.0 + raw_life, 1.0), config.ngu_mod_clip)
+    if life_mod_override is not None:
+        life_mod = min(
+            max(_finite_float(life_mod_override, 1.0), 1.0),
+            config.ngu_mod_clip,
+        )
+    else:
+        life_mod, _ = _life_mod_from_raw(
+            config,
+            raw_life,
+            n_before=0,
+            mean_before=0.0,
+            std_before=0.0,
+        )
+    trust = max(0.0, _finite_float(trust_gate, 1.0))
+    intrinsic_signal = episodic * life_mod
     metrics: dict[str, Any] = {
         "explore_agent57_ngu_mod_clip": float(config.ngu_mod_clip),
         "explore_agent57_ngu_episodic_source": config.ngu_episodic_source,
+        "explore_agent57_ngu_episodic_reducer": config.ngu_episodic_reducer,
+        "explore_agent57_ngu_life_mod_mode": config.ngu_life_mod_mode,
+        "explore_agent57_ngu_life_mod_std_clip": float(config.ngu_life_mod_std_clip),
         "explore_agent57_ngu_episodic": float(episodic),
         "explore_agent57_ngu_life_mod": float(life_mod),
+        "explore_agent57_intrinsic_signal": float(intrinsic_signal),
+        "explore_agent57_trust": float(trust),
         "explore_agent57_ngu_bonus": 0.0,
         "explore_agent57_ngu_bonus_unclipped": 0.0,
     }
@@ -802,10 +1107,11 @@ def compute_ngu_lite_bonus(
         or config.combine_mode != "ngu_lite"
         or not config.lifelong_enabled
         or not lifelong_eligible
+        or trust <= 0.0
     ):
         return metrics
 
-    unclipped = float(beta * config.lifelong_coef * episodic * life_mod)
+    unclipped = float(beta * config.lifelong_coef * intrinsic_signal * trust)
     bonus, clipped = _clamp_bonus(unclipped, config.max_bonus)
     metrics["explore_agent57_ngu_bonus_unclipped"] = unclipped
     metrics["explore_agent57_ngu_bonus"] = float(bonus)

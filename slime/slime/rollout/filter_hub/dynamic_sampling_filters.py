@@ -37,6 +37,23 @@ def _reward_component(sample: Sample, key: str) -> float:
 def _post_norm_bonus_for_filter(sample: Sample) -> float:
     if not _env_flag("EXPLORE_ADVANTAGE_BONUS_ENABLED", os.getenv("EXPLORE_ADVANTAGE_BONUS", "0")):
         return 0.0
+    mode = os.getenv("EXPLORE_ADVANTAGE_BONUS_MODE", "component").strip().lower()
+    if mode in {"dual", "dual_stream", "intrinsic_advantage"}:
+        intrinsic_key = os.getenv(
+            "EXPLORE_ADVANTAGE_INTRINSIC_KEY",
+            "explore_agent57_intrinsic_signal",
+        ).strip()
+        lambda_coef = _env_float(
+            "EXPLORE_ADVANTAGE_LAMBDA",
+            _env_float("EXPLORE_ADVANTAGE_BONUS_COEF", 0.1),
+        )
+        reward = getattr(sample, "reward", None)
+        trust_key = os.getenv("EXPLORE_ADVANTAGE_TRUST_KEY", "explore_agent57_trust").strip()
+        trust_missing = not isinstance(reward, dict) or trust_key not in reward
+        trust = _reward_component(sample, trust_key)
+        if trust_missing and trust_key == "explore_agent57_trust":
+            trust = 1.0
+        return lambda_coef * trust * _reward_component(sample, intrinsic_key)
     components = [
         part.strip()
         for part in os.getenv("EXPLORE_ADVANTAGE_BONUS_COMPONENTS", "explore_intrinsic_scaled").split(",")

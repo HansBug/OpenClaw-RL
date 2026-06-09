@@ -789,6 +789,42 @@ class WorkerPool:
 
         return expired_slots
 
+    @staticmethod
+    def _stale_reason_for_run_slot(run_slot: RunSlot, now: float) -> tuple[str, float]:
+        allocated_ttl = _env_float("WORKER_ALLOCATED_TTL", 120.0)
+        resetting_ttl = _env_float("WORKER_RESETTING_TTL", 900.0)
+        closing_ttl = _env_float("WORKER_CLOSING_REQUESTED_TTL", 300.0)
+        created_age_sec = now - run_slot.created_ts
+        reset_age_sec = (
+            now - run_slot.reset_started_ts
+            if run_slot.reset_started_ts is not None
+            else 0.0
+        )
+        close_age_sec = (
+            now - run_slot.close_requested_ts
+            if run_slot.close_requested_ts is not None
+            else 0.0
+        )
+        if (
+            run_slot.phase == "allocated"
+            and allocated_ttl > 0
+            and created_age_sec >= allocated_ttl
+        ):
+            return "allocated_ttl_exceeded", created_age_sec
+        if (
+            run_slot.phase == "resetting"
+            and resetting_ttl > 0
+            and reset_age_sec >= resetting_ttl
+        ):
+            return "resetting_ttl_exceeded", reset_age_sec
+        if (
+            run_slot.close_requested
+            and closing_ttl > 0
+            and close_age_sec >= closing_ttl
+        ):
+            return "closing_requested_ttl_exceeded", close_age_sec
+        return "", 0.0
+
     def _get_run_slot(self, run_lease_id: str) -> RunSlot:
         task_key = self._run_to_task.get(run_lease_id)
         if task_key is None:
@@ -1042,29 +1078,9 @@ class WorkerPool:
                         if rslot.close_requested_ts is not None
                         else 0.0
                     )
-                    stale_reason = ""
-                    stale_age_sec = 0.0
-                    if (
-                        rslot.phase == "allocated"
-                        and allocated_ttl > 0
-                        and created_age_sec >= allocated_ttl
-                    ):
-                        stale_reason = "allocated_ttl_exceeded"
-                        stale_age_sec = created_age_sec
-                    elif (
-                        rslot.phase == "resetting"
-                        and resetting_ttl > 0
-                        and reset_age_sec >= resetting_ttl
-                    ):
-                        stale_reason = "resetting_ttl_exceeded"
-                        stale_age_sec = reset_age_sec
-                    elif (
-                        rslot.close_requested
-                        and closing_ttl > 0
-                        and close_age_sec >= closing_ttl
-                    ):
-                        stale_reason = "closing_requested_ttl_exceeded"
-                        stale_age_sec = close_age_sec
+                    stale_reason, stale_age_sec = self._stale_reason_for_run_slot(
+                        rslot, now
+                    )
                     if stale_reason:
                         stale_runs.append(
                             {
@@ -1193,6 +1209,65 @@ class WorkerPool:
             "skipped_young": skipped_young,
             "pruned_after_cancel": pruned_after_cancel,
             "pending_after": pending_after,
+        }
+
+    async def repair_stale_runs(
+        self,
+        *,
+        reason: str,
+        min_age: float = 0.0,
+        max_repairs: int = 20,
+    ) -> dict[str, Any]:
+        now = time.time()
+        slots_to_force_cleanup: list[tuple[str, str, RunSlot]] = []
+        repaired_runs: list[dict[str, Any]] = []
+        async with self._lock:
+            self._prune_done_closing_tasks()
+            for task_key, task_slot in list(self._tasks.items()):
+                for run_lease_id, run_slot in list(task_slot.runs.items()):
+                    stale_reason, stale_age_sec = self._stale_reason_for_run_slot(
+                        run_slot, now
+                    )
+                    if not stale_reason or stale_age_sec < min_age:
+                        continue
+                    popped = self._pop_run_slot_locked(run_lease_id)
+                    if popped is None:
+                        continue
+                    popped_task_key, popped_slot = popped
+                    slots_to_force_cleanup.append(
+                        (popped_task_key, run_lease_id, popped_slot)
+                    )
+                    repaired_runs.append(
+                        {
+                            "lease_id": run_lease_id,
+                            "task_key": popped_task_key,
+                            "phase": popped_slot.phase,
+                            "reason": stale_reason,
+                            "age_sec": round(stale_age_sec, 1),
+                            "in_flight_ops": popped_slot.in_flight_ops,
+                            "active_op": popped_slot.active_op,
+                            "close_requested": popped_slot.close_requested,
+                            "container": self._run_slot_container_info(popped_slot),
+                        }
+                    )
+                    if max_repairs > 0 and len(repaired_runs) >= max_repairs:
+                        break
+                if max_repairs > 0 and len(repaired_runs) >= max_repairs:
+                    break
+
+        if slots_to_force_cleanup:
+            await self._force_cleanup_slots(
+                slots_to_force_cleanup,
+                reason=f"repair_stale_runs:{reason}",
+            )
+
+        return {
+            "repaired": bool(repaired_runs),
+            "reason": reason,
+            "min_age": min_age,
+            "max_repairs": max_repairs,
+            "repaired_count": len(repaired_runs),
+            "repaired_runs": repaired_runs,
         }
 
     async def _force_cleanup_slots(
@@ -1644,6 +1719,45 @@ async def repair_pending_closes(request: Request) -> JSONResponse:
         max_active_runs=max_active_runs,
         cancel_timeout=cancel_timeout,
         min_age=min_age,
+    )
+    return JSONResponse({"ok": True, **result})
+
+
+@app.post("/repair/stale_runs")
+async def repair_stale_runs(request: Request) -> JSONResponse:
+    if POOL is None:
+        return JSONResponse(
+            {"ok": False, "error": "Pool is not initialized"}, status_code=500
+        )
+    if os.getenv("WORKER_REPAIR_STALE_RUNS", "1") != "1":
+        return JSONResponse(
+            {
+                "ok": False,
+                "error": "Stale-run repair endpoint is disabled",
+                "code": "REPAIR_DISABLED",
+            },
+            status_code=403,
+        )
+
+    data = await json_payload(request)
+    reason = str(data.get("reason") or "manual")
+    min_age = _env_float("WORKER_REPAIR_STALE_RUNS_MIN_AGE", 0.0)
+    max_repairs = _env_int("WORKER_REPAIR_STALE_RUNS_MAX_REPAIRS", 20)
+    try:
+        if "min_age" in data:
+            min_age = float(data["min_age"])
+    except (TypeError, ValueError):
+        pass
+    try:
+        if "max_repairs" in data:
+            max_repairs = int(data["max_repairs"])
+    except (TypeError, ValueError):
+        pass
+
+    result = await POOL.repair_stale_runs(
+        reason=reason,
+        min_age=max(0.0, min_age),
+        max_repairs=max(0, max_repairs),
     )
     return JSONResponse({"ok": True, **result})
 

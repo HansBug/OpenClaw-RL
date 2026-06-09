@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import sys
 import sqlite3
+import math
 from pathlib import Path
 
 TERMINAL_RL_DIR = Path(__file__).resolve().parents[1]
@@ -16,8 +17,12 @@ import explore_agent57_lite as a57
 
 def _reset_local_agent57_state():
     a57._LOCAL_COUNTS.clear()
+    a57._LOCAL_COUNT_LAST_SEEN.clear()
     a57._LOCAL_ARM_EVENTS.clear()
     a57._LOCAL_TRAJ_SEEN = 0
+    a57._LOCAL_LIFE_RAW_N = 0
+    a57._LOCAL_LIFE_RAW_MEAN = 0.0
+    a57._LOCAL_LIFE_RAW_M2 = 0.0
     a57._reset_ucb_rng_for_tests()
 
 
@@ -26,7 +31,14 @@ def test_agent57_config_defaults_preserve_additive_mode(monkeypatch):
         "EXPLORE_AGENT57_COMBINE_MODE",
         "EXPLORE_AGENT57_NGU_MOD_CLIP",
         "EXPLORE_AGENT57_NGU_EPISODIC_SOURCE",
+        "EXPLORE_AGENT57_NGU_EPISODIC_REDUCER",
+        "EXPLORE_AGENT57_NGU_LIFE_MOD_MODE",
+        "EXPLORE_AGENT57_NGU_LIFE_MOD_STD_CLIP",
         "EXPLORE_AGENT57_MAX_BONUS",
+        "EXPLORE_AGENT57_LIFELONG_COUNT_DECAY",
+        "EXPLORE_AGENT57_LIFELONG_CAPACITY",
+        "EXPLORE_AGENT57_LIFELONG_OBS_MODE",
+        "EXPLORE_AGENT57_TRUST_GATE",
     ):
         monkeypatch.delenv(name, raising=False)
 
@@ -35,7 +47,14 @@ def test_agent57_config_defaults_preserve_additive_mode(monkeypatch):
     assert config.combine_mode == "add"
     assert config.ngu_mod_clip == 5.0
     assert config.ngu_episodic_source == "signature_intrinsic"
+    assert config.ngu_episodic_reducer == "sum"
+    assert config.ngu_life_mod_mode == "linear"
+    assert config.ngu_life_mod_std_clip == 5.0
     assert config.max_bonus == 0.0
+    assert config.lifelong_count_decay == 1.0
+    assert config.lifelong_capacity == 0
+    assert config.lifelong_obs_mode == "fingerprint"
+    assert config.trust_gate_mode == "hard"
 
 
 def test_ngu_lite_bonus_uses_product_and_clamp(monkeypatch):
@@ -54,9 +73,11 @@ def test_ngu_lite_bonus_uses_product_and_clamp(monkeypatch):
         episodic_novelty=10.0,
         lifelong_raw=5.0,
         lifelong_eligible=True,
+        trust_gate=1.0,
     )
 
     assert metrics["explore_agent57_ngu_life_mod"] == 3.0
+    assert metrics["explore_agent57_intrinsic_signal"] == 30.0
     assert metrics["explore_agent57_ngu_bonus_unclipped"] == 0.3
     assert metrics["explore_agent57_ngu_bonus"] == 0.05
     assert metrics["explore_agent57_bonus_clipped"] == 1.0
@@ -79,6 +100,27 @@ def test_ngu_lite_bonus_stays_zero_when_lifelong_not_eligible(monkeypatch):
 
     assert metrics["explore_agent57_ngu_bonus"] == 0.0
     assert metrics["explore_agent57_ngu_episodic"] == 10.0
+
+
+def test_ngu_lite_bonus_soft_trust_scales_product(monkeypatch):
+    monkeypatch.setenv("EXPLORE_AGENT57_LITE", "1")
+    monkeypatch.setenv("EXPLORE_AGENT57_LIFELONG", "1")
+    monkeypatch.setenv("EXPLORE_AGENT57_COMBINE_MODE", "ngu_lite")
+    monkeypatch.setenv("EXPLORE_AGENT57_ARM_BETAS", "0.02")
+    monkeypatch.setenv("EXPLORE_AGENT57_LIFELONG_COEF", "0.5")
+    config = a57.config_from_env()
+
+    metrics = a57.compute_ngu_lite_bonus(
+        config=config,
+        arm_id=0,
+        episodic_novelty=10.0,
+        lifelong_raw=1.0,
+        lifelong_eligible=True,
+        trust_gate=0.1,
+    )
+
+    assert metrics["explore_agent57_ngu_bonus_unclipped"] == 0.02
+    assert metrics["explore_agent57_trust"] == 0.1
 
 
 def test_ucb_min_per_arm_prioritizes_under_sampled_arms(monkeypatch):
@@ -209,6 +251,121 @@ def test_lifelong_key_v2_includes_dataset_by_default(monkeypatch):
     )
 
     assert seta_key != safety_key
+
+
+def test_lifelong_key_v2_label_obs_mode_collapses_generic_text(monkeypatch):
+    actions = [{"tool_name": "shell", "signature": "shell|cat", "raw": "cat file"}]
+    turns_a = [{"turn_idx": 0, "command": "cat a", "result": {"stdout": "alpha beta"}}]
+    turns_b = [{"turn_idx": 0, "command": "cat b", "result": {"stdout": "gamma zeta"}}]
+    monkeypatch.setenv("EXPLORE_AGENT57_LIFELONG_KEY_VERSION", "v2")
+    monkeypatch.setenv("EXPLORE_AGENT57_LIFELONG_INCLUDE_DATASET", "1")
+    monkeypatch.setenv("EXPLORE_AGENT57_LIFELONG_OBS_MODE", "label")
+    config = a57.config_from_env()
+
+    key_a = a57.lifelong_keys(actions, turns_a, config=config, metadata={"data_source": "seta"})
+    key_b = a57.lifelong_keys(actions, turns_b, config=config, metadata={"data_source": "seta"})
+
+    assert key_a == key_b
+
+    monkeypatch.setenv("EXPLORE_AGENT57_LIFELONG_OBS_MODE", "fingerprint")
+    config = a57.config_from_env()
+    key_a = a57.lifelong_keys(actions, turns_a, config=config, metadata={"data_source": "seta"})
+    key_b = a57.lifelong_keys(actions, turns_b, config=config, metadata={"data_source": "seta"})
+
+    assert key_a != key_b
+
+
+def test_soft_trust_gate_keeps_failed_lifelong_signal(monkeypatch):
+    _reset_local_agent57_state()
+    monkeypatch.setenv("EXPLORE_AGENT57_LITE", "1")
+    monkeypatch.setenv("EXPLORE_AGENT57_LIFELONG", "1")
+    monkeypatch.setenv("EXPLORE_AGENT57_LIFELONG_BACKEND", "local")
+    monkeypatch.setenv("EXPLORE_AGENT57_ARM_BETAS", "0.02")
+    monkeypatch.setenv("EXPLORE_AGENT57_LIFELONG_COEF", "0.5")
+    monkeypatch.setenv("EXPLORE_AGENT57_TRUST_GATE", "soft")
+    monkeypatch.setenv("EXPLORE_AGENT57_TRUST_FAILED", "0.1")
+    monkeypatch.setenv("EXPLORE_AGENT57_TRUST_PARSE_ERROR", "0.1")
+    monkeypatch.setenv("EXPLORE_AGENT57_TRUST_WARMUP", "0.3")
+    config = a57.config_from_env()
+    actions = [{"tool_name": "shell", "signature": "shell|pytest", "raw": "pytest"}]
+    turns = [{"turn_idx": 0, "command": "pytest", "result": {"exit_code": 1}}]
+
+    metrics = a57.compute_lifelong_bonus(
+        config=config,
+        arm_id=0,
+        actions=actions,
+        turn_records=turns,
+        status="failed",
+        parse_error_count=1,
+        metadata={"data_source": "seta"},
+    )
+
+    assert metrics["explore_agent57_lifelong_eligible"] == 1.0
+    assert metrics["explore_agent57_trust"] == 0.1
+    assert metrics["explore_agent57_lifelong_bonus"] > 0.0
+    assert "parse_error" in metrics["explore_agent57_lifelong_suppressed_reason"]
+
+
+def test_lifelong_local_counts_support_decay_and_capacity(monkeypatch):
+    _reset_local_agent57_state()
+    monkeypatch.setenv("EXPLORE_AGENT57_LITE", "1")
+    monkeypatch.setenv("EXPLORE_AGENT57_LIFELONG", "1")
+    monkeypatch.setenv("EXPLORE_AGENT57_LIFELONG_BACKEND", "local")
+    monkeypatch.setenv("EXPLORE_AGENT57_LIFELONG_WARMUP", "0")
+    monkeypatch.setenv("EXPLORE_AGENT57_LIFELONG_COUNT_DECAY", "0.5")
+    monkeypatch.setenv("EXPLORE_AGENT57_LIFELONG_CAPACITY", "1")
+    config = a57.config_from_env()
+    turns = [{"turn_idx": 0, "command": "pytest", "result": {"exit_code": 0}}]
+
+    a57.compute_lifelong_bonus(
+        config=config,
+        arm_id=0,
+        actions=[{"tool_name": "shell", "signature": "shell|pytest", "raw": "pytest"}],
+        turn_records=turns,
+        status="completed",
+        parse_error_count=0,
+    )
+    second = a57.compute_lifelong_bonus(
+        config=config,
+        arm_id=0,
+        actions=[{"tool_name": "shell", "signature": "shell|pytest", "raw": "pytest"}],
+        turn_records=turns,
+        status="completed",
+        parse_error_count=0,
+    )
+    a57.compute_lifelong_bonus(
+        config=config,
+        arm_id=0,
+        actions=[{"tool_name": "shell", "signature": "shell|ls", "raw": "ls"}],
+        turn_records=turns,
+        status="completed",
+        parse_error_count=0,
+    )
+
+    assert math.isclose(second["explore_agent57_lifelong_raw"], 1.0 / math.sqrt(2.0))
+    assert len(a57._LOCAL_COUNTS) == 1
+
+
+def test_standardized_life_mod_override_drives_ngu_product(monkeypatch):
+    monkeypatch.setenv("EXPLORE_AGENT57_LITE", "1")
+    monkeypatch.setenv("EXPLORE_AGENT57_LIFELONG", "1")
+    monkeypatch.setenv("EXPLORE_AGENT57_COMBINE_MODE", "ngu_lite")
+    monkeypatch.setenv("EXPLORE_AGENT57_ARM_BETAS", "0.02")
+    monkeypatch.setenv("EXPLORE_AGENT57_LIFELONG_COEF", "0.5")
+    monkeypatch.setenv("EXPLORE_AGENT57_NGU_LIFE_MOD_MODE", "standardized_softplus")
+    config = a57.config_from_env()
+
+    metrics = a57.compute_ngu_lite_bonus(
+        config=config,
+        arm_id=0,
+        episodic_novelty=2.0,
+        lifelong_raw=0.0,
+        lifelong_eligible=True,
+        life_mod_override=1.25,
+    )
+
+    assert metrics["explore_agent57_ngu_life_mod"] == 1.25
+    assert metrics["explore_agent57_intrinsic_signal"] == 2.5
 
 
 def test_lifelong_key_v2_task_bucket_is_opt_in(monkeypatch):

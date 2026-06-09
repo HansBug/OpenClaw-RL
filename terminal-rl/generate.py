@@ -224,6 +224,10 @@ _EXPLORE_INTRINSIC_ENABLED = _env_bool("EXPLORE_INTRINSIC_ENABLED", False)
 _EXPLORE_INTRINSIC_COEF = _env_float("EXPLORE_INTRINSIC_COEF", 0.1)
 _EXPLORE_INTRINSIC_SCHEDULE = os.getenv("EXPLORE_INTRINSIC_SCHEDULE", "constant").strip().lower()
 _EXPLORE_INTRINSIC_DECAY_STEPS = _env_int("EXPLORE_INTRINSIC_DECAY_STEPS", 0)
+_EXPLORE_INTRINSIC_REDUCER = os.getenv("EXPLORE_INTRINSIC_REDUCER", "sum").strip().lower()
+if _EXPLORE_INTRINSIC_REDUCER not in {"sum", "mean"}:
+    _EXPLORE_INTRINSIC_REDUCER = "sum"
+_EXPLORE_SCORE_BONUS_COMPONENTS = os.getenv("EXPLORE_SCORE_BONUS_COMPONENTS", "legacy").strip().lower()
 # Granularity for novelty hashing:
 #   "raw"        = full command string (default, matches v1)
 #   "signature"  = tool-call signature (cmd name + first 2 args), Agent57-style
@@ -415,8 +419,10 @@ def _explore_intrinsic_bonus(turn_records: List[Dict[str, Any]]) -> float:
     if not _EXPLORE_INTRINSIC_ENABLED or not turn_records:
         return 0.0
     total = 0.0
+    action_count = 0
     episode_counter: Dict[str, int] = {}
     for action in _iter_explore_actions(turn_records):
+        action_count += 1
         if _EXPLORE_INTRINSIC_GRANULARITY == "signature":
             key_src = action["signature"]
         else:
@@ -431,20 +437,68 @@ def _explore_intrinsic_bonus(turn_records: List[Dict[str, Any]]) -> float:
         else:
             _CMD_COUNTER[key] = _CMD_COUNTER.get(key, 0) + 1
             total += 1.0 / math.sqrt(_CMD_COUNTER[key])
+    if _EXPLORE_INTRINSIC_REDUCER == "mean" and action_count > 0:
+        return total / action_count
     return total
 
 
-def _explore_episode_signature_novelty(turn_records: List[Dict[str, Any]]) -> float:
+def _explore_episode_signature_novelty(
+    turn_records: List[Dict[str, Any]],
+    *,
+    reducer: str = "sum",
+) -> float:
     """Episode-local signature novelty used by Agent57 NGU-lite product mode."""
     if not turn_records:
         return 0.0
     total = 0.0
+    action_count = 0
     episode_counter: Dict[str, int] = {}
     for action in _iter_explore_actions(turn_records):
+        action_count += 1
         key_src = action["signature"]
         key = hashlib.md5(key_src.encode()).hexdigest()[:10]
         episode_counter[key] = episode_counter.get(key, 0) + 1
         total += 1.0 / math.sqrt(episode_counter[key])
+    if reducer == "mean" and action_count > 0:
+        return total / action_count
+    return total
+
+
+def _explore_score_bonus_from_components(
+    components_raw: str,
+    *,
+    intrinsic: float,
+    safety: float,
+    lprnd: float,
+    agent57: float,
+    cde_actor: float,
+) -> float:
+    """Select which exploration components are injected into reward["score"]."""
+    raw = (components_raw or "").strip().lower()
+    if raw in {"", "none", "off", "0"}:
+        return 0.0
+    values = {
+        "intrinsic": intrinsic,
+        "explore_intrinsic_scaled": intrinsic,
+        "safety": safety,
+        "explore_safety_penalty": safety,
+        "lprnd": lprnd,
+        "explore_lprnd": lprnd,
+        "agent57": agent57,
+        "ngu": agent57,
+        "explore_agent57_ngu_bonus": agent57,
+        "cde": cde_actor,
+        "cde_actor": cde_actor,
+        "explore_cde_actor_bonus": cde_actor,
+    }
+    if raw == "legacy":
+        return intrinsic + safety + lprnd + agent57 + cde_actor
+    total = 0.0
+    for part in raw.split(","):
+        key = part.strip().lower()
+        if not key:
+            continue
+        total += values.get(key, 0.0)
     return total
 
 
@@ -1097,13 +1151,27 @@ def _exploration_audit_from_reward(reward: Dict[str, Any]) -> Dict[str, Any]:
         "explore_agent57_lifelong_include_dataset",
         "explore_agent57_lifelong_include_task",
         "explore_agent57_lifelong_include_turn",
+        "explore_agent57_lifelong_obs_mode",
+        "explore_agent57_lifelong_count_decay",
+        "explore_agent57_lifelong_capacity",
+        "explore_agent57_trust_gate_mode",
+        "explore_agent57_trust",
         "explore_agent57_lifelong_raw",
+        "explore_agent57_lifelong_z",
+        "explore_agent57_lifelong_stat_n",
+        "explore_agent57_lifelong_stat_mean",
+        "explore_agent57_lifelong_stat_std",
+        "explore_agent57_lifelong_stat_error",
         "explore_agent57_lifelong_bonus",
         "explore_agent57_lifelong_bonus_unclipped",
         "explore_agent57_ngu_episodic_source",
+        "explore_agent57_ngu_episodic_reducer",
+        "explore_agent57_ngu_life_mod_mode",
+        "explore_agent57_ngu_life_mod_std_clip",
         "explore_agent57_ngu_mod_clip",
         "explore_agent57_ngu_episodic",
         "explore_agent57_ngu_life_mod",
+        "explore_agent57_intrinsic_signal",
         "explore_agent57_ngu_bonus",
         "explore_agent57_ngu_bonus_unclipped",
         "explore_agent57_bonus_unclipped",
@@ -1188,6 +1256,7 @@ def _save_rollout_artifacts(
                 "explore_intrinsic_coef", "explore_intrinsic_effective_coef",
                 "explore_intrinsic_schedule", "explore_intrinsic_decay_steps",
                 "explore_intrinsic_schedule_multiplier",
+                "explore_intrinsic_reducer",
                 "explore_intrinsic_granularity", "explore_intrinsic_scope",
                 "explore_safety_penalty",
                 "explore_lprnd", "explore_lprnd_raw", "explore_lprnd_coef",
@@ -1210,17 +1279,31 @@ def _save_rollout_artifacts(
                 "explore_agent57_lifelong_coef",
                 "explore_agent57_lifelong_clip",
                 "explore_agent57_lifelong_warmup",
+                "explore_agent57_lifelong_count_decay",
+                "explore_agent57_lifelong_capacity",
                 "explore_agent57_lifelong_key_version",
                 "explore_agent57_lifelong_include_dataset",
                 "explore_agent57_lifelong_include_task",
                 "explore_agent57_lifelong_include_turn",
+                "explore_agent57_lifelong_obs_mode",
+                "explore_agent57_trust_gate_mode",
+                "explore_agent57_trust",
                 "explore_agent57_lifelong_raw",
+                "explore_agent57_lifelong_z",
+                "explore_agent57_lifelong_stat_n",
+                "explore_agent57_lifelong_stat_mean",
+                "explore_agent57_lifelong_stat_std",
+                "explore_agent57_lifelong_stat_error",
                 "explore_agent57_lifelong_bonus",
                 "explore_agent57_lifelong_bonus_unclipped",
                 "explore_agent57_ngu_episodic_source",
+                "explore_agent57_ngu_episodic_reducer",
+                "explore_agent57_ngu_life_mod_mode",
+                "explore_agent57_ngu_life_mod_std_clip",
                 "explore_agent57_ngu_mod_clip",
                 "explore_agent57_ngu_episodic",
                 "explore_agent57_ngu_life_mod",
+                "explore_agent57_intrinsic_signal",
                 "explore_agent57_ngu_bonus",
                 "explore_agent57_ngu_bonus_unclipped",
                 "explore_agent57_bonus_unclipped",
@@ -1239,6 +1322,7 @@ def _save_rollout_artifacts(
                 "explore_cde_actor_cap",
                 "explore_cde_actor_scaled",
                 "explore_cde_actor_clipped", "explore_total_bonus",
+                "explore_all_bonus", "explore_score_bonus_components",
                 "explore_base_score_before_bonus",
                 "explore_bonus_to_base_abs_ratio",
                 "explore_curiosity_pressure",
@@ -2623,7 +2707,10 @@ async def generate(
                 _agent57_episodic = (
                     _intr_bonus
                     if _AGENT57_CONFIG.ngu_episodic_source == "intrinsic"
-                    else _explore_episode_signature_novelty(turn_records)
+                    else _explore_episode_signature_novelty(
+                        turn_records,
+                        reducer=_AGENT57_CONFIG.ngu_episodic_reducer,
+                    )
                 )
                 _agent57_ngu_metrics = _agent57_compute_ngu_lite_bonus(
                     config=_AGENT57_CONFIG,
@@ -2639,6 +2726,12 @@ async def generate(
                         _agent57_metrics.get(
                             "explore_agent57_lifelong_eligible", 0.0
                         )
+                    ),
+                    trust_gate=float(
+                        _agent57_metrics.get("explore_agent57_trust", 1.0) or 0.0
+                    ),
+                    life_mod_override=_agent57_metrics.get(
+                        "explore_agent57_ngu_life_mod"
                     ),
                 )
                 _agent57_metrics.update(_agent57_ngu_metrics)
@@ -2679,10 +2772,18 @@ async def generate(
                 + _agent57_bonus
                 + _cde_actor_bonus
             )
+            _explore_score_bonus = _explore_score_bonus_from_components(
+                _EXPLORE_SCORE_BONUS_COMPONENTS,
+                intrinsic=_intr_for_total,
+                safety=_safe_penalty,
+                lprnd=_lprnd_bonus,
+                agent57=_agent57_bonus,
+                cde_actor=_cde_actor_bonus,
+            )
             _explore_debug = _explore_debug_metrics(
                 status=status,
                 base_score_mean=_base_score_mean,
-                total_bonus=_explore_total,
+                total_bonus=_explore_score_bonus,
                 intrinsic_scaled=_intr_for_total,
                 safety_penalty=_safe_penalty,
                 lprnd_bonus=_lprnd_bonus,
@@ -2695,7 +2796,7 @@ async def generate(
                 config=_AGENT57_CONFIG,
                 arm_id=_agent57_arm_id,
                 base_score=_base_score_mean,
-                final_score=_base_score_mean + _explore_total,
+                final_score=_base_score_mean + _explore_score_bonus,
                 status=status,
                 parse_error_count=agent_runner.parse_error_count,
                 bonus=_agent57_bonus,
@@ -2703,7 +2804,7 @@ async def generate(
             )
             for s in samples:
                 if isinstance(s.reward, dict) and "score" in s.reward:
-                    s.reward["score"] += _explore_total
+                    s.reward["score"] += _explore_score_bonus
                     s.reward["explore_intrinsic"] = _intr_bonus
                     s.reward["explore_intrinsic_scaled"] = _intr_scaled
                     s.reward["explore_intrinsic_in_total"] = _intr_for_total
@@ -2711,6 +2812,7 @@ async def generate(
                     s.reward["explore_intrinsic_effective_coef"] = _intr_effective_coef
                     s.reward["explore_intrinsic_schedule"] = _EXPLORE_INTRINSIC_SCHEDULE
                     s.reward["explore_intrinsic_decay_steps"] = _EXPLORE_INTRINSIC_DECAY_STEPS
+                    s.reward["explore_intrinsic_reducer"] = _EXPLORE_INTRINSIC_REDUCER
                     s.reward["explore_intrinsic_schedule_multiplier"] = _intr_schedule_multiplier
                     s.reward["explore_intrinsic_granularity"] = _EXPLORE_INTRINSIC_GRANULARITY
                     s.reward["explore_intrinsic_scope"] = _EXPLORE_INTRINSIC_SCOPE
@@ -2764,7 +2866,9 @@ async def generate(
                         s.reward["explore_cde_actor_cap"] = _cde_actor["cap"]
                         s.reward["explore_cde_actor_scaled"] = _cde_actor["scaled"]
                         s.reward["explore_cde_actor_clipped"] = _cde_actor["clipped"]
-                    s.reward["explore_total_bonus"] = _explore_total
+                    s.reward["explore_total_bonus"] = _explore_score_bonus
+                    s.reward["explore_all_bonus"] = _explore_total
+                    s.reward["explore_score_bonus_components"] = _EXPLORE_SCORE_BONUS_COMPONENTS
                     s.reward.update(_explore_debug)
                     _sync_reward_aliases(s.reward)
 
@@ -2812,12 +2916,14 @@ async def generate(
         return samples
 
     except Exception as exc:
+        log_traceback = _env_bool("TERMINAL_RL_GENERATE_FAILURE_TRACEBACK", False)
         logger.error(
-            "%s Generate failed (%s): %s",
+            "%s Generate failed (%s): %s%s",
             _log_tag,
             type(exc).__name__,
             exc,
-            exc_info=True,
+            "" if log_traceback else " (set TERMINAL_RL_GENERATE_FAILURE_TRACEBACK=1 for traceback)",
+            exc_info=log_traceback,
         )
         metadata = sample.metadata if isinstance(sample.metadata, dict) else {}
         sample.metadata = dict(metadata)

@@ -321,6 +321,39 @@ def test_status_and_readyz_report_stale_allocated_run(monkeypatch, tmp_path):
     asyncio.run(_case())
 
 
+def test_repair_stale_run_force_cleans_inflight_close_requested(monkeypatch, tmp_path):
+    async def _case():
+        pool_server = _install_import_stubs(monkeypatch)
+        monkeypatch.setenv("WORKER_CLOSING_REQUESTED_TTL", "10")
+        env = _DummyEnv()
+        pool = _new_pool(pool_server, env, tmp_path)
+
+        lease = await pool.allocate("task")
+        lease_id = lease["lease_id"]
+        async with pool._lock:
+            run_slot = pool._get_run_slot(lease_id)
+            run_slot.phase = "closing_requested"
+            run_slot.close_requested = True
+            run_slot.close_reason = "test"
+            run_slot.close_requested_ts = time.time() - 20
+            run_slot.in_flight_ops = 1
+            run_slot.active_op = "exec_tool"
+
+        status = await pool.status()
+        assert status["stale_runs"][0]["lease_id"] == lease_id
+        result = await pool.repair_stale_runs(reason="test", min_age=0, max_repairs=10)
+
+        assert result["repaired"] is True
+        assert result["repaired_count"] == 1
+        assert result["repaired_runs"][0]["lease_id"] == lease_id
+        assert env.force_cleanup_reason == "repair_stale_runs:test"
+        status = await pool.status()
+        assert status["total_active_runs"] == 0
+        assert status["stale_runs"] == []
+
+    asyncio.run(_case())
+
+
 def test_reaper_removes_stale_allocated_run(monkeypatch, tmp_path):
     async def _case():
         pool_server = _install_import_stubs(monkeypatch)
