@@ -112,6 +112,85 @@ _STRUCTURED_LOG_PREFIX = "TERMINAL_RL_METRIC_JSON"
 _STRUCTURED_SCHEMA = "terminal_rl.per_dataset_metrics.v1"
 _STRUCTURED_SCHEMA_VERSION = 5
 _LAST_EVAL_BY_DATASET: dict[str, dict[str, Any]] = {}
+_COMPACT_EXACT_KEYS = {
+    "rollout/step",
+    "eval/step",
+    "terminal/total_samples",
+    "terminal/completed",
+    "terminal/truncated",
+    "terminal/failed",
+    "terminal/aborted",
+    "terminal/failed_ratio",
+    "terminal/non_trainable_ratio",
+    "terminal/reward_mean",
+    "terminal/reward_std",
+    "terminal/reward_min",
+    "terminal/reward_max",
+    "terminal/accuracy",
+    "terminal/safety_score_mean",
+    "terminal/safety_negative_ratio",
+    "terminal/clawsentry_error_rate",
+    "terminal/rollout_time",
+    "terminal/explore/explore_total_bonus/mean",
+    "terminal/explore/explore_bonus_to_base_abs_ratio/mean",
+    "terminal/explore/explore_curiosity_pressure/mean",
+    "terminal/explore/explore_safety_pressure/mean",
+    "terminal/explore/explore_reward_hacking_risk_rate",
+    "terminal/explore/explore_over_exploration_risk_rate",
+    "terminal/explore/explore_safety_tension_rate",
+    "terminal/explore/agent57/active_rate",
+    "terminal/explore/agent57/lifelong_enabled_rate",
+    "terminal/explore/agent57/lifelong_eligible_rate",
+    "terminal/explore/agent57/lifelong_state_error_rate",
+    "terminal/explore/agent57/arm_count",
+    "terminal/explore/agent57/top_arm",
+    "terminal/explore/agent57/top_arm_ratio",
+    "terminal/explore/agent57/lifelong_raw/mean",
+    "terminal/explore/agent57/lifelong_bonus/mean",
+    "terminal/explore/agent57/ngu_episodic/mean",
+    "terminal/explore/agent57/ngu_life_mod/mean",
+    "terminal/explore/agent57/ngu_bonus/mean",
+    "terminal/explore/agent57/bonus_clipped/mean",
+    "terminal/turn_uncertainty/mean_neg_logprob/mean",
+    "terminal/turn_uncertainty/mean_score/mean",
+    "terminal/turn_uncertainty/low_progress_turn_ratio",
+}
+_COMPACT_PER_DATASET_SUFFIXES = {
+    "sample_count",
+    "trainable_count",
+    "reward/total",
+    "reward/task",
+    "reward/raw",
+    "reward/exploration",
+    "reward/exploration_ratio",
+    "total_reward",
+    "task_reward",
+    "raw_reward",
+    "exploration_reward",
+    "truncated_fraction",
+    "test_acc",
+    "reward_std",
+    "response_length",
+    "kl",
+    "entropy",
+    "turn_uncertainty/mean_neg_logprob",
+    "turn_uncertainty/mean_score",
+    "turn_uncertainty/mean_abs_score_delta",
+    "turn_uncertainty/low_progress_fraction",
+    "agent57/active",
+    "agent57/lifelong_enabled",
+    "agent57/lifelong_bonus",
+    "agent57/lifelong_raw",
+    "agent57/lifelong_unique_keys",
+    "agent57/lifelong_seen_before",
+    "agent57/lifelong_warmup_remaining",
+    "agent57/lifelong_eligible_rate",
+    "agent57/lifelong_state_error_rate",
+    "agent57/arm_count",
+    "agent57/top_arm",
+    "agent57/top_arm_ratio",
+    "agent57/top_suppressed_ratio",
+}
 
 
 def _ensure_terminal_step_metric(args) -> None:
@@ -122,6 +201,55 @@ def _ensure_terminal_step_metric(args) -> None:
         wandb.define_metric("per_dataset/*", step_metric="rollout/step")
     except Exception as e:
         logger.warning("Failed to define wandb step metric for terminal/*: %s", e)
+
+
+def _wandb_metric_profile() -> str:
+    return str(os.getenv("TERMINAL_WANDB_METRIC_PROFILE", "full")).strip().lower()
+
+
+def _compact_per_dataset_suffix(metric_key: str) -> str | None:
+    prefix = "per_dataset/"
+    if not metric_key.startswith(prefix):
+        return None
+    parts = metric_key[len(prefix):].split("/", 1)
+    if len(parts) != 2 or not parts[0]:
+        return None
+    return parts[1]
+
+
+def _filter_wandb_metrics(log_dict: Dict[str, Any]) -> Dict[str, Any]:
+    """Keep wandb dashboards low-cardinality by default.
+
+    The detailed rollout diagnostics are still emitted to structured JSONL and
+    train logs. This filter only controls the wandb payload.
+    """
+    profile = _wandb_metric_profile()
+    if profile in {"full", "legacy", "all", "verbose"}:
+        return log_dict
+    if profile not in {"compact", "minimal", "key", "keys"}:
+        logger.warning(
+            "Unknown TERMINAL_WANDB_METRIC_PROFILE=%r; using compact wandb metrics",
+            profile,
+        )
+
+    filtered: Dict[str, Any] = {}
+    for key, value in log_dict.items():
+        if key in _COMPACT_EXACT_KEYS:
+            filtered[key] = value
+            continue
+        per_dataset_suffix = _compact_per_dataset_suffix(key)
+        if per_dataset_suffix in _COMPACT_PER_DATASET_SUFFIXES:
+            filtered[key] = value
+    dropped = len(log_dict) - len(filtered)
+    if dropped > 0 and _env_enabled("TERMINAL_WANDB_FILTER_LOG_ONCE", "1"):
+        logger.info(
+            "wandb metric profile=%s kept=%d dropped=%d; detailed metrics remain in structured JSONL/log tables",
+            profile or "compact",
+            len(filtered),
+            dropped,
+        )
+        os.environ["TERMINAL_WANDB_FILTER_LOG_ONCE"] = "0"
+    return filtered
 
 
 def _sanitize_metric_part(value: Any) -> str:
@@ -869,8 +997,8 @@ def _metric_record_from_samples(
         raw_reward_semantics = "terminal task test pass rate; 1.0 means all trainable samples passed"
         raw_reward_min = 0.0
         raw_reward_max = 1.0
-    elif dataset_name in {"agent_safetybench", "agentharm"} or scale_sources.intersection(
-        {"agent_safetybench", "agentharm"}
+    elif dataset_name in {"agent_safetybench", "agentharm", "security"} or scale_sources.intersection(
+        {"agent_safetybench", "agentharm", "security", "safety"}
     ):
         raw_reward_scale = "direct_safety_score"
         raw_reward_semantics = "dataset reward-model score, not a 0/1 pass rate"
@@ -1798,7 +1926,7 @@ def rollout_log(rollout_id, args, samples, rollout_extra_metrics, rollout_time):
         logger.info("dataset split metrics rollout=%s step=%s\n%s", rollout_id, step, split_table)
     _write_structured_metrics(metric_records)
     _ensure_terminal_step_metric(args)
-    logging_utils.log(args, log_dict, step_key="rollout/step")
+    logging_utils.log(args, _filter_wandb_metrics(log_dict), step_key="rollout/step")
 
     return False
 
@@ -1886,5 +2014,5 @@ def eval_rollout_log(rollout_id, args, data, extra_metrics=None):
 
     _write_structured_metrics(records)
     _ensure_terminal_step_metric(args)
-    logging_utils.log(args, log_dict, step_key="eval/step")
+    logging_utils.log(args, _filter_wandb_metrics(log_dict), step_key="eval/step")
     return False

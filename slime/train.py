@@ -13,6 +13,19 @@ logger = logging.getLogger(__name__)
 _SKIPPED_ROLLOUT = object()
 
 
+def _looks_like_env_storm(exc: Exception) -> bool:
+    text = repr(exc)
+    return any(
+        marker in text
+        for marker in (
+            "dynamic sampling aborted after repeated all-failed rollout groups",
+            "TASK_SLOTS_EXHAUSTED",
+            "ALL_WORKERS_UNAVAILABLE_OR_PRESSURED",
+            "/allocate",
+        )
+    )
+
+
 def _relay_pending_metrics(result):
     """Log pending wandb metrics relayed from secondary processes."""
     if not result:
@@ -34,13 +47,30 @@ def _get_rollout_generation_result(args, rollout_manager, rollout_id):
     initial_backoff = max(0.0, float(getattr(args, "rollout_generation_retry_initial_backoff", 30.0) or 0.0))
     max_backoff = max(0.0, float(getattr(args, "rollout_generation_retry_max_backoff", 300.0) or 0.0))
     multiplier = max(1.0, float(getattr(args, "rollout_generation_retry_backoff_multiplier", 2.0) or 1.0))
+    env_storm_max_retries = int(getattr(args, "rollout_generation_env_storm_max_retries", 3) or 0)
     attempt = 0
+    env_storm_attempt = 0
 
     while True:
         try:
             return ray.get(rollout_manager.generate.remote(rollout_id))
         except Exception as exc:
             attempt += 1
+            if _looks_like_env_storm(exc):
+                env_storm_attempt += 1
+            else:
+                env_storm_attempt = 0
+            if env_storm_max_retries >= 0 and env_storm_attempt > env_storm_max_retries:
+                logger.error(
+                    "Rollout generation failed after repeated environment-allocation storms: "
+                    "rollout_id=%s attempts=%s env_storm_attempts=%s env_storm_max_retries=%s error=%r",
+                    rollout_id,
+                    attempt,
+                    env_storm_attempt,
+                    env_storm_max_retries,
+                    exc,
+                )
+                raise
             if max_retries >= 0 and attempt > max_retries:
                 if getattr(args, "rollout_generation_skip_on_failure", False):
                     logger.error(

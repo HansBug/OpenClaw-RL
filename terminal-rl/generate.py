@@ -117,6 +117,82 @@ def _uses_remote_terminal_env(task_meta: Dict[str, Any] | None) -> bool:
     )
 
 
+_TASK_CIRCUIT: dict[str, dict[str, Any]] = {}
+
+
+def _task_circuit_enabled() -> bool:
+    return _env_bool("ENV_TASK_CIRCUIT_BREAKER_ENABLED", True)
+
+
+def _task_circuit_threshold() -> int:
+    return max(1, _env_int("ENV_TASK_CIRCUIT_BREAKER_THRESHOLD", 2))
+
+
+def _task_circuit_cooldown() -> float:
+    return max(0.0, _env_float("ENV_TASK_CIRCUIT_BREAKER_COOLDOWN", 1800.0))
+
+
+def _task_circuit_failure_is_relevant(exc: BaseException) -> bool:
+    text = str(exc)
+    return any(
+        marker in text
+        for marker in (
+            "TASK_BUILD_FAILED",
+            "WORKER_RESET_TIMEOUT",
+            "env reset timed out",
+            "reset timed out",
+            "Docker image build failed",
+            "dockerfile parse error",
+            "RESET_IN_PROGRESS",
+            "WORKER_RESET_CANCELLED",
+            "WORKER_RESET_STALE",
+        )
+    )
+
+
+def _task_circuit_open_reason(task_key: str) -> str | None:
+    if not _task_circuit_enabled():
+        return None
+    state = _TASK_CIRCUIT.get(task_key)
+    if not state:
+        return None
+    opened_until = float(state.get("opened_until", 0.0) or 0.0)
+    if opened_until <= time.time():
+        _TASK_CIRCUIT.pop(task_key, None)
+        return None
+    return str(state.get("reason") or "recent env failures")
+
+
+def _task_circuit_record_success(task_key: str) -> None:
+    if task_key:
+        _TASK_CIRCUIT.pop(task_key, None)
+
+
+def _task_circuit_record_failure(task_key: str, exc: BaseException) -> None:
+    if not task_key or not _task_circuit_enabled():
+        return
+    if not _task_circuit_failure_is_relevant(exc):
+        return
+    now = time.time()
+    state = _TASK_CIRCUIT.setdefault(
+        task_key,
+        {"count": 0, "opened_until": 0.0, "reason": ""},
+    )
+    state["count"] = int(state.get("count", 0) or 0) + 1
+    reason = f"{type(exc).__name__}: {str(exc)[:300]}"
+    state["reason"] = reason
+    immediate = "TASK_BUILD_FAILED" in str(exc) or "dockerfile parse error" in str(exc)
+    if immediate or int(state["count"]) >= _task_circuit_threshold():
+        state["opened_until"] = now + _task_circuit_cooldown()
+        logger.warning(
+            "Opening task circuit breaker task_key=%s count=%s cooldown=%.1fs reason=%s",
+            task_key,
+            state["count"],
+            _task_circuit_cooldown(),
+            reason,
+        )
+
+
 def _remote_env_condition() -> asyncio.Condition:
     global _REMOTE_ENV_CONDITION
     if _REMOTE_ENV_CONDITION is None:
@@ -2082,12 +2158,18 @@ async def generate(
     cs_per_call_full: list[dict[str, Any]] = []
     turn_records: list[dict[str, Any]] = []
 
+    task_key = f"{task_spec.task_name}:{task_spec.task_path}"
     _log_tag = f"[task={task_spec.task_name} uid={run_ctx.uid} group_idx={run_ctx.group_index} sample_idx={run_ctx.sample_index}]"
 
     try:
         if _uses_remote_terminal_env(task_meta):
+            open_reason = _task_circuit_open_reason(task_key)
+            if open_reason is not None:
+                raise RuntimeError(
+                    f"TASK_CIRCUIT_OPEN task_key={task_key}: {open_reason}"
+                )
             remote_env_admission_key = await _acquire_remote_env_admission(
-                f"{task_spec.task_name}:{task_spec.task_path}",
+                task_key,
                 log_tag=_log_tag,
             )
         env_client, lease_id = await _create_env_client(
@@ -2097,12 +2179,18 @@ async def generate(
             "ENV_RESET_HTTP_TIMEOUT",
             float(timeouts.reset_session) + 30.0,
         )
-        reset_coro = env_client.reset(
-            lease_id=lease_id,
-            task_meta=task_meta,
-            run_ctx=run_ctx_payload,
-            task_timeouts=timeouts_payload,
-        )
+        reset_kwargs = {
+            "lease_id": lease_id,
+            "task_meta": task_meta,
+            "run_ctx": run_ctx_payload,
+            "task_timeouts": timeouts_payload,
+        }
+        if remote_env_admission_key is not None:
+            reset_kwargs["request_id"] = (
+                f"{task_key}:{run_ctx.uid}:{run_ctx.group_index}:"
+                f"{run_ctx.sample_index}:reset"
+            )
+        reset_coro = env_client.reset(**reset_kwargs)
         reset_payload = await _await_with_optional_timeout(
             reset_coro,
             reset_http_timeout,
@@ -2913,9 +3001,13 @@ async def generate(
             trajectory_save_interval=traj_save_interval,
         )
 
+        if remote_env_admission_key is not None:
+            _task_circuit_record_success(task_key)
         return samples
 
     except Exception as exc:
+        if _uses_remote_terminal_env(task_meta):
+            _task_circuit_record_failure(task_key, exc)
         log_traceback = _env_bool("TERMINAL_RL_GENERATE_FAILURE_TRACEBACK", False)
         logger.error(
             "%s Generate failed (%s): %s%s",

@@ -196,6 +196,38 @@ def _retry_sleep_seconds(
     return delay
 
 
+def _env_int(name: str, default: int) -> int:
+    raw = os.getenv(name)
+    if raw is None or raw == "":
+        return default
+    try:
+        return int(raw)
+    except ValueError:
+        logger.warning("Invalid %s=%r; using %s", name, raw, default)
+        return default
+
+
+def _should_log_retry(retry_count: int, max_retries: int) -> bool:
+    """Keep retry storms readable while preserving early/final diagnostics."""
+    if retry_count <= 3 or retry_count == max_retries:
+        return True
+    if retry_count in {5, 10, 20, 50}:
+        return True
+    every_n = _env_int("HTTP_RETRY_LOG_EVERY_N", 25)
+    return every_n > 0 and retry_count % every_n == 0
+
+
+def _compact_response_text(text: str | None) -> str | None:
+    if text is None:
+        return None
+    limit = max(0, _env_int("HTTP_RETRY_LOG_RESPONSE_CHARS", 512))
+    if limit <= 0:
+        return None
+    if len(text) <= limit:
+        return text
+    return text[:limit].rstrip() + f"... [truncated {len(text) - limit} chars]"
+
+
 async def _post(
     client,
     url,
@@ -206,6 +238,8 @@ async def _post(
     retry_max_delay: float = 1.0,
     retry_backoff_factor: float = 1.0,
     retry_jitter: float = 0.0,
+    retry_statuses: set[int] | None = None,
+    non_retry_statuses: set[int] | None = None,
 ):
     retry_count = 0
     while retry_count < max_retries:
@@ -219,6 +253,24 @@ async def _post(
             except json.JSONDecodeError:
                 output = content.decode() if isinstance(content, bytes) else content
         except Exception as e:
+            status_code = None
+            if isinstance(e, httpx.HTTPStatusError):
+                status_code = e.response.status_code
+                if non_retry_statuses is not None and status_code in non_retry_statuses:
+                    logger.info(
+                        "Non-retryable HTTP status %s for url=%s, failing immediately.",
+                        status_code,
+                        url,
+                    )
+                    raise e
+                if retry_statuses is not None and status_code not in retry_statuses:
+                    logger.info(
+                        "HTTP status %s is outside retry_statuses=%s for url=%s, failing immediately.",
+                        status_code,
+                        sorted(retry_statuses),
+                        url,
+                    )
+                    raise e
             retry_count += 1
 
             if isinstance(e, httpx.HTTPStatusError):
@@ -226,9 +278,25 @@ async def _post(
             else:
                 response_text = None
 
-            logger.info(
-                f"Error: {e}, retrying... (attempt {retry_count}/{max_retries}, url={url}, response={response_text})"
-            )
+            if _should_log_retry(retry_count, max_retries):
+                response_text = _compact_response_text(response_text)
+                if response_text is None:
+                    logger.info(
+                        "Error: %s, retrying... (attempt %s/%s, url=%s)",
+                        e,
+                        retry_count,
+                        max_retries,
+                        url,
+                    )
+                else:
+                    logger.info(
+                        "Error: %s, retrying... (attempt %s/%s, url=%s, response=%s)",
+                        e,
+                        retry_count,
+                        max_retries,
+                        url,
+                        response_text,
+                    )
             if retry_count >= max_retries:
                 logger.info(f"Max retries ({max_retries}) reached, failing... (url={url})")
                 raise e
@@ -306,6 +374,8 @@ def _init_ray_distributed_post(args):
             retry_max_delay=1.0,
             retry_backoff_factor=1.0,
             retry_jitter=0.0,
+            retry_statuses=None,
+            non_retry_statuses=None,
         ):
             return await _post(
                 self._client,
@@ -316,6 +386,8 @@ def _init_ray_distributed_post(args):
                 retry_max_delay=retry_max_delay,
                 retry_backoff_factor=retry_backoff_factor,
                 retry_jitter=retry_jitter,
+                retry_statuses=set(retry_statuses) if retry_statuses is not None else None,
+                non_retry_statuses=set(non_retry_statuses) if non_retry_statuses is not None else None,
             )
 
     # Create actors per node
@@ -349,6 +421,8 @@ async def post(
     retry_max_delay: float = 1.0,
     retry_backoff_factor: float = 1.0,
     retry_jitter: float = 0.0,
+    retry_statuses: set[int] | None = None,
+    non_retry_statuses: set[int] | None = None,
 ):
     # If distributed mode is enabled and actors exist, dispatch via Ray.
     if _distributed_post_enabled and _post_actors:
@@ -366,6 +440,8 @@ async def post(
                     retry_max_delay,
                     retry_backoff_factor,
                     retry_jitter,
+                    sorted(retry_statuses) if retry_statuses is not None else None,
+                    sorted(non_retry_statuses) if non_retry_statuses is not None else None,
                 )
                 return await asyncio.to_thread(ray.get, obj_ref)
         except Exception as e:
@@ -381,6 +457,8 @@ async def post(
         retry_max_delay=retry_max_delay,
         retry_backoff_factor=retry_backoff_factor,
         retry_jitter=retry_jitter,
+        retry_statuses=retry_statuses,
+        non_retry_statuses=non_retry_statuses,
     )
 
 

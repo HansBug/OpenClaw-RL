@@ -25,6 +25,9 @@
 
 set -uo pipefail
 
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &>/dev/null && pwd)"
+REPO_ROOT="$(cd -- "${SCRIPT_DIR}/../.." &>/dev/null && pwd)"
+
 # ── 可调参数 ──────────────────────────────────────────────────────────
 MAX_RUNNING_CONTAINERS="${MAX_RUNNING_CONTAINERS:-80}"
 HARD_KILL_THRESHOLD="${HARD_KILL_THRESHOLD:-128}"
@@ -91,6 +94,13 @@ POOL_E2E_PROBE_INTERVAL="${POOL_E2E_PROBE_INTERVAL:-0}"
 POOL_E2E_PROBE_PAYLOAD_FILE="${POOL_E2E_PROBE_PAYLOAD_FILE:-}"
 POOL_E2E_PROBE_TIMEOUT="${POOL_E2E_PROBE_TIMEOUT:-600}"
 POOL_E2E_PROBE_FAILS_RESTART="${POOL_E2E_PROBE_FAILS_RESTART:-2}"
+POOL_RESET_STORM_REPAIR="${POOL_RESET_STORM_REPAIR:-1}"
+POOL_RESET_STORM_MIN_RESETTING="${POOL_RESET_STORM_MIN_RESETTING:-32}"
+POOL_RESET_STORM_RATIO_PCT="${POOL_RESET_STORM_RATIO_PCT:-80}"
+POOL_RESET_STORM_MIN_AGE="${POOL_RESET_STORM_MIN_AGE:-390}"
+POOL_RESET_STORM_STUCK_CHECKS="${POOL_RESET_STORM_STUCK_CHECKS:-2}"
+POOL_RESET_STORM_REPAIR_LIMIT="${POOL_RESET_STORM_REPAIR_LIMIT:-64}"
+POOL_RESET_STORM_REPAIR_COOLDOWN_S="${POOL_RESET_STORM_REPAIR_COOLDOWN_S:-120}"
 BRIDGE_NETS_WARN="${BRIDGE_NETS_WARN:-200}"
 EMERGENCY_COOLDOWN_S="${EMERGENCY_COOLDOWN_S:-60}"
 POOL_SERVER_NAME_REGEX="${POOL_SERVER_NAME_REGEX:-openclaw_pool_server}"
@@ -120,6 +130,15 @@ DISK_INODE_EMERGENCY_PCT="${DISK_INODE_EMERGENCY_PCT:-90}"
 DISK_PRUNE_COOLDOWN_S="${DISK_PRUNE_COOLDOWN_S:-300}"
 DISK_BUILD_CACHE_UNTIL="${DISK_BUILD_CACHE_UNTIL:-12h}"
 WATCHDOG_AGGRESSIVE_IMAGE_PRUNE="${WATCHDOG_AGGRESSIVE_IMAGE_PRUNE:-0}"
+WATCHDOG_DOCKER_STORAGE_GC="${WATCHDOG_DOCKER_STORAGE_GC:-1}"
+DOCKER_GC_TRIGGER_USED_PCT="${DOCKER_GC_TRIGGER_USED_PCT:-85}"
+DOCKER_GC_TARGET_USED_PCT="${DOCKER_GC_TARGET_USED_PCT:-70}"
+DOCKER_GC_MIN_FREE_GB="${DOCKER_GC_MIN_FREE_GB:-${DISK_MIN_FREE_GB}}"
+DOCKER_GC_KEEP_PATTERNS="${DOCKER_GC_KEEP_PATTERNS:-ghcr.io/laude-institute/t-bench/*,ubuntu:*,python:*}"
+DOCKER_GC_PRUNE_VOLUMES="${DOCKER_GC_PRUNE_VOLUMES:-1}"
+DOCKER_GC_DRY_RUN="${DOCKER_GC_DRY_RUN:-0}"
+DOCKER_GC_DELETE_OLD_IMAGES="${DOCKER_GC_DELETE_OLD_IMAGES:-0}"
+DOCKER_GC_TIMEOUT="${DOCKER_GC_TIMEOUT:-900}"
 WATCHDOG_PRUNE_TIMEOUT="${WATCHDOG_PRUNE_TIMEOUT:-120}"
 POOL_STOP_ON_DISK_EMERGENCY="${POOL_STOP_ON_DISK_EMERGENCY:-1}"
 POOL_STOP_COOLDOWN_S="${POOL_STOP_COOLDOWN_S:-300}"
@@ -234,6 +253,12 @@ POOL_RESTART_COOLDOWN_S="$(nonnegative_int_or_default POOL_RESTART_COOLDOWN_S "$
 POOL_E2E_PROBE_INTERVAL="$(nonnegative_int_or_default POOL_E2E_PROBE_INTERVAL "${POOL_E2E_PROBE_INTERVAL}" 0)"
 POOL_E2E_PROBE_TIMEOUT="$(positive_int_or_default POOL_E2E_PROBE_TIMEOUT "${POOL_E2E_PROBE_TIMEOUT}" 600)"
 POOL_E2E_PROBE_FAILS_RESTART="$(positive_int_or_default POOL_E2E_PROBE_FAILS_RESTART "${POOL_E2E_PROBE_FAILS_RESTART}" 2)"
+POOL_RESET_STORM_MIN_RESETTING="$(positive_int_or_default POOL_RESET_STORM_MIN_RESETTING "${POOL_RESET_STORM_MIN_RESETTING}" 32)"
+POOL_RESET_STORM_RATIO_PCT="$(positive_int_or_default POOL_RESET_STORM_RATIO_PCT "${POOL_RESET_STORM_RATIO_PCT}" 80)"
+POOL_RESET_STORM_MIN_AGE="$(positive_int_or_default POOL_RESET_STORM_MIN_AGE "${POOL_RESET_STORM_MIN_AGE}" 390)"
+POOL_RESET_STORM_STUCK_CHECKS="$(positive_int_or_default POOL_RESET_STORM_STUCK_CHECKS "${POOL_RESET_STORM_STUCK_CHECKS}" 2)"
+POOL_RESET_STORM_REPAIR_LIMIT="$(positive_int_or_default POOL_RESET_STORM_REPAIR_LIMIT "${POOL_RESET_STORM_REPAIR_LIMIT}" 64)"
+POOL_RESET_STORM_REPAIR_COOLDOWN_S="$(positive_int_or_default POOL_RESET_STORM_REPAIR_COOLDOWN_S "${POOL_RESET_STORM_REPAIR_COOLDOWN_S}" 120)"
 
 docker_alive() {
     timeout 3 curl -fsS --max-time 2 \
@@ -505,6 +530,33 @@ repair_stuck_pool_pending_closes() {
         fi
         rm -f "${repair_tmp}" 2>/dev/null || true
     fi
+}
+
+repair_pool_reset_storm() {
+    local resetting="$1"
+    local active="$2"
+    local max_age="$3"
+    local now repair_tmp repair_code
+
+    [ "${POOL_RESET_STORM_REPAIR}" = "1" ] || return 0
+    now=$(date +%s)
+    if [ $((now - LAST_POOL_RESET_STORM_REPAIR_TS)) -lt "${POOL_RESET_STORM_REPAIR_COOLDOWN_S}" ]; then
+        log "POOL_RESET_REPAIR suppressed (cooldown ${POOL_RESET_STORM_REPAIR_COOLDOWN_S}s active): resetting=${resetting} active=${active} max_age=${max_age}s"
+        return 0
+    fi
+    LAST_POOL_RESET_STORM_REPAIR_TS="$now"
+
+    repair_tmp="$(mktemp /tmp/pool_reset_repair.XXXXXX 2>/dev/null || echo /tmp/pool_reset_repair.$$)"
+    repair_code=$(timeout 15 curl -sS --noproxy '*' -o "${repair_tmp}" -w '%{http_code}' \
+        -X POST -H 'Content-Type: application/json' \
+        --data "{\"reason\":\"watchdog_reset_storm\",\"min_age\":${POOL_RESET_STORM_MIN_AGE},\"max_repairs\":${POOL_RESET_STORM_REPAIR_LIMIT},\"wait_for_cleanup\":false}" \
+        "http://${POOL_HOST}:${POOL_PORT}/repair/resetting_runs" 2>/dev/null || echo "000")
+    if [ "${repair_code}" = "200" ]; then
+        log "POOL_RESET_REPAIR: response: $(head -c 500 "${repair_tmp}" 2>/dev/null)"
+    else
+        log "POOL_RESET_REPAIR: failed HTTP ${repair_code}: $(head -c 500 "${repair_tmp}" 2>/dev/null)"
+    fi
+    rm -f "${repair_tmp}" 2>/dev/null || true
 }
 
 # ── 紧急泄压（带冷却 + foreground + timeout）─────────────────────────
@@ -792,9 +844,13 @@ monitor_pod_cgroup() {
 # 供 heartbeat 复用，不重新发起 HTTP/docker 调用。
 LAST_POOL_ACTIVE="?"
 LAST_POOL_PENDING="?"
+LAST_POOL_RESETTING="?"
+LAST_POOL_RESET_MAX_AGE="?"
 LAST_POOL_PROTECTED_COUNT=0
 LAST_BRIDGE_NETS="?"
 LAST_POOL_STATUS_TS=0
+POOL_RESET_STORM_HIGH_COUNT=0
+LAST_POOL_RESET_STORM_REPAIR_TS=0
 check_pool_server() {
     local ready_tmp ready_code ready_path ready_failed=0
     ready_path="/readyz"
@@ -810,6 +866,8 @@ check_pool_server() {
         log "WARN: pool_server ${ready_path} unreachable"
         LAST_POOL_ACTIVE="down"
         LAST_POOL_PENDING="down"
+        LAST_POOL_RESETTING="down"
+        LAST_POOL_RESET_MAX_AGE="down"
         LAST_POOL_PROTECTED_COUNT=0
         LAST_POOL_STATUS_TS=0
         : > "${WATCHDOG_PROTECTED_IDS_FILE}" 2>/dev/null || true
@@ -824,7 +882,7 @@ check_pool_server() {
     fi
     rm -f "$ready_tmp" 2>/dev/null || true
 
-    local body pending=0 active=0 active_tasks=0 active_runs=0 protected_count=0
+    local body pending=0 active=0 active_tasks=0 active_runs=0 protected_count=0 resetting=0 reset_max_age=0
     body=$(timeout 3 curl -fsS --noproxy '*' "http://${POOL_HOST}:${POOL_PORT}/status" 2>/dev/null)
     if [ -n "$body" ]; then
         local status_tmp ids_tmp names_tmp trials_tmp parsed
@@ -855,6 +913,9 @@ try:
     pending = int(pool.get("pending_closes", 0) or 0)
     active_tasks = int(pool.get("active_tasks", 0) or 0)
     active_runs = int(pool.get("total_active_runs", 0) or 0)
+    phase_counts = pool.get("phase_counts", {})
+    resetting = int(phase_counts.get("resetting", 0) or 0) if isinstance(phase_counts, dict) else 0
+    reset_max_age = 0.0
 
     ids = clean_values(pool.get("active_container_ids", []))
     names = clean_values(pool.get("active_container_names", []))
@@ -871,6 +932,11 @@ try:
                 if not isinstance(run_info, dict):
                     continue
                 container = run_info.get("container", {})
+                if run_info.get("phase") == "resetting":
+                    try:
+                        reset_max_age = max(reset_max_age, float(run_info.get("reset_age_sec", 0) or 0))
+                    except Exception:
+                        pass
                 if not isinstance(container, dict):
                     continue
                 ids.update(clean_values([container.get("id"), container.get("short_id")]))
@@ -882,12 +948,12 @@ try:
             for value in sorted(values):
                 fh.write(value + "\n")
     protected_count = max(len(ids), len(names), len(trials), active_runs)
-    print("OK", pending, active_tasks, active_runs, protected_count)
+    print("OK", pending, active_tasks, active_runs, protected_count, resetting, int(reset_max_age))
 except Exception:
     for path in (ids_path, names_path, trials_path):
         with open(path, "w", encoding="utf-8") as fh:
             pass
-    print("ERR 0 0 0 0")
+    print("ERR 0 0 0 0 0 0")
 PY
 )
         set -- ${parsed}
@@ -896,6 +962,8 @@ PY
             active_tasks="${3:-0}"
             active_runs="${4:-0}"
             protected_count="${5:-0}"
+            resetting="${6:-0}"
+            reset_max_age="${7:-0}"
             active="${active_runs}"
             pending="${pending:-0}"
             active="${active:-0}"
@@ -904,6 +972,8 @@ PY
             mv -f "$trials_tmp" "${WATCHDOG_PROTECTED_TRIALS_FILE}" 2>/dev/null || cp "$trials_tmp" "${WATCHDOG_PROTECTED_TRIALS_FILE}" 2>/dev/null || true
             LAST_POOL_PENDING="$pending"
             LAST_POOL_ACTIVE="$active"
+            LAST_POOL_RESETTING="$resetting"
+            LAST_POOL_RESET_MAX_AGE="$reset_max_age"
             LAST_POOL_PROTECTED_COUNT="$protected_count"
             LAST_POOL_STATUS_TS="$(date +%s)"
         else
@@ -912,6 +982,8 @@ PY
             : > "${WATCHDOG_PROTECTED_TRIALS_FILE}" 2>/dev/null || true
             LAST_POOL_ACTIVE="unknown"
             LAST_POOL_PENDING="unknown"
+            LAST_POOL_RESETTING="unknown"
+            LAST_POOL_RESET_MAX_AGE="unknown"
             LAST_POOL_PROTECTED_COUNT=0
             LAST_POOL_STATUS_TS=0
         fi
@@ -933,9 +1005,25 @@ PY
         else
             POOL_PENDING_HIGH_COUNT=0
         fi
+        if [ "${POOL_RESET_STORM_REPAIR}" = "1" ] \
+           && [ "$active" -gt 0 ] 2>/dev/null \
+           && [ "$resetting" -ge "$POOL_RESET_STORM_MIN_RESETTING" ] 2>/dev/null \
+           && [ "$reset_max_age" -ge "$POOL_RESET_STORM_MIN_AGE" ] 2>/dev/null \
+           && [ $((resetting * 100 / active)) -ge "$POOL_RESET_STORM_RATIO_PCT" ] 2>/dev/null; then
+            POOL_RESET_STORM_HIGH_COUNT=$((POOL_RESET_STORM_HIGH_COUNT + 1))
+            log "WARN: pool_server reset storm resetting=${resetting}/${active} max_age=${reset_max_age}s high_count=${POOL_RESET_STORM_HIGH_COUNT}/${POOL_RESET_STORM_STUCK_CHECKS}"
+            if [ "$POOL_RESET_STORM_HIGH_COUNT" -ge "$POOL_RESET_STORM_STUCK_CHECKS" ] 2>/dev/null; then
+                repair_pool_reset_storm "$resetting" "$active" "$reset_max_age"
+                POOL_RESET_STORM_HIGH_COUNT=0
+            fi
+        else
+            POOL_RESET_STORM_HIGH_COUNT=0
+        fi
     else
         LAST_POOL_ACTIVE="unknown"
         LAST_POOL_PENDING="unknown"
+        LAST_POOL_RESETTING="unknown"
+        LAST_POOL_RESET_MAX_AGE="unknown"
         LAST_POOL_PROTECTED_COUNT=0
         LAST_POOL_STATUS_TS=0
         : > "${WATCHDOG_PROTECTED_IDS_FILE}" 2>/dev/null || true
@@ -1065,17 +1153,40 @@ disk_prune_light() {
     timeout 30 docker network prune -f >/dev/null 2>&1 || true
     timeout "${WATCHDOG_PRUNE_TIMEOUT}" docker builder prune -af --filter "until=${DISK_BUILD_CACHE_UNTIL}" >/dev/null 2>&1 || true
     timeout 60 docker image prune -f >/dev/null 2>&1 || true
+    docker_storage_gc warn
+}
+
+docker_storage_gc() {
+    local reason="${1:-disk-pressure}"
+    [ "${WATCHDOG_DOCKER_STORAGE_GC}" = "1" ] || return 0
+    [ -f "${SCRIPT_DIR}/docker_storage_gc.py" ] || {
+        log "DISK: docker_storage_gc.py not found; skipping LRU image GC"
+        return 0
+    }
+    log "DISK: running Docker storage LRU GC (${reason}); trigger=${DOCKER_GC_TRIGGER_USED_PCT}% target=${DOCKER_GC_TARGET_USED_PCT}% min_free=${DOCKER_GC_MIN_FREE_GB}GB dry_run=${DOCKER_GC_DRY_RUN}"
+    timeout "${DOCKER_GC_TIMEOUT}" env \
+        DOCKER_DATA_ROOT="${DOCKER_DATA_ROOT}" \
+        DOCKER_GC_TRIGGER_USED_PCT="${DOCKER_GC_TRIGGER_USED_PCT}" \
+        DOCKER_GC_TARGET_USED_PCT="${DOCKER_GC_TARGET_USED_PCT}" \
+        DOCKER_GC_MIN_FREE_GB="${DOCKER_GC_MIN_FREE_GB}" \
+        DOCKER_GC_KEEP_PATTERNS="${DOCKER_GC_KEEP_PATTERNS}" \
+        DOCKER_GC_PRUNE_VOLUMES="${DOCKER_GC_PRUNE_VOLUMES}" \
+        DOCKER_GC_BUILDER_CACHE_UNTIL="${DISK_BUILD_CACHE_UNTIL}" \
+        DOCKER_GC_DRY_RUN="${DOCKER_GC_DRY_RUN}" \
+        DOCKER_GC_DELETE_OLD_IMAGES="${DOCKER_GC_DELETE_OLD_IMAGES}" \
+        python3 "${SCRIPT_DIR}/docker_storage_gc.py" || \
+        log "WARN: Docker storage LRU GC timed out or failed"
 }
 
 disk_prune_emergency() {
     local reason="$1"
     emergency_pressure_relief "Docker data-root disk pressure: ${reason}"
     disk_prune_light
-    if [ "${WATCHDOG_AGGRESSIVE_IMAGE_PRUNE}" = "1" ]; then
-        log "DISK: WATCHDOG_AGGRESSIVE_IMAGE_PRUNE=1, pruning all unused images"
+    if [ "${WATCHDOG_AGGRESSIVE_IMAGE_PRUNE}" = "1" ] && [ "${WATCHDOG_DOCKER_STORAGE_GC}" != "1" ]; then
+        log "DISK: WATCHDOG_AGGRESSIVE_IMAGE_PRUNE=1 and LRU GC disabled, pruning all unused images"
         timeout "${WATCHDOG_PRUNE_TIMEOUT}" docker image prune -af >/dev/null 2>&1 || true
     else
-        log "DISK: aggressive unused-image prune disabled; set WATCHDOG_AGGRESSIVE_IMAGE_PRUNE=1 to enable"
+        log "DISK: old-image cleanup handled by LRU GC; set WATCHDOG_DOCKER_STORAGE_GC=0 WATCHDOG_AGGRESSIVE_IMAGE_PRUNE=1 for legacy prune -af"
     fi
 
     local stats used_pct avail_gb inode_pct
@@ -1609,6 +1720,7 @@ log "  pool=${POOL_HOST}:${POOL_PORT}  pool_server_regex=${POOL_SERVER_NAME_REGE
 log "  pool_ready restart_failures=${POOL_READY_FAILS_RESTART} restart_active_max=${POOL_RESTART_ACTIVE_MAX} restart_cooldown=${POOL_RESTART_COOLDOWN_S}s stop_launcher=${WATCHDOG_STOP_POOL_LAUNCHER}"
 log "  pool_e2e interval=${POOL_E2E_PROBE_INTERVAL}s timeout=${POOL_E2E_PROBE_TIMEOUT}s fail_trigger=${POOL_E2E_PROBE_FAILS_RESTART} payload=${POOL_E2E_PROBE_PAYLOAD_FILE:-<unset>}"
 log "  pool_pending repair=${POOL_PENDING_CLOSES_REPAIR} warn=${POOL_PENDING_CLOSES_WARN} threshold=${POOL_PENDING_CLOSES_REPAIR_THRESHOLD} stuck_checks=${POOL_PENDING_CLOSES_STUCK_CHECKS} active_max=${POOL_PENDING_CLOSES_ACTIVE_MAX} reap_limit=${POOL_PENDING_CLOSES_REAP_LIMIT} cooldown=${POOL_PENDING_CLOSES_REPAIR_COOLDOWN_S}s cancel_api=${POOL_PENDING_CLOSES_CANCEL_API} cancel_timeout=${POOL_PENDING_CLOSES_CANCEL_TIMEOUT}s kill_when_active=${POOL_PENDING_CLOSES_KILL_CONTAINERS_WHEN_ACTIVE}"
+log "  pool_resetstorm repair=${POOL_RESET_STORM_REPAIR} min_resetting=${POOL_RESET_STORM_MIN_RESETTING} ratio=${POOL_RESET_STORM_RATIO_PCT}% min_age=${POOL_RESET_STORM_MIN_AGE}s stuck_checks=${POOL_RESET_STORM_STUCK_CHECKS} limit=${POOL_RESET_STORM_REPAIR_LIMIT} cooldown=${POOL_RESET_STORM_REPAIR_COOLDOWN_S}s"
 log "  task_container_regex=${TASK_CONTAINER_REGEX}"
 log "  task_image_regex=${TASK_IMAGE_REGEX}"
 log "  task_reap headroom=${WATCHDOG_REAP_HEADROOM} soft_batch=${WATCHDOG_SOFT_REAP_BATCH} hard_batch=${WATCHDOG_HARD_REAP_BATCH} soft_age=${WATCHDOG_STALE_MIN_AGE_SOFT}s pressure_age=${WATCHDOG_STALE_MIN_AGE_PRESSURE}s hard_age=${WATCHDOG_STALE_MIN_AGE_HARD}s stale_status_age=${WATCHDOG_STALE_STATUS_MIN_AGE}s low_cpu=${WATCHDOG_STALE_LOW_CPU_PCT}% low_mem=${WATCHDOG_STALE_LOW_MEM_MB}MiB stats_timeout=${WATCHDOG_STATS_TIMEOUT}s"
@@ -1772,7 +1884,7 @@ while true; do
 
     # 11) 低频心跳（默认 10 min）—— 复用上面已采集的指标，不发起新的 docker / curl
     if [ $((NOW - LAST_HEARTBEAT_TS)) -ge "${HEARTBEAT_INTERVAL}" ]; then
-        log "OK: dockerd alive | docker_cli=${LAST_DOCKER_CLI_STATUS} proxy=${LAST_PROXY_STATUS} | pids=${LAST_PIDS_CUR:-?}/${LAST_PIDS_MAX:-?} (${LAST_PIDS_PCT:-?}%) tasks=${LAST_PROC_TASKS:-?} zombies=${LAST_ZOMBIES:-?} shim=${LAST_SHIM_PROCS:-?} runc=${LAST_RUNC_PROCS:-?} | pool active=${LAST_POOL_ACTIVE} pending_closes=${LAST_POOL_PENDING} | bridges=${LAST_BRIDGE_NETS} | task_containers=${LAST_RUNNING_TASKS}"
+        log "OK: dockerd alive | docker_cli=${LAST_DOCKER_CLI_STATUS} proxy=${LAST_PROXY_STATUS} | pids=${LAST_PIDS_CUR:-?}/${LAST_PIDS_MAX:-?} (${LAST_PIDS_PCT:-?}%) tasks=${LAST_PROC_TASKS:-?} zombies=${LAST_ZOMBIES:-?} shim=${LAST_SHIM_PROCS:-?} runc=${LAST_RUNC_PROCS:-?} | pool active=${LAST_POOL_ACTIVE} pending_closes=${LAST_POOL_PENDING} resetting=${LAST_POOL_RESETTING} reset_max_age=${LAST_POOL_RESET_MAX_AGE}s | bridges=${LAST_BRIDGE_NETS} | task_containers=${LAST_RUNNING_TASKS}"
         LAST_HEARTBEAT_TS="$NOW"
     fi
 

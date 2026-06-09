@@ -583,6 +583,16 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 help="Multiplier applied to rollout generation retry backoff after each failure.",
             )
             parser.add_argument(
+                "--rollout-generation-env-storm-max-retries",
+                type=int,
+                default=3,
+                help=(
+                    "Maximum consecutive rollout-generation retries allowed when the error looks like "
+                    "an environment allocation storm, such as all dynamic-sampling groups failing, "
+                    "TASK_SLOTS_EXHAUSTED, or repeated /allocate failures. Use -1 to disable this circuit breaker."
+                ),
+            )
+            parser.add_argument(
                 "--rollout-generation-skip-on-failure",
                 action="store_true",
                 default=False,

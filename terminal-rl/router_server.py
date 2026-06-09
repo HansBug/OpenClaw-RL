@@ -78,6 +78,7 @@ class Router:
         self.forward_retry_backoff = max(0.0, float(forward_retry_backoff))
         self.pressure_cooldown = max(0.0, float(pressure_cooldown))
         self._unhealthy_until: dict[int, float] = {}
+        self._status_cache: dict[int, tuple[float, dict[str, Any], int]] = {}
         self._session: aiohttp.ClientSession | None = None
 
     @property
@@ -130,6 +131,69 @@ class Router:
             item for item in candidates if self._unhealthy_until.get(item[0], 0.0) > now
         ]
         return healthy + unhealthy if healthy else candidates
+
+    async def _worker_status_cached(
+        self, worker_idx: int, worker_url: str
+    ) -> tuple[dict[str, Any], int]:
+        ttl = _env_float("ROUTER_LOAD_STATUS_CACHE_TTL", 2.0)
+        now = time.monotonic()
+        cached = self._status_cache.get(worker_idx)
+        if cached is not None and now - cached[0] <= ttl:
+            return cached[1], cached[2]
+        timeout = _env_float("ROUTER_LOAD_STATUS_TIMEOUT", 2.0)
+        data, status = await self.worker_status(worker_url, timeout=timeout)
+        self._status_cache[worker_idx] = (now, data, status)
+        return data, status
+
+    @staticmethod
+    def _worker_load_score(data: dict[str, Any], status: int) -> float:
+        if status >= 500 or not data.get("ok", False):
+            return 1_000_000.0 + status
+        pool = data.get("pool", {})
+        if not isinstance(pool, dict):
+            return 900_000.0
+        try:
+            max_tasks = int(pool.get("max_tasks", 1) or 1)
+            max_runs_per_task = int(pool.get("max_runs_per_task", 1) or 1)
+            total_runs = int(pool.get("total_active_runs", 0) or 0)
+            pending = int(pool.get("pending_closes", 0) or 0)
+            stale = len(pool.get("stale_runs", []) or [])
+            phase_counts = pool.get("phase_counts", {})
+            resetting = int(phase_counts.get("resetting", 0) or 0) if isinstance(phase_counts, dict) else 0
+        except (TypeError, ValueError):
+            return 800_000.0
+        capacity = max(1, max_tasks * max_runs_per_task)
+        util = total_runs / capacity
+        reset_ratio = resetting / max(1, total_runs)
+        return util * 100.0 + reset_ratio * 100.0 + pending * 2.0 + stale * 50.0
+
+    async def iter_worker_candidates_for_allocate(
+        self, start_idx: int
+    ) -> list[tuple[int, str]]:
+        candidates = self.iter_worker_candidates(start_idx)
+        if os.getenv("ROUTER_LOAD_AWARE_ALLOCATE", "1") != "1" or len(candidates) <= 1:
+            return candidates
+
+        async def _score(pos: int, item: tuple[int, str]) -> tuple[float, int, tuple[int, str]]:
+            worker_idx, worker_url = item
+            if self._unhealthy_until.get(worker_idx, 0.0) > time.monotonic():
+                return 1_100_000.0, pos, item
+            try:
+                data, status = await self._worker_status_cached(worker_idx, worker_url)
+                return self._worker_load_score(data, status), pos, item
+            except Exception as exc:
+                logger.warning(
+                    "Load-aware status failed for worker_idx=%d url=%s err=%s",
+                    worker_idx,
+                    worker_url,
+                    _format_error(exc),
+                )
+                return 1_000_000.0, pos, item
+
+        scored = await asyncio.gather(
+            *[_score(pos, item) for pos, item in enumerate(candidates)]
+        )
+        return [item for _score_value, _pos, item in sorted(scored, key=lambda x: (x[0], x[1]))]
 
     def mark_worker_unhealthy(self, worker_idx: int, reason: str) -> None:
         if self.pressure_cooldown <= 0:
@@ -370,7 +434,8 @@ async def allocate(request: Request) -> JSONResponse:
         payload = {"task_key": task_key, "request_id": request_id}
         primary_idx, _ = ROUTER.select_worker(str(task_key))
         upstream_errors: list[dict[str, Any]] = []
-        for worker_idx, worker_url in ROUTER.iter_worker_candidates(primary_idx):
+        candidates = await ROUTER.iter_worker_candidates_for_allocate(primary_idx)
+        for worker_idx, worker_url in candidates:
             try:
                 result, code = await ROUTER.forward(worker_url, "/allocate", payload)
                 if result.get("ok") and "lease_id" in result:

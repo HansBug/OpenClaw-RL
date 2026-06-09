@@ -132,8 +132,8 @@ case "${HARNESS_OPTION}" in
     ;;
 esac
 SETA_SAFETY="${SETA_SAFETY:-none}"
-SAFETY_BENCH_REWARD="${SAFETY_BENCH_REWARD:-rule}"
-AGENTHARM_REWARD="${AGENTHARM_REWARD:-rule}"
+SAFETY_BENCH_REWARD="${SAFETY_BENCH_REWARD:-dense_rule}"
+AGENTHARM_REWARD="${AGENTHARM_REWARD:-dense_rule}"
 SAFETY_REWARD_COEF="${SAFETY_REWARD_COEF:-0}"
 MAX_TURN="${MAX_TURN:-10}"
 DAPO_EPS_CLIP_HIGH="${DAPO_EPS_CLIP_HIGH:-0.28}"
@@ -331,7 +331,8 @@ TERMINAL_SAVE_TRAJ_DIR="${RUN_DIR}/trajectories"
 WANDB_DIR="${RUN_DIR}/metrics/wandb"
 TERMINAL_STRUCTURED_METRICS="${TERMINAL_STRUCTURED_METRICS:-1}"
 TERMINAL_METRICS_JSONL="${TERMINAL_METRICS_JSONL:-${RUN_LOG_DIR}/metrics.jsonl}"
-export TERMINAL_STRUCTURED_METRICS TERMINAL_METRICS_JSONL
+TERMINAL_WANDB_METRIC_PROFILE="${TERMINAL_WANDB_METRIC_PROFILE:-full}"
+export TERMINAL_STRUCTURED_METRICS TERMINAL_METRICS_JSONL TERMINAL_WANDB_METRIC_PROFILE
 TRAIN_PYTHON="${TRAIN_PYTHON:-python3}"
 A3S_CODE_REPO_ROOT="${A3S_CODE_REPO_ROOT:-/mnt/shared-storage-user/puyuan/code/Code}"
 A3S_CODE_CONFIG_PATH="${A3S_CODE_CONFIG_PATH:-${REPO_ROOT}/a3s-code-adapter/generated_configs/a3s-code-shared.hcl}"
@@ -508,7 +509,6 @@ fi
 # Symlinks for backward compatibility. Dry-run avoids touching stable repo links.
 if [[ "${DRY_RUN}" != "1" ]]; then
   ln -sfn "${RUN_DIR}" "${RUNS_ROOT}/latest" 2>/dev/null || true
-  ln -sfn "${RUN_DIR}" "${REPO_ROOT}/tmp_doc_latest" 2>/dev/null || true
   # Keep old logs/latest symlink for tools that expect it
   LOG_BASE="${SCRIPT_DIR}/logs"
   mkdir -p "${LOG_BASE}" 2>/dev/null || true
@@ -537,32 +537,33 @@ fi
 RUN_LOG="${RUN_LOG_DIR}/train.log"
 
 # ── Auto-mirror logs to a stable path that Claude can Read directly ──
-# Two-tier scheme:
-#   tmp_doc_latest/   → always the current run's logs (symlinks)
-#   tmp_doc_<ts>/     → per-run snapshot (kept for history)
-# Both live under the repo root so they're on shared storage (visible from
-# CPU worker too, useful if you want to grep both sides at once).
-if [[ "${DRY_RUN}" == "1" ]]; then
-  TMP_DOC_ROOT="${RUN_DIR}/tmp_doc_${RUN_TIMESTAMP}"
-  TMP_DOC_LATEST="${TMP_DOC_ROOT}"
-  mkdir -p "${TMP_DOC_ROOT}"
-else
-  TMP_DOC_ROOT="${REPO_ROOT}/tmp_doc_${RUN_TIMESTAMP}"
-  TMP_DOC_LATEST="${REPO_ROOT}/tmp_doc_latest"
-  mkdir -p "${TMP_DOC_ROOT}"
-  ln -sfn "${TMP_DOC_ROOT}" "${TMP_DOC_LATEST}"
-fi
+# Canonical logs live under runs/<run>/.  The repo-root tmp_doc_latest path is
+# kept only as a compatibility symlink to the current run directory, so legacy
+# tmp_doc_latest/remote_logs also resolves under runs/<run>/remote_logs.  New
+# tmp_doc_<timestamp> directories are no longer created at the repo root.
+TMP_DOC_ROOT="${RUN_LOG_DIR}/mirror"
+TMP_DOC_LATEST="${TMP_DOC_ROOT}"
+mkdir -p "${TMP_DOC_ROOT}"
 
 GPU_RUN_LOG="${TMP_DOC_ROOT}/gpu_run.log"      # full stdout/stderr
 GPU_ERR_LOG="${TMP_DOC_ROOT}/gpu_err.log"      # filtered errors (populated on failure)
 GPU_TAIL_LOG="${TMP_DOC_ROOT}/gpu_tail.log"    # last ~300 lines (populated on failure)
+if [[ "${DRY_RUN}" != "1" ]]; then
+  TMP_DOC_LATEST="${REPO_ROOT}/tmp_doc_latest"
+  if ! ln -sfnT "${RUN_DIR}" "${TMP_DOC_LATEST}" 2>/dev/null; then
+    echo "[WARN] Could not update ${TMP_DOC_LATEST}; existing non-symlink directory may need manual archival."
+  fi
+  ln -sfnT "${GPU_RUN_LOG}" "${RUN_DIR}/gpu_run.log" 2>/dev/null || true
+  ln -sfnT "${GPU_ERR_LOG}" "${RUN_DIR}/gpu_err.log" 2>/dev/null || true
+  ln -sfnT "${GPU_TAIL_LOG}" "${RUN_DIR}/gpu_tail.log" 2>/dev/null || true
+fi
 
 # Tee everything to both the run-specific file and tmp_doc copy
 exec > >(tee -a "${RUN_LOG}" "${GPU_RUN_LOG}") 2>&1
 echo "========================================"
 echo "  Terminal-RL Run: ${RUN_NAME}"
 echo "  Log dir:  ${RUN_LOG_DIR}"
-echo "  Metrics:  ${TERMINAL_METRICS_JSONL} (structured=${TERMINAL_STRUCTURED_METRICS})"
+echo "  Metrics:  ${TERMINAL_METRICS_JSONL} (structured=${TERMINAL_STRUCTURED_METRICS}, wandb=${TERMINAL_WANDB_METRIC_PROFILE})"
 echo "  Harness:  ${HARNESS_OPTION}"
 echo "  Ckpt:     ${SAVE_CKPT:-<disabled>}"
 echo "  HF_CKPT:  ${HF_CKPT}"
@@ -1633,6 +1634,7 @@ cat > "${RUN_DIR}/config/run_config.json" <<CFGEOF
   "clawsentry_evolving_enabled": "${CS_EVOLVING_ENABLED}",
   "terminal_structured_metrics": "${TERMINAL_STRUCTURED_METRICS}",
   "terminal_metrics_jsonl": "${TERMINAL_METRICS_JSONL}",
+  "terminal_wandb_metric_profile": "${TERMINAL_WANDB_METRIC_PROFILE}",
   "train_python": "${TRAIN_PYTHON}",
   "a3s_code_repo_root": "${A3S_CODE_REPO_ROOT}",
   "a3s_code_config_path": "${A3S_CODE_CONFIG_PATH}",
@@ -1759,6 +1761,7 @@ RUNTIME_ENV_JSON="{
     \"RUN_LOG_DIR\": \"${RUN_LOG_DIR}\",
     \"TERMINAL_STRUCTURED_METRICS\": \"${TERMINAL_STRUCTURED_METRICS}\",
     \"TERMINAL_METRICS_JSONL\": \"${TERMINAL_METRICS_JSONL}\",
+    \"TERMINAL_WANDB_METRIC_PROFILE\": \"${TERMINAL_WANDB_METRIC_PROFILE}\",
     \"HARNESS_OPTION\": \"${HARNESS_OPTION}\",
     \"DATASET\": \"${DATASET}\",
     \"ALGO\": \"${ALGO}\",
@@ -1931,7 +1934,7 @@ if [[ "${RAY_STATUS_LOWER}" == *"succeeded"* ]]; then
 fi
 
 # ── Failure auto-capture ─────────────────────────────────────────────
-# Generate two condensed artifacts under tmp_doc_latest/ for easy inspection:
+# Generate two condensed artifacts under the run-contained log mirror:
 #   gpu_tail.log : last 300 lines (often enough to see the actual stack)
 #   gpu_err.log  : grep-filtered "real" error lines (CUDA/OOM/Exception/etc.)
 log "Ray job failed (logs exit: ${RAY_LOG_EXIT}). Writing condensed artifacts..."
@@ -1949,7 +1952,7 @@ cat <<EOF
     full   : ${GPU_RUN_LOG}
     errors : ${GPU_ERR_LOG}
     tail   : ${GPU_TAIL_LOG}
-    latest : ${TMP_DOC_LATEST}/  (symlink → ${TMP_DOC_ROOT##*/})
+    latest : ${TMP_DOC_LATEST}/
 ========================================
 EOF
 run_case_study_if_requested failure

@@ -20,19 +20,55 @@ def _env_float(name: str, default: float) -> float:
         return default
 
 
+def _env_int(name: str, default: int) -> int:
+    raw = os.getenv(name)
+    if raw is None or raw == "":
+        return default
+    try:
+        return int(raw)
+    except ValueError:
+        logger.warning("Invalid %s=%r; using %s", name, raw, default)
+        return default
+
+
+def _env_status_set(name: str, default: str) -> set[int]:
+    raw = os.getenv(name, default)
+    out: set[int] = set()
+    for part in raw.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        try:
+            out.add(int(part))
+        except ValueError:
+            logger.warning("Invalid HTTP status %r in %s=%r", part, name, raw)
+    return out
+
+
 class TerminalEnvClient:
 
     def __init__(self, base_url: str):
         self.base_url = base_url.rstrip("/")
-        self.default_max_retries = int(os.getenv("ENV_HTTP_MAX_RETRIES", "10"))
-        self.allocate_max_retries = int(os.getenv("ENV_ALLOCATE_MAX_RETRIES", "100"))
+        self.default_max_retries = _env_int("ENV_HTTP_MAX_RETRIES", 10)
+        self.allocate_max_retries = _env_int("ENV_ALLOCATE_MAX_RETRIES", 100)
         self.allocate_retry_base_delay = _env_float("ENV_ALLOCATE_RETRY_BASE_DELAY", 2.0)
         self.allocate_retry_max_delay = _env_float("ENV_ALLOCATE_RETRY_MAX_DELAY", 30.0)
         self.allocate_retry_backoff = _env_float("ENV_ALLOCATE_RETRY_BACKOFF", 2.0)
         self.allocate_retry_jitter = _env_float("ENV_ALLOCATE_RETRY_JITTER", 0.25)
-        self.evaluate_max_retries = int(os.getenv("ENV_EVALUATE_MAX_RETRIES", "1"))
-        self.close_max_retries = int(os.getenv("ENV_CLOSE_MAX_RETRIES", "3"))
-        self.exec_tool_max_retries = int(os.getenv("ENV_EXEC_TOOL_MAX_RETRIES", "3"))
+        self.reset_max_retries = _env_int("ENV_RESET_MAX_RETRIES", 2)
+        self.reset_retry_base_delay = _env_float("ENV_RESET_RETRY_BASE_DELAY", 1.0)
+        self.reset_retry_max_delay = _env_float("ENV_RESET_RETRY_MAX_DELAY", 5.0)
+        self.reset_retry_backoff = _env_float("ENV_RESET_RETRY_BACKOFF", 2.0)
+        self.reset_retry_jitter = _env_float("ENV_RESET_RETRY_JITTER", 0.2)
+        self.reset_retry_statuses = _env_status_set(
+            "ENV_RESET_RETRY_STATUSES", "429,502,503,504"
+        )
+        self.reset_non_retry_statuses = _env_status_set(
+            "ENV_RESET_NON_RETRY_STATUSES", "400,404,409,500"
+        )
+        self.evaluate_max_retries = _env_int("ENV_EVALUATE_MAX_RETRIES", 1)
+        self.close_max_retries = _env_int("ENV_CLOSE_MAX_RETRIES", 3)
+        self.exec_tool_max_retries = _env_int("ENV_EXEC_TOOL_MAX_RETRIES", 3)
         self.last_evaluate_details: dict[str, Any] | None = None
 
     async def allocate(
@@ -68,6 +104,7 @@ class TerminalEnvClient:
         task_meta: dict[str, Any],
         run_ctx: dict[str, Any],
         task_timeouts: dict[str, Any] | None = None,
+        request_id: str | None = None,
     ) -> dict[str, Any]:
         out = await post(
             f"{self.base_url}/reset",
@@ -76,8 +113,15 @@ class TerminalEnvClient:
                 "task_meta": task_meta,
                 "run_ctx": run_ctx,
                 "task_timeouts": task_timeouts,
+                "request_id": request_id,
             },
-            max_retries=self.default_max_retries,
+            max_retries=self.reset_max_retries,
+            retry_base_delay=self.reset_retry_base_delay,
+            retry_max_delay=self.reset_retry_max_delay,
+            retry_backoff_factor=self.reset_retry_backoff,
+            retry_jitter=self.reset_retry_jitter,
+            retry_statuses=self.reset_retry_statuses,
+            non_retry_statuses=self.reset_non_retry_statuses,
         )
         if not out.get("ok", False):
             raise RuntimeError(f"reset failed: {out}")

@@ -293,6 +293,38 @@ def test_close_during_reset_is_deferred_until_in_flight_finishes(monkeypatch, tm
     asyncio.run(_case())
 
 
+def test_close_during_reset_force_releases_after_delay(monkeypatch, tmp_path):
+    async def _case():
+        pool_server = _install_import_stubs(monkeypatch)
+        monkeypatch.setenv("WORKER_CLOSE_REQUESTED_FORCE_RELEASE_AFTER", "0")
+        env = _DummyEnv()
+        pool = _new_pool(pool_server, env, tmp_path)
+
+        lease = await pool.allocate("task")
+        lease_id = lease["lease_id"]
+        reset_task = asyncio.create_task(
+            pool.reset(
+                lease_id,
+                {"task_name": "task", "task_path": "task", "instruction": "do it"},
+                {"uid": "u1", "log_dir": str(tmp_path)},
+            )
+        )
+        await env.reset_started.wait()
+
+        assert await pool.close_run(lease_id, reason="test_close") is True
+        await asyncio.sleep(0)
+        if pool._force_cleanup_tasks:
+            await asyncio.gather(*pool._force_cleanup_tasks, return_exceptions=True)
+
+        assert lease_id not in pool._run_to_task
+        assert env.force_cleanup_reason == "close_requested_force_release:test_close"
+
+        reset_task.cancel()
+        await asyncio.gather(reset_task, return_exceptions=True)
+
+    asyncio.run(_case())
+
+
 def test_status_and_readyz_report_stale_allocated_run(monkeypatch, tmp_path):
     async def _case():
         pool_server = _install_import_stubs(monkeypatch)
@@ -317,6 +349,55 @@ def test_status_and_readyz_report_stale_allocated_run(monkeypatch, tmp_path):
         response = await pool_server.readyz()
         assert response.status_code == 503
         assert response["code"] == "WORKER_STALE_RUNS"
+
+    asyncio.run(_case())
+
+
+def test_allocate_auto_repairs_close_requested_task_capacity(monkeypatch, tmp_path):
+    async def _case():
+        pool_server = _install_import_stubs(monkeypatch)
+        monkeypatch.setenv("WORKER_DISK_GUARD_ENABLED", "0")
+        monkeypatch.setenv("WORKER_PRESSURE_GUARD_ENABLED", "0")
+        monkeypatch.setenv("WORKER_AUTO_REPAIR_ON_CAPACITY", "1")
+        env = _DummyEnv()
+
+        class OneTaskPool(pool_server.WorkerPool):
+            def _new_env(self):
+                return env
+
+        pool = OneTaskPool(
+            max_tasks=1,
+            max_runs_per_task=4,
+            run_idle_ttl=1,
+            output_root=str(tmp_path),
+            default_timeouts=_TaskTimeouts(),
+            max_concurrent_closes=2,
+        )
+        pool_server.POOL = pool
+
+        old_lease = (await pool.allocate("old-task"))["lease_id"]
+        async with pool._lock:
+            old_slot = pool._get_run_slot(old_lease)
+            old_slot.phase = "closing_requested"
+            old_slot.close_requested = True
+            old_slot.close_reason = "test"
+            old_slot.close_requested_ts = time.time() - 5
+            old_slot.in_flight_ops = 1
+            old_slot.active_op = "reset"
+
+        async def _payload(_request):
+            return {"task_key": "new-task"}
+
+        pool_server.json_payload = _payload
+        response = await pool_server.allocate(object())
+
+        assert response.status_code == 200
+        assert response["ok"] is True
+        assert response["auto_repair"]["close_requested"]["repaired_count"] == 1
+        assert old_lease not in pool._run_to_task
+        assert response["lease_id"] in pool._run_to_task
+        if pool._force_cleanup_tasks:
+            await asyncio.gather(*pool._force_cleanup_tasks, return_exceptions=True)
 
     asyncio.run(_case())
 

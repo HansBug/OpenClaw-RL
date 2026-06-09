@@ -998,6 +998,31 @@ async def eval_rollout_single_dataset(
         spaces_between_special_tokens=False,
     )
 
+    eval_max_concurrency = int(
+        os.getenv("EVAL_ROLLOUT_MAX_CONCURRENCY", "0") or 0
+    )
+    eval_semaphore = (
+        asyncio.Semaphore(eval_max_concurrency) if eval_max_concurrency > 0 else None
+    )
+
+    async def _generate_eval_sample(
+        sample: Sample, sampling_params: dict[str, Any]
+    ) -> list[Sample]:
+        if eval_semaphore is None:
+            return await generate_and_rm(
+                args,
+                sample,
+                sampling_params=sampling_params,
+                evaluation=True,
+            )
+        async with eval_semaphore:
+            return await generate_and_rm(
+                args,
+                sample,
+                sampling_params=sampling_params,
+                evaluation=True,
+            )
+
     tasks = []
     # do multiple samples for eval prompts
     sample_index = 0
@@ -1016,12 +1041,7 @@ async def eval_rollout_single_dataset(
                 sampling_params["sampling_seed"] = args.rollout_seed + j
             tasks.append(
                 asyncio.create_task(
-                    generate_and_rm(
-                        args,
-                        sample,
-                        sampling_params=sampling_params,
-                        evaluation=True,
-                    )
+                    _generate_eval_sample(sample, sampling_params=sampling_params)
                 )
             )
 

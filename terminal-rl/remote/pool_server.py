@@ -98,6 +98,15 @@ class ResourcePressureError(Exception):
         super().__init__(message)
 
 
+class ResetInProgressError(Exception):
+    def __init__(self, run_lease_id: str, request_id: str | None):
+        self.run_lease_id = run_lease_id
+        self.request_id = request_id
+        super().__init__(
+            f"Run {run_lease_id} already has a different reset in progress"
+        )
+
+
 def _env_float(name: str, default: float) -> float:
     raw = os.getenv(name)
     if raw is None or raw == "":
@@ -460,6 +469,9 @@ class RunSlot:
     close_requested_ts: float | None = None
     reset_started_ts: float | None = None
     reset_completed_ts: float | None = None
+    reset_request_id: str | None = None
+    reset_future: asyncio.Task | None = None
+    reset_result: dict[str, Any] | None = None
     first_step_ts: float | None = None
     evaluate_completed_ts: float | None = None
 
@@ -505,6 +517,10 @@ class WorkerPool:
         self._closing_tasks: set[asyncio.Task] = set()
         self._closing_task_started: dict[asyncio.Task, float] = {}
         self._closing_task_labels: dict[asyncio.Task, str] = {}
+        self._force_cleanup_tasks: set[asyncio.Task] = set()
+        self._force_cleanup_task_started: dict[asyncio.Task, float] = {}
+        self._force_cleanup_task_labels: dict[asyncio.Task, str] = {}
+        self._close_requested_release_tasks: dict[str, asyncio.Task] = {}
 
     def _new_env(self) -> TerminalEnv:
         return TerminalEnv()
@@ -652,6 +668,14 @@ class WorkerPool:
             self._closing_task_labels.pop(task, None)
         return len(done)
 
+    def _prune_done_force_cleanup_tasks(self) -> int:
+        done = {task for task in self._force_cleanup_tasks if task.done()}
+        self._force_cleanup_tasks.difference_update(done)
+        for task in done:
+            self._force_cleanup_task_started.pop(task, None)
+            self._force_cleanup_task_labels.pop(task, None)
+        return len(done)
+
     async def _close_run_slot_with_semaphore(self, run_slot: RunSlot) -> None:
         async with self._close_sem:
             await self._close_run_slot_under_lock(run_slot)
@@ -742,6 +766,108 @@ class WorkerPool:
             self._closing_task_labels.pop(done_task, None)
 
         task.add_done_callback(_on_done)
+
+    def _schedule_force_cleanup_slots(
+        self, slots: list[tuple[str, str, RunSlot]], *, reason: str
+    ) -> None:
+        if not slots:
+            return
+        task = asyncio.create_task(self._force_cleanup_slots(slots, reason=reason))
+        self._force_cleanup_tasks.add(task)
+        self._force_cleanup_task_started[task] = time.time()
+        self._force_cleanup_task_labels[task] = (
+            f"{reason} leases={','.join(rid for _tk, rid, _slot in slots[:8])}"
+        )
+
+        def _on_done(done_task: asyncio.Task) -> None:
+            self._force_cleanup_tasks.discard(done_task)
+            self._force_cleanup_task_started.pop(done_task, None)
+            self._force_cleanup_task_labels.pop(done_task, None)
+
+        task.add_done_callback(_on_done)
+
+    def _schedule_close_requested_force_release(
+        self, run_lease_id: str, *, reason: str
+    ) -> None:
+        if os.getenv("WORKER_CLOSE_REQUESTED_FORCE_RELEASE", "1") != "1":
+            return
+        existing = self._close_requested_release_tasks.get(run_lease_id)
+        if existing is not None and not existing.done():
+            return
+        delay = max(
+            0.0, _env_float("WORKER_CLOSE_REQUESTED_FORCE_RELEASE_AFTER", 30.0)
+        )
+        task = asyncio.create_task(
+            self._force_release_close_requested_after_delay(
+                run_lease_id,
+                reason=reason,
+                delay=delay,
+            )
+        )
+        self._close_requested_release_tasks[run_lease_id] = task
+
+        def _on_done(done_task: asyncio.Task) -> None:
+            current = self._close_requested_release_tasks.get(run_lease_id)
+            if current is done_task:
+                self._close_requested_release_tasks.pop(run_lease_id, None)
+
+        task.add_done_callback(_on_done)
+
+    async def _force_release_close_requested_after_delay(
+        self, run_lease_id: str, *, reason: str, delay: float
+    ) -> None:
+        if delay > 0:
+            await asyncio.sleep(delay)
+        slot_to_force_cleanup: tuple[str, str, RunSlot] | None = None
+        async with self._lock:
+            task_key = self._run_to_task.get(run_lease_id)
+            if task_key is None:
+                return
+            task_slot = self._tasks.get(task_key)
+            run_slot = task_slot.runs.get(run_lease_id) if task_slot else None
+            if run_slot is None or not run_slot.close_requested:
+                return
+            if run_slot.in_flight_ops <= 0 and not run_slot.lock.locked():
+                popped = self._pop_run_slot_locked(run_lease_id)
+                if popped is not None:
+                    task_key, run_slot = popped
+                    logger.warning(
+                        "Force-releasing close_requested idle run lease=%s task=%s "
+                        "reason=%s phase=%s",
+                        run_lease_id,
+                        task_key,
+                        reason,
+                        run_slot.phase,
+                    )
+                    self._schedule_close(
+                        task_key,
+                        run_lease_id,
+                        run_slot,
+                        reason=f"Force-releasing idle close_requested run: {reason}",
+                    )
+                return
+            popped = self._pop_run_slot_locked(run_lease_id)
+            if popped is None:
+                return
+            task_key, run_slot = popped
+            logger.warning(
+                "Force-releasing close_requested in-flight run lease=%s task=%s "
+                "reason=%s phase=%s in_flight=%d active_op=%s %s",
+                run_lease_id,
+                task_key,
+                reason,
+                run_slot.phase,
+                run_slot.in_flight_ops,
+                run_slot.active_op,
+                self._run_slot_container_ref(run_slot),
+            )
+            slot_to_force_cleanup = (task_key, run_lease_id, run_slot)
+
+        if slot_to_force_cleanup is not None:
+            self._schedule_force_cleanup_slots(
+                [slot_to_force_cleanup],
+                reason=f"close_requested_force_release:{reason}",
+            )
 
     def _reap_idle_locked(self) -> list[tuple[str, str, RunSlot]]:
         now = time.time()
@@ -905,16 +1031,52 @@ class WorkerPool:
         finally:
             await self._finish_run_op(run_slot, "heartbeat", success=success)
 
-    async def reset(
+    @staticmethod
+    def _reset_operation_timeout(timeouts: TaskTimeouts) -> float:
+        configured = _env_float("WORKER_RESET_OPERATION_TIMEOUT", 330.0)
+        if configured > 0:
+            return configured
+        return max(30.0, float(timeouts.ensure_image) + float(timeouts.reset_session) + 30.0)
+
+    async def _drop_resetting_run_for_timeout(
+        self, run_lease_id: str, run_slot: RunSlot, *, timeout: float
+    ) -> None:
+        popped_slot: tuple[str, str, RunSlot] | None = None
+        async with self._lock:
+            task_key = self._run_to_task.get(run_lease_id)
+            if task_key is None:
+                return
+            current = self._tasks.get(task_key)
+            if current is None or current.runs.get(run_lease_id) is not run_slot:
+                return
+            popped = self._pop_run_slot_locked(run_lease_id)
+            if popped is not None:
+                popped_task_key, popped_run_slot = popped
+                logger.warning(
+                    "Dropping reset-timed-out run lease=%s task=%s timeout=%.1fs "
+                    "phase=%s in_flight=%d %s",
+                    run_lease_id,
+                    popped_task_key,
+                    timeout,
+                    popped_run_slot.phase,
+                    popped_run_slot.in_flight_ops,
+                    self._run_slot_container_ref(popped_run_slot),
+                )
+                popped_slot = (popped_task_key, run_lease_id, popped_run_slot)
+
+        if popped_slot is not None:
+            self._schedule_force_cleanup_slots(
+                [popped_slot],
+                reason=f"reset_timeout:{timeout:.1f}s",
+            )
+
+    async def _run_reset_once(
         self,
         run_lease_id: str,
         task_meta: dict[str, Any],
-        run_ctx_payload: dict[str, Any] | None = None,
-        task_timeouts: dict[str, Any] | None = None,
+        run_ctx_payload: dict[str, Any] | None,
+        task_timeouts: dict[str, Any] | None,
     ) -> dict[str, Any]:
-        if not isinstance(task_meta, dict):
-            raise ValueError("task_meta must be a dict")
-
         run_slot = await self._begin_run_op(run_lease_id, "reset")
 
         run_ctx = _build_run_ctx(
@@ -922,20 +1084,102 @@ class WorkerPool:
         )
         timeouts = _parse_timeout_overrides(self.default_timeouts, task_timeouts)
         task_spec = _build_task_spec(task_meta)
+        reset_timeout = self._reset_operation_timeout(timeouts)
 
         success = False
         try:
             async with run_slot.lock:
-                user_msg, tool_schemas = await run_slot.env.reset(
-                    task_meta=task_meta,
-                    task_spec=task_spec,
-                    run_ctx=run_ctx,
-                    timeouts=timeouts,
-                )
+                try:
+                    user_msg, tool_schemas = await asyncio.wait_for(
+                        run_slot.env.reset(
+                            task_meta=task_meta,
+                            task_spec=task_spec,
+                            run_ctx=run_ctx,
+                            timeouts=timeouts,
+                        ),
+                        timeout=reset_timeout,
+                    )
+                except asyncio.TimeoutError as exc:
+                    await self._drop_resetting_run_for_timeout(
+                        run_lease_id, run_slot, timeout=reset_timeout
+                    )
+                    raise TimeoutError(
+                        f"WORKER_RESET_TIMEOUT lease_id={run_lease_id} "
+                        f"after {reset_timeout:.1f}s"
+                    ) from exc
                 success = True
                 return {"user_msg": user_msg, "tool_schemas": tool_schemas}
         finally:
             await self._finish_run_op(run_slot, "reset", success=success)
+
+    async def reset(
+        self,
+        run_lease_id: str,
+        task_meta: dict[str, Any],
+        run_ctx_payload: dict[str, Any] | None = None,
+        task_timeouts: dict[str, Any] | None = None,
+        request_id: str | None = None,
+    ) -> dict[str, Any]:
+        if not isinstance(task_meta, dict):
+            raise ValueError("task_meta must be a dict")
+
+        request_id = str(request_id or "")
+        future: asyncio.Task
+        async with self._lock:
+            run_slot = self._get_run_slot(run_lease_id)
+            existing = run_slot.reset_future
+            if request_id and run_slot.reset_request_id == request_id:
+                if run_slot.reset_result is not None:
+                    return dict(run_slot.reset_result)
+                if existing is not None and not existing.done():
+                    future = existing
+                elif existing is not None and existing.done():
+                    future = existing
+                else:
+                    future = asyncio.create_task(
+                        self._run_reset_once(
+                            run_lease_id,
+                            task_meta,
+                            run_ctx_payload,
+                            task_timeouts,
+                        )
+                    )
+                    run_slot.reset_future = future
+            else:
+                if existing is not None and not existing.done():
+                    raise ResetInProgressError(run_lease_id, run_slot.reset_request_id)
+                run_slot.reset_request_id = request_id or f"reset-{uuid.uuid4().hex[:16]}"
+                run_slot.reset_result = None
+                future = asyncio.create_task(
+                    self._run_reset_once(
+                        run_lease_id,
+                        task_meta,
+                        run_ctx_payload,
+                        task_timeouts,
+                    )
+                )
+                run_slot.reset_future = future
+
+        try:
+            result = await asyncio.shield(future)
+        except asyncio.CancelledError as exc:
+            raise TimeoutError(
+                f"WORKER_RESET_CANCELLED lease_id={run_lease_id} request_id={request_id}"
+            ) from exc
+        except Exception:
+            raise
+        else:
+            async with self._lock:
+                try:
+                    run_slot = self._get_run_slot(run_lease_id)
+                except KeyError:
+                    raise RuntimeError(
+                        f"WORKER_RESET_STALE lease_id={run_lease_id} "
+                        "completed after run was removed"
+                    )
+                if run_slot.reset_future is future:
+                    run_slot.reset_result = dict(result)
+            return result
 
     async def exec_tool(
         self, run_lease_id: str, tool_name: str, arguments: dict[str, Any] | None = None
@@ -1010,6 +1254,9 @@ class WorkerPool:
             )
             if run_slot.in_flight_ops > 0 or run_slot.lock.locked():
                 run_slot.phase = "closing_requested"
+                self._schedule_close_requested_force_release(
+                    run_lease_id, reason=reason
+                )
                 return True
 
             popped = self._pop_run_slot_locked(run_lease_id)
@@ -1025,6 +1272,7 @@ class WorkerPool:
     async def status(self) -> dict[str, Any]:
         async with self._lock:
             self._prune_done_closing_tasks()
+            self._prune_done_force_cleanup_tasks()
             now = time.time()
             allocated_ttl = _env_float("WORKER_ALLOCATED_TTL", 120.0)
             resetting_ttl = _env_float("WORKER_RESETTING_TTL", 900.0)
@@ -1032,12 +1280,19 @@ class WorkerPool:
             close_ages = [
                 now - started for started in self._closing_task_started.values()
             ]
+            force_cleanup_ages = [
+                now - started for started in self._force_cleanup_task_started.values()
+            ]
             pending_close_age_sec = {
                 "min": round(min(close_ages), 1) if close_ages else 0.0,
                 "max": round(max(close_ages), 1) if close_ages else 0.0,
                 "over_close_timeout": sum(
                     1 for age in close_ages if age >= self.close_task_timeout
                 ),
+            }
+            pending_force_cleanup_age_sec = {
+                "min": round(min(force_cleanup_ages), 1) if force_cleanup_ages else 0.0,
+                "max": round(max(force_cleanup_ages), 1) if force_cleanup_ages else 0.0,
             }
             tasks_info: dict[str, Any] = {}
             active_container_ids: set[str] = set()
@@ -1119,7 +1374,9 @@ class WorkerPool:
                 "in_flight_runs": in_flight_runs,
                 "closing_requested_runs": closing_requested_runs,
                 "pending_closes": len(self._closing_tasks),
+                "pending_force_cleanups": len(self._force_cleanup_tasks),
                 "pending_close_age_sec": pending_close_age_sec,
+                "pending_force_cleanup_age_sec": pending_force_cleanup_age_sec,
                 "phase_counts": phase_counts,
                 "stale_runs": stale_runs,
                 "active_container_ids": sorted(active_container_ids),
@@ -1217,6 +1474,7 @@ class WorkerPool:
         reason: str,
         min_age: float = 0.0,
         max_repairs: int = 20,
+        wait_for_cleanup: bool = True,
     ) -> dict[str, Any]:
         now = time.time()
         slots_to_force_cleanup: list[tuple[str, str, RunSlot]] = []
@@ -1255,8 +1513,13 @@ class WorkerPool:
                 if max_repairs > 0 and len(repaired_runs) >= max_repairs:
                     break
 
-        if slots_to_force_cleanup:
+        if slots_to_force_cleanup and wait_for_cleanup:
             await self._force_cleanup_slots(
+                slots_to_force_cleanup,
+                reason=f"repair_stale_runs:{reason}",
+            )
+        elif slots_to_force_cleanup:
+            self._schedule_force_cleanup_slots(
                 slots_to_force_cleanup,
                 reason=f"repair_stale_runs:{reason}",
             )
@@ -1266,6 +1529,154 @@ class WorkerPool:
             "reason": reason,
             "min_age": min_age,
             "max_repairs": max_repairs,
+            "wait_for_cleanup": wait_for_cleanup,
+            "repaired_count": len(repaired_runs),
+            "repaired_runs": repaired_runs,
+        }
+
+    async def repair_close_requested_runs(
+        self,
+        *,
+        reason: str,
+        min_age: float = 0.0,
+        max_repairs: int = 20,
+        wait_for_cleanup: bool = False,
+    ) -> dict[str, Any]:
+        now = time.time()
+        slots_to_force_cleanup: list[tuple[str, str, RunSlot]] = []
+        repaired_runs: list[dict[str, Any]] = []
+        async with self._lock:
+            self._prune_done_closing_tasks()
+            self._prune_done_force_cleanup_tasks()
+            for task_key, task_slot in list(self._tasks.items()):
+                for run_lease_id, run_slot in list(task_slot.runs.items()):
+                    if not run_slot.close_requested:
+                        continue
+                    close_age_sec = (
+                        now - run_slot.close_requested_ts
+                        if run_slot.close_requested_ts is not None
+                        else now - run_slot.last_used_ts
+                    )
+                    if close_age_sec < min_age:
+                        continue
+                    popped = self._pop_run_slot_locked(run_lease_id)
+                    if popped is None:
+                        continue
+                    popped_task_key, popped_slot = popped
+                    slots_to_force_cleanup.append(
+                        (popped_task_key, run_lease_id, popped_slot)
+                    )
+                    repaired_runs.append(
+                        {
+                            "lease_id": run_lease_id,
+                            "task_key": popped_task_key,
+                            "phase": popped_slot.phase,
+                            "reason": "close_requested_capacity_pressure",
+                            "age_sec": round(close_age_sec, 1),
+                            "in_flight_ops": popped_slot.in_flight_ops,
+                            "active_op": popped_slot.active_op,
+                            "close_requested": popped_slot.close_requested,
+                            "container": self._run_slot_container_info(popped_slot),
+                        }
+                    )
+                    if max_repairs > 0 and len(repaired_runs) >= max_repairs:
+                        break
+                if max_repairs > 0 and len(repaired_runs) >= max_repairs:
+                    break
+
+        if slots_to_force_cleanup and wait_for_cleanup:
+            await self._force_cleanup_slots(
+                slots_to_force_cleanup,
+                reason=f"repair_close_requested_runs:{reason}",
+            )
+        elif slots_to_force_cleanup:
+            self._schedule_force_cleanup_slots(
+                slots_to_force_cleanup,
+                reason=f"repair_close_requested_runs:{reason}",
+            )
+
+        return {
+            "repaired": bool(repaired_runs),
+            "reason": reason,
+            "min_age": min_age,
+            "max_repairs": max_repairs,
+            "wait_for_cleanup": wait_for_cleanup,
+            "repaired_count": len(repaired_runs),
+            "repaired_runs": repaired_runs,
+        }
+
+    async def repair_resetting_runs(
+        self,
+        *,
+        reason: str,
+        min_age: float = 0.0,
+        max_repairs: int = 20,
+        wait_for_cleanup: bool = False,
+    ) -> dict[str, Any]:
+        now = time.time()
+        slots_to_force_cleanup: list[tuple[str, str, RunSlot]] = []
+        repaired_runs: list[dict[str, Any]] = []
+        async with self._lock:
+            self._prune_done_closing_tasks()
+            self._prune_done_force_cleanup_tasks()
+            for task_key, task_slot in list(self._tasks.items()):
+                for run_lease_id, run_slot in list(task_slot.runs.items()):
+                    if run_slot.phase != "resetting":
+                        continue
+                    reset_age_sec = (
+                        now - run_slot.reset_started_ts
+                        if run_slot.reset_started_ts is not None
+                        else now - run_slot.last_used_ts
+                    )
+                    if reset_age_sec < min_age:
+                        continue
+                    if (
+                        run_slot.reset_future is not None
+                        and not run_slot.reset_future.done()
+                    ):
+                        run_slot.reset_future.cancel()
+                    popped = self._pop_run_slot_locked(run_lease_id)
+                    if popped is None:
+                        continue
+                    popped_task_key, popped_slot = popped
+                    slots_to_force_cleanup.append(
+                        (popped_task_key, run_lease_id, popped_slot)
+                    )
+                    repaired_runs.append(
+                        {
+                            "lease_id": run_lease_id,
+                            "task_key": popped_task_key,
+                            "phase": popped_slot.phase,
+                            "reason": "resetting_storm_repair",
+                            "age_sec": round(reset_age_sec, 1),
+                            "in_flight_ops": popped_slot.in_flight_ops,
+                            "active_op": popped_slot.active_op,
+                            "close_requested": popped_slot.close_requested,
+                            "container": self._run_slot_container_info(popped_slot),
+                        }
+                    )
+                    if max_repairs > 0 and len(repaired_runs) >= max_repairs:
+                        break
+                if max_repairs > 0 and len(repaired_runs) >= max_repairs:
+                    break
+
+        if slots_to_force_cleanup and wait_for_cleanup:
+            await self._force_cleanup_slots(
+                slots_to_force_cleanup,
+                reason=f"repair_resetting_runs:{reason}",
+            )
+        elif slots_to_force_cleanup:
+            self._schedule_force_cleanup_slots(
+                slots_to_force_cleanup,
+                reason=f"repair_resetting_runs:{reason}",
+            )
+
+        return {
+            "repaired": bool(repaired_runs),
+            "reason": reason,
+            "min_age": min_age,
+            "max_repairs": max_repairs,
+            "wait_for_cleanup": wait_for_cleanup,
             "repaired_count": len(repaired_runs),
             "repaired_runs": repaired_runs,
         }
@@ -1280,7 +1691,7 @@ class WorkerPool:
             max(10.0, min(120.0, len(slots) * 2.0)),
         )
         logger.warning(
-            "Shutdown force cleanup starting for %d run slot(s), reason=%s timeout=%.1fs",
+            "Batch force cleanup starting for %d run slot(s), reason=%s timeout=%.1fs",
             len(slots),
             reason,
             timeout,
@@ -1298,13 +1709,13 @@ class WorkerPool:
             )
         except asyncio.TimeoutError:
             logger.warning(
-                "Shutdown force cleanup timed out with %d cleanup task(s) still pending",
+                "Batch force cleanup timed out with %d cleanup task(s) still pending",
                 sum(1 for task in cleanup_tasks if not task.done()),
             )
             for task in cleanup_tasks:
                 task.cancel()
             await asyncio.gather(*cleanup_tasks, return_exceptions=True)
-        logger.warning("Shutdown force cleanup finished for reason=%s", reason)
+        logger.warning("Batch force cleanup finished for reason=%s", reason)
 
     async def periodic_reap(self, interval: float = 60.0) -> None:
         while True:
@@ -1386,6 +1797,19 @@ class WorkerPool:
                 await self._force_cleanup_slots(
                     slots_to_close,
                     reason="shutdown_final_sweep",
+                )
+        if self._force_cleanup_tasks:
+            try:
+                await asyncio.wait_for(
+                    asyncio.gather(
+                        *self._force_cleanup_tasks, return_exceptions=True
+                    ),
+                    timeout=_env_float("WORKER_SHUTDOWN_FORCE_CLEANUP_TASKS_TIMEOUT", 10.0),
+                )
+            except asyncio.TimeoutError:
+                logger.warning(
+                    "Shutdown timed out waiting for %d background force cleanup task(s)",
+                    len(self._force_cleanup_tasks),
                 )
 
 
@@ -1753,11 +2177,107 @@ async def repair_stale_runs(request: Request) -> JSONResponse:
             max_repairs = int(data["max_repairs"])
     except (TypeError, ValueError):
         pass
+    wait_for_cleanup = str(data.get("wait_for_cleanup", "1")).lower() in {
+        "1",
+        "true",
+        "yes",
+    }
 
     result = await POOL.repair_stale_runs(
         reason=reason,
         min_age=max(0.0, min_age),
         max_repairs=max(0, max_repairs),
+        wait_for_cleanup=wait_for_cleanup,
+    )
+    return JSONResponse({"ok": True, **result})
+
+
+@app.post("/repair/close_requested_runs")
+async def repair_close_requested_runs(request: Request) -> JSONResponse:
+    if POOL is None:
+        return JSONResponse(
+            {"ok": False, "error": "Pool is not initialized"}, status_code=500
+        )
+    if os.getenv("WORKER_REPAIR_CLOSE_REQUESTED_RUNS", "1") != "1":
+        return JSONResponse(
+            {
+                "ok": False,
+                "error": "Close-requested run repair endpoint is disabled",
+                "code": "REPAIR_DISABLED",
+            },
+            status_code=403,
+        )
+
+    data = await json_payload(request)
+    reason = str(data.get("reason") or "manual")
+    min_age = _env_float("WORKER_REPAIR_CLOSE_REQUESTED_MIN_AGE", 0.0)
+    max_repairs = _env_int("WORKER_REPAIR_CLOSE_REQUESTED_MAX_REPAIRS", 20)
+    try:
+        if "min_age" in data:
+            min_age = float(data["min_age"])
+    except (TypeError, ValueError):
+        pass
+    try:
+        if "max_repairs" in data:
+            max_repairs = int(data["max_repairs"])
+    except (TypeError, ValueError):
+        pass
+    wait_for_cleanup = str(data.get("wait_for_cleanup", "0")).lower() in {
+        "1",
+        "true",
+        "yes",
+    }
+
+    result = await POOL.repair_close_requested_runs(
+        reason=reason,
+        min_age=max(0.0, min_age),
+        max_repairs=max(0, max_repairs),
+        wait_for_cleanup=wait_for_cleanup,
+    )
+    return JSONResponse({"ok": True, **result})
+
+
+@app.post("/repair/resetting_runs")
+async def repair_resetting_runs(request: Request) -> JSONResponse:
+    if POOL is None:
+        return JSONResponse(
+            {"ok": False, "error": "Pool is not initialized"}, status_code=500
+        )
+    if os.getenv("WORKER_REPAIR_RESETTING_RUNS", "1") != "1":
+        return JSONResponse(
+            {
+                "ok": False,
+                "error": "Resetting-run repair endpoint is disabled",
+                "code": "REPAIR_DISABLED",
+            },
+            status_code=403,
+        )
+
+    data = await json_payload(request)
+    reason = str(data.get("reason") or "manual")
+    min_age = _env_float("WORKER_REPAIR_RESETTING_MIN_AGE", 390.0)
+    max_repairs = _env_int("WORKER_REPAIR_RESETTING_MAX_REPAIRS", 64)
+    try:
+        if "min_age" in data:
+            min_age = float(data["min_age"])
+    except (TypeError, ValueError):
+        pass
+    try:
+        if "max_repairs" in data:
+            max_repairs = int(data["max_repairs"])
+    except (TypeError, ValueError):
+        pass
+    wait_for_cleanup = str(data.get("wait_for_cleanup", "0")).lower() in {
+        "1",
+        "true",
+        "yes",
+    }
+
+    result = await POOL.repair_resetting_runs(
+        reason=reason,
+        min_age=max(0.0, min_age),
+        max_repairs=max(0, max_repairs),
+        wait_for_cleanup=wait_for_cleanup,
     )
     return JSONResponse({"ok": True, **result})
 
@@ -1778,13 +2298,18 @@ async def allocate(request: Request) -> JSONResponse:
             {"ok": False, "error": "task_key is required"}, status_code=400
         )
 
-    try:
+    auto_repair_result: dict[str, Any] | None = None
+
+    async def _try_allocate_once() -> dict[str, Any]:
         pool_status = await POOL.status()
         assert_worker_has_capacity_for_docker(
             phase="allocate",
             pending_closes=int(pool_status.get("pending_closes", 0)),
         )
-        result = await POOL.allocate(task_key=str(task_key), request_id=request_id)
+        return await POOL.allocate(task_key=str(task_key), request_id=request_id)
+
+    try:
+        result = await _try_allocate_once()
         return JSONResponse({"ok": True, **result})
     except ResourcePressureError as exc:
         return JSONResponse(
@@ -1798,8 +2323,47 @@ async def allocate(request: Request) -> JSONResponse:
             headers={"Retry-After": os.getenv("WORKER_PRESSURE_RETRY_AFTER", "10")},
         )
     except CapacityError as exc:
+        if os.getenv("WORKER_AUTO_REPAIR_ON_CAPACITY", "1") == "1":
+            max_repairs = _env_int("WORKER_AUTO_REPAIR_MAX_REPAIRS", 20)
+            close_min_age = _env_float(
+                "WORKER_AUTO_REPAIR_CLOSE_REQUESTED_MIN_AGE", 0.0
+            )
+            stale_min_age = _env_float("WORKER_AUTO_REPAIR_STALE_MIN_AGE", 0.0)
+            close_repair = await POOL.repair_close_requested_runs(
+                reason=f"allocate_capacity:{exc.code}",
+                min_age=max(0.0, close_min_age),
+                max_repairs=max(0, max_repairs),
+                wait_for_cleanup=False,
+            )
+            stale_repair: dict[str, Any] | None = None
+            if not close_repair.get("repaired"):
+                stale_repair = await POOL.repair_stale_runs(
+                    reason=f"allocate_capacity:{exc.code}",
+                    min_age=max(0.0, stale_min_age),
+                    max_repairs=max(0, max_repairs),
+                    wait_for_cleanup=False,
+                )
+            auto_repair_result = {
+                "close_requested": close_repair,
+                "stale": stale_repair,
+            }
+            if close_repair.get("repaired") or (
+                stale_repair is not None and stale_repair.get("repaired")
+            ):
+                try:
+                    result = await _try_allocate_once()
+                    return JSONResponse(
+                        {"ok": True, **result, "auto_repair": auto_repair_result}
+                    )
+                except CapacityError as retry_exc:
+                    exc = retry_exc
         return JSONResponse(
-            {"ok": False, "error": exc.message, "code": exc.code},
+            {
+                "ok": False,
+                "error": exc.message,
+                "code": exc.code,
+                "auto_repair": auto_repair_result,
+            },
             status_code=429,
             headers={"Retry-After": os.getenv("WORKER_CAPACITY_RETRY_AFTER", "5")},
         )
@@ -1840,6 +2404,7 @@ async def reset(request: Request) -> JSONResponse:
     task_meta = data.get("task_meta")
     run_ctx_payload = data.get("run_ctx")
     task_timeouts = data.get("task_timeouts")
+    request_id = data.get("request_id")
 
     if not lease_id:
         return JSONResponse(
@@ -1861,6 +2426,7 @@ async def reset(request: Request) -> JSONResponse:
             task_meta=task_meta,
             run_ctx_payload=run_ctx_payload,
             task_timeouts=task_timeouts,
+            request_id=str(request_id) if request_id else None,
         )
         return JSONResponse({"ok": True, **out})
     except ResourcePressureError as exc:
@@ -1872,6 +2438,18 @@ async def reset(request: Request) -> JSONResponse:
                 "details": exc.details,
             },
             status_code=503,
+        )
+    except ResetInProgressError as exc:
+        return JSONResponse(
+            {
+                "ok": False,
+                "error": str(exc),
+                "code": "RESET_IN_PROGRESS",
+                "lease_id": exc.run_lease_id,
+                "request_id": exc.request_id,
+            },
+            status_code=429,
+            headers={"Retry-After": os.getenv("WORKER_RESET_IN_PROGRESS_RETRY_AFTER", "2")},
         )
     except Exception as exc:
         logger.exception("Reset failed for lease_id=%s", lease_id)

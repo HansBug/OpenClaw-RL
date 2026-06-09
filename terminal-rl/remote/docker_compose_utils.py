@@ -6,6 +6,7 @@ import re
 import shutil
 import subprocess
 import threading
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal
@@ -39,6 +40,11 @@ _BUILD_SEMAPHORE = threading.BoundedSemaphore(_MAX_CONCURRENT_BUILDS)
 _BUILD_LOCKS_GUARD = threading.Lock()
 _BUILD_LOCKS: dict[str, threading.Lock] = {}
 _BUILD_DONE: set[str] = set()
+_BUILD_FAILED: dict[str, tuple[float, str]] = {}
+
+
+class DockerImageBuildError(RuntimeError):
+    """Deterministic task image build failure cached per task image."""
 
 
 def _safe_project_component(value: str, fallback: str = "task") -> str:
@@ -138,6 +144,29 @@ def _env_bool(name: str, default: bool) -> bool:
     return raw.strip().lower() not in {"0", "false", "no", "off"}
 
 
+def _build_failed_ttl() -> float:
+    raw = os.getenv("WORKER_DOCKER_BUILD_FAILED_TTL", "3600")
+    try:
+        value = float(raw)
+    except ValueError:
+        return 3600.0
+    return max(0.0, value)
+
+
+def _cached_build_failure(build_key: str) -> str | None:
+    ttl = _build_failed_ttl()
+    if ttl <= 0:
+        return None
+    cached = _BUILD_FAILED.get(build_key)
+    if cached is None:
+        return None
+    ts, message = cached
+    if time.time() - ts <= ttl:
+        return message
+    _BUILD_FAILED.pop(build_key, None)
+    return None
+
+
 def _lock_for_build_key(key: str) -> threading.Lock:
     with _BUILD_LOCKS_GUARD:
         lock = _BUILD_LOCKS.get(key)
@@ -178,20 +207,34 @@ def build_docker_image(task: dict[str, Any], timeout: float = 1200.0) -> None:
     with build_lock:
         if build_key in _BUILD_DONE:
             return
+        cached_failure = _cached_build_failure(build_key)
+        if cached_failure is not None:
+            raise DockerImageBuildError(
+                f"TASK_BUILD_FAILED cached for image={build_key}: {cached_failure}"
+            )
         if skip_existing and _docker_image_exists_locally(build_key):
             logger.debug("Docker image already exists locally; skip build: %s", build_key)
             _BUILD_DONE.add(build_key)
+            _BUILD_FAILED.pop(build_key, None)
             return
 
         with _BUILD_SEMAPHORE:
             import inspect
 
             logger.info("Building Docker image for task=%s image=%s", task_name, build_key)
-            if "timeout" in inspect.signature(compose_manager.build).parameters:
-                compose_manager.build(timeout=timeout)
-            else:
-                compose_manager.build()
+            try:
+                if "timeout" in inspect.signature(compose_manager.build).parameters:
+                    compose_manager.build(timeout=timeout)
+                else:
+                    compose_manager.build()
+            except Exception as exc:
+                message = _shorten_output(str(exc), max_chars=1200) or type(exc).__name__
+                _BUILD_FAILED[build_key] = (time.time(), message)
+                raise DockerImageBuildError(
+                    f"TASK_BUILD_FAILED image={build_key} task={task_name}: {message}"
+                ) from exc
             _BUILD_DONE.add(build_key)
+            _BUILD_FAILED.pop(build_key, None)
 
 
 def _resolve_pull_image(task: dict[str, Any]) -> str:
