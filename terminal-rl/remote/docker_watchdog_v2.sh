@@ -97,7 +97,7 @@ POOL_E2E_PROBE_FAILS_RESTART="${POOL_E2E_PROBE_FAILS_RESTART:-2}"
 POOL_RESET_STORM_REPAIR="${POOL_RESET_STORM_REPAIR:-1}"
 POOL_RESET_STORM_MIN_RESETTING="${POOL_RESET_STORM_MIN_RESETTING:-32}"
 POOL_RESET_STORM_RATIO_PCT="${POOL_RESET_STORM_RATIO_PCT:-80}"
-POOL_RESET_STORM_MIN_AGE="${POOL_RESET_STORM_MIN_AGE:-390}"
+POOL_RESET_STORM_MIN_AGE="${POOL_RESET_STORM_MIN_AGE:-450}"
 POOL_RESET_STORM_STUCK_CHECKS="${POOL_RESET_STORM_STUCK_CHECKS:-2}"
 POOL_RESET_STORM_REPAIR_LIMIT="${POOL_RESET_STORM_REPAIR_LIMIT:-64}"
 POOL_RESET_STORM_REPAIR_COOLDOWN_S="${POOL_RESET_STORM_REPAIR_COOLDOWN_S:-120}"
@@ -113,6 +113,12 @@ WATCHDOG_STALE_MIN_AGE_SOFT="${WATCHDOG_STALE_MIN_AGE_SOFT:-900}"
 WATCHDOG_STALE_MIN_AGE_PRESSURE="${WATCHDOG_STALE_MIN_AGE_PRESSURE:-300}"
 WATCHDOG_STALE_MIN_AGE_HARD="${WATCHDOG_STALE_MIN_AGE_HARD:-120}"
 WATCHDOG_STALE_STATUS_MIN_AGE="${WATCHDOG_STALE_STATUS_MIN_AGE:-3600}"
+WATCHDOG_IDLE_REAP_ENABLED="${WATCHDOG_IDLE_REAP_ENABLED:-1}"
+WATCHDOG_IDLE_REAP_MIN_CONTAINERS="${WATCHDOG_IDLE_REAP_MIN_CONTAINERS:-48}"
+WATCHDOG_IDLE_REAP_MIN_GAP="${WATCHDOG_IDLE_REAP_MIN_GAP:-24}"
+WATCHDOG_IDLE_REAP_BATCH="${WATCHDOG_IDLE_REAP_BATCH:-16}"
+WATCHDOG_IDLE_REAP_MIN_AGE="${WATCHDOG_IDLE_REAP_MIN_AGE:-900}"
+WATCHDOG_IDLE_REAP_COOLDOWN_S="${WATCHDOG_IDLE_REAP_COOLDOWN_S:-300}"
 WATCHDOG_STALE_LOW_CPU_PCT="${WATCHDOG_STALE_LOW_CPU_PCT:-1.0}"
 WATCHDOG_STALE_LOW_MEM_MB="${WATCHDOG_STALE_LOW_MEM_MB:-1024}"
 WATCHDOG_STATS_TIMEOUT="${WATCHDOG_STATS_TIMEOUT:-10}"
@@ -157,6 +163,7 @@ LAST_REPAIR_TS=0
 LAST_PROC_WARN_TS=0
 LAST_PIDS_RELIEF_TS=0
 LAST_POOL_PENDING_REPAIR_TS=0
+LAST_IDLE_REAP_TS=0
 POOL_PENDING_HIGH_COUNT=0
 
 cleanup_watchdog_tmp() {
@@ -255,10 +262,15 @@ POOL_E2E_PROBE_TIMEOUT="$(positive_int_or_default POOL_E2E_PROBE_TIMEOUT "${POOL
 POOL_E2E_PROBE_FAILS_RESTART="$(positive_int_or_default POOL_E2E_PROBE_FAILS_RESTART "${POOL_E2E_PROBE_FAILS_RESTART}" 2)"
 POOL_RESET_STORM_MIN_RESETTING="$(positive_int_or_default POOL_RESET_STORM_MIN_RESETTING "${POOL_RESET_STORM_MIN_RESETTING}" 32)"
 POOL_RESET_STORM_RATIO_PCT="$(positive_int_or_default POOL_RESET_STORM_RATIO_PCT "${POOL_RESET_STORM_RATIO_PCT}" 80)"
-POOL_RESET_STORM_MIN_AGE="$(positive_int_or_default POOL_RESET_STORM_MIN_AGE "${POOL_RESET_STORM_MIN_AGE}" 390)"
+POOL_RESET_STORM_MIN_AGE="$(positive_int_or_default POOL_RESET_STORM_MIN_AGE "${POOL_RESET_STORM_MIN_AGE}" 450)"
 POOL_RESET_STORM_STUCK_CHECKS="$(positive_int_or_default POOL_RESET_STORM_STUCK_CHECKS "${POOL_RESET_STORM_STUCK_CHECKS}" 2)"
 POOL_RESET_STORM_REPAIR_LIMIT="$(positive_int_or_default POOL_RESET_STORM_REPAIR_LIMIT "${POOL_RESET_STORM_REPAIR_LIMIT}" 64)"
 POOL_RESET_STORM_REPAIR_COOLDOWN_S="$(positive_int_or_default POOL_RESET_STORM_REPAIR_COOLDOWN_S "${POOL_RESET_STORM_REPAIR_COOLDOWN_S}" 120)"
+WATCHDOG_IDLE_REAP_MIN_CONTAINERS="$(positive_int_or_default WATCHDOG_IDLE_REAP_MIN_CONTAINERS "${WATCHDOG_IDLE_REAP_MIN_CONTAINERS}" 48)"
+WATCHDOG_IDLE_REAP_MIN_GAP="$(positive_int_or_default WATCHDOG_IDLE_REAP_MIN_GAP "${WATCHDOG_IDLE_REAP_MIN_GAP}" 24)"
+WATCHDOG_IDLE_REAP_BATCH="$(positive_int_or_default WATCHDOG_IDLE_REAP_BATCH "${WATCHDOG_IDLE_REAP_BATCH}" 16)"
+WATCHDOG_IDLE_REAP_MIN_AGE="$(positive_int_or_default WATCHDOG_IDLE_REAP_MIN_AGE "${WATCHDOG_IDLE_REAP_MIN_AGE}" 900)"
+WATCHDOG_IDLE_REAP_COOLDOWN_S="$(nonnegative_int_or_default WATCHDOG_IDLE_REAP_COOLDOWN_S "${WATCHDOG_IDLE_REAP_COOLDOWN_S}" 300)"
 
 docker_alive() {
     timeout 3 curl -fsS --max-time 2 \
@@ -1550,6 +1562,39 @@ PY
     return 0
 }
 
+reap_idle_orphan_task_containers() {
+    local running="$1"
+    local idle_target idle_excess limit now
+
+    [ "${WATCHDOG_IDLE_REAP_ENABLED}" = "1" ] || return 0
+    pool_status_is_fresh || return 0
+    [ "${running}" -ge "${WATCHDOG_IDLE_REAP_MIN_CONTAINERS}" ] 2>/dev/null || return 0
+
+    idle_target=$((LAST_POOL_ACTIVE + WATCHDOG_REAP_HEADROOM))
+    if [ "${idle_target}" -lt "${WATCHDOG_IDLE_REAP_MIN_CONTAINERS}" ] 2>/dev/null; then
+        idle_target="${WATCHDOG_IDLE_REAP_MIN_CONTAINERS}"
+    fi
+
+    idle_excess=$((running - idle_target))
+    [ "${idle_excess}" -ge "${WATCHDOG_IDLE_REAP_MIN_GAP}" ] 2>/dev/null || return 0
+
+    now=$(date +%s)
+    if [ $((now - LAST_IDLE_REAP_TS)) -lt "${WATCHDOG_IDLE_REAP_COOLDOWN_S}" ]; then
+        log "Idle orphan reap suppressed: running=${running} active=${LAST_POOL_ACTIVE} target=${idle_target} excess=${idle_excess} cooldown=${WATCHDOG_IDLE_REAP_COOLDOWN_S}s"
+        return 0
+    fi
+    LAST_IDLE_REAP_TS="${now}"
+
+    limit="$(min_int "${idle_excess}" "${WATCHDOG_IDLE_REAP_BATCH}")"
+    log "Idle orphan reap: running=${running} active=${LAST_POOL_ACTIVE} protected=${LAST_POOL_PROTECTED_COUNT} target=${idle_target} excess=${idle_excess}; reaping up to ${limit} old idle unprotected containers"
+    reap_unprotected_task_containers \
+        "idle orphan gap running=${running} active=${LAST_POOL_ACTIVE} target=${idle_target}" \
+        "${limit}" \
+        "${WATCHDOG_IDLE_REAP_MIN_AGE}" \
+        "idle_orphan" \
+        1 || true
+}
+
 enforce_container_limit() {
     local running status_age target excess limit pressure_reason reap_min_age
     # 只统计 task 容器（带数字前缀 + client/helper 后缀），不算 pool_server 等基础容器
@@ -1590,6 +1635,10 @@ enforce_container_limit() {
             reap_unprotected_task_containers "${pressure_reason}; stale pool status" "${limit}" "${WATCHDOG_STALE_STATUS_MIN_AGE}" "stale_status" 1 || true
         fi
         return
+    fi
+
+    if [ "${running}" -le "${MAX_RUNNING_CONTAINERS}" ] 2>/dev/null; then
+        reap_idle_orphan_task_containers "${running}"
     fi
 
     if [ "${running}" -gt "${MAX_RUNNING_CONTAINERS}" ]; then
@@ -1725,6 +1774,7 @@ log "  pool_resetstorm repair=${POOL_RESET_STORM_REPAIR} min_resetting=${POOL_RE
 log "  task_container_regex=${TASK_CONTAINER_REGEX}"
 log "  task_image_regex=${TASK_IMAGE_REGEX}"
 log "  task_reap headroom=${WATCHDOG_REAP_HEADROOM} soft_batch=${WATCHDOG_SOFT_REAP_BATCH} hard_batch=${WATCHDOG_HARD_REAP_BATCH} soft_age=${WATCHDOG_STALE_MIN_AGE_SOFT}s pressure_age=${WATCHDOG_STALE_MIN_AGE_PRESSURE}s hard_age=${WATCHDOG_STALE_MIN_AGE_HARD}s stale_status_age=${WATCHDOG_STALE_STATUS_MIN_AGE}s low_cpu=${WATCHDOG_STALE_LOW_CPU_PCT}% low_mem=${WATCHDOG_STALE_LOW_MEM_MB}MiB stats_timeout=${WATCHDOG_STATS_TIMEOUT}s"
+log "  idle_orphan_reap enabled=${WATCHDOG_IDLE_REAP_ENABLED} min_containers=${WATCHDOG_IDLE_REAP_MIN_CONTAINERS} min_gap=${WATCHDOG_IDLE_REAP_MIN_GAP} batch=${WATCHDOG_IDLE_REAP_BATCH} min_age=${WATCHDOG_IDLE_REAP_MIN_AGE}s cooldown=${WATCHDOG_IDLE_REAP_COOLDOWN_S}s"
 log "  docker_data_root=${DOCKER_DATA_ROOT}  proxy_url=${PROXY_URL}  proxy_env_file=${PROXY_ENV_FILE}"
 log "  auto_repair=${WATCHDOG_AUTO_REPAIR} repair_mode=${WATCHDOG_REPAIR_MODE} repair_cooldown=${REPAIR_COOLDOWN_S}s repair_lock=${REPAIR_LOCK_DIR}"
 log "  log_file=${LOG_FILE}  log_max=${LOG_MAX_BYTES}"

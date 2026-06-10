@@ -125,7 +125,13 @@ def _force_remove_docker_objects(
 
     try:
         listed = _run(
-            ["docker", "ps", "-aq", "--format", "{{.ID}}\t{{.Names}}\t{{.Image}}"]
+            [
+                "docker",
+                "ps",
+                "-aq",
+                "--format",
+                "{{.ID}}\t{{.Names}}\t{{.Image}}\t{{.Status}}",
+            ]
         )
     except Exception as exc:
         logger.warning(
@@ -137,28 +143,48 @@ def _force_remove_docker_objects(
         return
 
     container_ids: list[str] = []
+    container_samples: list[str] = []
     for line in listed.stdout.splitlines():
         parts = line.split("\t")
         if len(parts) < 2:
             continue
         container_id, name = parts[0], parts[1]
         image = parts[2] if len(parts) > 2 else ""
-        if _matches_project_name(name, project_names, broad=broad) or any(
+        status = parts[3] if len(parts) > 3 else ""
+        name_match = _matches_project_name(name, project_names, broad=broad)
+        # Image-prefix matching is intentionally only a fallback when we do not
+        # know a project/container name; matching tb__<task>__ can otherwise
+        # remove other active samples of the same task.
+        image_match = not project_names and any(
             image.startswith(prefix) for prefix in image_prefixes
-        ):
+        )
+        if name_match or image_match:
             container_ids.append(container_id)
+            if len(container_samples) < 8:
+                container_samples.append(
+                    f"{container_id[:12]} name={name} image={image} status={status}"
+                )
 
     if container_ids:
         logger.warning(
-            "Force removing %d Docker container(s) for TerminalEnv %s (%s)",
+            "Force removing %d Docker container(s) for TerminalEnv %s (%s): %s",
             len(container_ids),
             trial_name,
             reason,
+            "; ".join(container_samples),
         )
         for start in range(0, len(container_ids), 20):
             chunk = container_ids[start : start + 20]
             try:
-                _run(["docker", "rm", "-f", *chunk])
+                removed = _run(["docker", "rm", "-f", *chunk])
+                logger.warning(
+                    "Force docker rm finished for TerminalEnv %s ids=%s rc=%s stdout=%s stderr=%s",
+                    trial_name,
+                    ",".join(cid[:12] for cid in chunk),
+                    removed.returncode,
+                    removed.stdout.strip()[:300],
+                    removed.stderr.strip()[:300],
+                )
             except Exception as exc:
                 logger.warning(
                     "Force docker rm failed for TerminalEnv %s ids=%s: %s",
@@ -166,6 +192,16 @@ def _force_remove_docker_objects(
                     ",".join(chunk),
                     exc,
                 )
+    else:
+        logger.warning(
+            "Force cleanup matched no Docker containers for TerminalEnv %s (%s); "
+            "client_container=%s image_prefixes=%s projects=%s",
+            trial_name,
+            reason,
+            client_container_name or "",
+            ",".join(sorted(image_prefixes)) or "",
+            ",".join(sorted(project_names)) or "",
+        )
 
     try:
         networks = _run(["docker", "network", "ls", "--format", "{{.ID}}\t{{.Name}}"])
@@ -183,7 +219,13 @@ def _force_remove_docker_objects(
 
     for net_id in network_ids:
         try:
-            _run(["docker", "network", "rm", net_id])
+            removed_net = _run(["docker", "network", "rm", net_id])
+            logger.warning(
+                "Force docker network rm finished for TerminalEnv %s id=%s rc=%s",
+                trial_name,
+                net_id[:12],
+                removed_net.returncode,
+            )
         except Exception:
             pass
 

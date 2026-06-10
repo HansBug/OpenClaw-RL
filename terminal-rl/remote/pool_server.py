@@ -972,9 +972,9 @@ class WorkerPool:
     @staticmethod
     def _stale_reason_for_run_slot(run_slot: RunSlot, now: float) -> tuple[str, float]:
         allocated_ttl = _env_float("WORKER_ALLOCATED_TTL", 120.0)
-        # STABILITY FIX: Match WORKER_RESET_OPERATION_TIMEOUT (720s) + 180s buffer = 900s
-        # This prevents runs from being marked stale while legitimate reset operations are in progress
-        resetting_ttl = _env_float("WORKER_RESETTING_TTL", 900.0)
+        # Keep this above WORKER_RESET_OPERATION_TIMEOUT so legitimate reset
+        # operations are not reaped before their timeout handler runs.
+        resetting_ttl = _env_float("WORKER_RESETTING_TTL", 450.0)
         closing_ttl = _env_float("WORKER_CLOSING_REQUESTED_TTL", 300.0)
         created_age_sec = now - run_slot.created_ts
         reset_age_sec = (
@@ -1089,9 +1089,7 @@ class WorkerPool:
 
     @staticmethod
     def _reset_operation_timeout(timeouts: TaskTimeouts) -> float:
-        # FIX-2: Increase default timeout from 360s to 720s to accommodate worst-case
-        # legitimate operation time (ENSURE_IMAGE_TIMEOUT=300s + RESET_SESSION_TIMEOUT=300s = 600s)
-        configured = _env_float("WORKER_RESET_OPERATION_TIMEOUT", 720.0)
+        configured = _env_float("WORKER_RESET_OPERATION_TIMEOUT", 360.0)
         if configured > 0:
             return configured
         return max(30.0, float(timeouts.ensure_image) + float(timeouts.reset_session) + 30.0)
@@ -1146,51 +1144,73 @@ class WorkerPool:
         task_spec = _build_task_spec(task_meta)
         reset_timeout = self._reset_operation_timeout(timeouts)
 
-        # FIX-2: Progressive timeout - warn at halfway point, fail at full timeout
-        warn_timeout = reset_timeout / 2.0
+        # Use a Task instead of a bare coroutine. wait_for() cancels its awaitable
+        # on timeout, and bare coroutines cannot be awaited again after that.
+        warn_timeout = max(0.1, reset_timeout / 2.0)
+        remaining_timeout = max(0.1, reset_timeout - warn_timeout)
         is_timeout_drop = False
         success = False
+        reset_task: asyncio.Task[tuple[str, list[dict[str, Any]]]] | None = None
+
+        def _consume_cancelled_reset_task(task: asyncio.Task[Any]) -> None:
+            try:
+                task.exception()
+            except asyncio.CancelledError:
+                pass
+            except Exception:
+                pass
+
         try:
             async with run_slot.lock:
-                # Create the reset operation once
-                reset_operation = run_slot.env.reset(
-                    task_meta=task_meta,
-                    task_spec=task_spec,
-                    run_ctx=run_ctx,
-                    timeouts=timeouts,
+                reset_task = asyncio.create_task(
+                    run_slot.env.reset(
+                        task_meta=task_meta,
+                        task_spec=task_spec,
+                        run_ctx=run_ctx,
+                        timeouts=timeouts,
+                    )
                 )
                 try:
-                    # First stage: wait with warning timeout
-                    user_msg, tool_schemas = await asyncio.wait_for(
-                        reset_operation,
-                        timeout=warn_timeout,
-                    )
-                except asyncio.TimeoutError:
-                    # Warn but continue with remaining time
+                    done, _ = await asyncio.wait({reset_task}, timeout=warn_timeout)
+                except asyncio.CancelledError:
+                    reset_task.cancel()
+                    raise
+
+                if reset_task not in done:
                     logger.warning(
                         "Reset exceeds %.1fs (warn threshold), allowing %.1fs more: lease=%s",
                         warn_timeout,
-                        reset_timeout - warn_timeout,
+                        remaining_timeout,
                         run_lease_id,
                     )
-                    try:
-                        # Second stage: continue waiting with remaining timeout
-                        user_msg, tool_schemas = await asyncio.wait_for(
-                            reset_operation,
-                            timeout=reset_timeout - warn_timeout,
-                        )
-                    except asyncio.TimeoutError as exc:
-                        # FIX-1: Mark timeout for deferred cleanup instead of immediate drop
-                        is_timeout_drop = True
-                        raise TimeoutError(
-                            f"WORKER_RESET_TIMEOUT lease_id={run_lease_id} "
-                            f"after {reset_timeout:.1f}s"
-                        ) from exc
+
+                try:
+                    user_msg, tool_schemas = await asyncio.wait_for(
+                        asyncio.shield(reset_task),
+                        timeout=remaining_timeout,
+                    )
+                except asyncio.TimeoutError as exc:
+                    if reset_task.done():
+                        raise
+                    is_timeout_drop = True
+                    reset_task.cancel()
+                    reset_task.add_done_callback(_consume_cancelled_reset_task)
+                    raise TimeoutError(
+                        f"WORKER_RESET_TIMEOUT lease_id={run_lease_id} "
+                        f"after {reset_timeout:.1f}s"
+                    ) from exc
                 success = True
                 return {"user_msg": user_msg, "tool_schemas": tool_schemas}
         finally:
-            # FIX-1: Pass is_timeout_drop flag to defer cleanup until after in_flight_ops decremented
-            await self._finish_run_op(run_slot, "reset", success=success, is_timeout_drop=is_timeout_drop)
+            if not success and reset_task is not None and not reset_task.done():
+                reset_task.cancel()
+                reset_task.add_done_callback(_consume_cancelled_reset_task)
+            await self._finish_run_op(
+                run_slot,
+                "reset",
+                success=success,
+                is_timeout_drop=is_timeout_drop,
+            )
 
     async def reset(
         self,
@@ -1355,8 +1375,7 @@ class WorkerPool:
             self._prune_done_force_cleanup_tasks()
             now = time.time()
             allocated_ttl = _env_float("WORKER_ALLOCATED_TTL", 120.0)
-            # STABILITY FIX: Match WORKER_RESET_OPERATION_TIMEOUT (720s) + 180s buffer = 900s
-            resetting_ttl = _env_float("WORKER_RESETTING_TTL", 900.0)
+            resetting_ttl = _env_float("WORKER_RESETTING_TTL", 450.0)
             closing_ttl = _env_float("WORKER_CLOSING_REQUESTED_TTL", 300.0)
             close_ages = [
                 now - started for started in self._closing_task_started.values()
@@ -2437,8 +2456,7 @@ async def repair_resetting_runs(request: Request) -> JSONResponse:
 
     data = await json_payload(request)
     reason = str(data.get("reason") or "manual")
-    # STABILITY FIX: Match WORKER_RESETTING_TTL to prevent "zombie state" where runs expire at 450s but repair doesn't trigger until 900s
-    min_age = _env_float("WORKER_REPAIR_RESETTING_MIN_AGE", 900.0)
+    min_age = _env_float("WORKER_REPAIR_RESETTING_MIN_AGE", 450.0)
     max_repairs = _env_int("WORKER_REPAIR_RESETTING_MAX_REPAIRS", 64)
     try:
         if "min_age" in data:
