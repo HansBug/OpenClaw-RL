@@ -474,6 +474,7 @@ class RunSlot:
     reset_result: dict[str, Any] | None = None
     first_step_ts: float | None = None
     evaluate_completed_ts: float | None = None
+    drop_scheduled: bool = False  # P0 fix: Flag to prevent double-pop race
 
 
 @dataclass
@@ -636,7 +637,8 @@ class WorkerPool:
             if run_slot.in_flight_ops == 0:
                 run_slot.active_op = None
 
-            if run_slot.close_requested and run_slot.in_flight_ops == 0:
+            # P0 fix: Check drop_scheduled flag to prevent double-pop race
+            if run_slot.close_requested and run_slot.in_flight_ops == 0 and not run_slot.drop_scheduled:
                 popped = self._pop_run_slot_locked(run_slot.run_lease_id)
                 if popped is not None:
                     task_key, popped_slot = popped
@@ -663,7 +665,20 @@ class WorkerPool:
     async def _close_run_slot_under_lock(self, run_slot: RunSlot) -> None:
         async with run_slot.lock:
             run_slot.phase = "closing"
-            await run_slot.env.close()
+            # P1 fix: Add timeout to prevent lock from being held indefinitely if env.close() hangs
+            close_timeout = _env_float(
+                "WORKER_CLOSE_SESSION_TIMEOUT",
+                max(30.0, float(self.default_timeouts.close_session)),
+            )
+            try:
+                await asyncio.wait_for(run_slot.env.close(), timeout=close_timeout)
+            except asyncio.TimeoutError:
+                logger.warning(
+                    "env.close() timed out after %.1fs for lease=%s; proceeding to force_cleanup",
+                    close_timeout,
+                    run_slot.run_lease_id,
+                )
+                raise
             run_slot.phase = "closed"
 
     def _prune_done_closing_tasks(self) -> int:
@@ -689,6 +704,8 @@ class WorkerPool:
     async def _force_cleanup_after_close_failure(
         self, run_slot: RunSlot, run_lease_id: str, *, reason: str
     ) -> None:
+        # P0 fix: Use outer timeout only; env.force_cleanup has its own internal timeout
+        # but we don't wrap it in another asyncio.wait_for to avoid nested timeout confusion
         timeout = _env_float("WORKER_FORCE_CLEANUP_TIMEOUT", 30.0)
         try:
             logger.warning(
@@ -697,6 +714,7 @@ class WorkerPool:
                 reason,
                 timeout,
             )
+            # P0 fix: Apply timeout here at the caller level; env.force_cleanup should not use nested timeout
             await asyncio.wait_for(run_slot.env.force_cleanup(reason=reason), timeout=timeout)
             logger.warning(
                 "Force cleanup finished for run session %s after %s",
@@ -1055,6 +1073,8 @@ class WorkerPool:
             current = self._tasks.get(task_key)
             if current is None or current.runs.get(run_lease_id) is not run_slot:
                 return
+            # P0 fix: Set drop_scheduled flag to prevent _finish_run_op from also trying to pop
+            run_slot.drop_scheduled = True
             popped = self._pop_run_slot_locked(run_lease_id)
             if popped is not None:
                 popped_task_key, popped_run_slot = popped
@@ -1422,6 +1442,7 @@ class WorkerPool:
             ]
             skipped_young = pending_before_cancel - len(tasks_to_cancel)
 
+        # P0 fix: Cancel tasks and wait for their cancellation handlers using shield
         cancelled = 0
         for task in tasks_to_cancel:
             if not task.done():
@@ -1430,9 +1451,12 @@ class WorkerPool:
 
         if tasks_to_cancel:
             try:
-                await asyncio.wait_for(
-                    asyncio.gather(*tasks_to_cancel, return_exceptions=True),
-                    timeout=max(0.1, cancel_timeout),
+                # P0 fix: Use asyncio.shield to ensure cancellation handlers complete
+                await asyncio.shield(
+                    asyncio.wait_for(
+                        asyncio.gather(*tasks_to_cancel, return_exceptions=True),
+                        timeout=max(0.1, cancel_timeout),
+                    )
                 )
             except asyncio.TimeoutError:
                 logger.warning(
@@ -1781,9 +1805,11 @@ class WorkerPool:
             )
 
             # Run docker system prune in background with timeout
+            # P0 fix: Add fallback if prune hangs; close stderr pipe immediately to prevent fd leak
             cleanup_timeout = _env_float("WORKER_SHIM_CLEANUP_TIMEOUT", 30.0)
+            proc = None
             try:
-                result = await asyncio.wait_for(
+                proc = await asyncio.wait_for(
                     asyncio.create_subprocess_exec(
                         "docker",
                         "system",
@@ -1791,11 +1817,11 @@ class WorkerPool:
                         "-f",
                         "--volumes=false",
                         stdout=asyncio.subprocess.DEVNULL,
-                        stderr=asyncio.subprocess.PIPE,
+                        stderr=asyncio.subprocess.DEVNULL,  # P0 fix: Use DEVNULL to avoid fd leak
                     ),
                     timeout=cleanup_timeout,
                 )
-                await asyncio.wait_for(result.wait(), timeout=cleanup_timeout)
+                await asyncio.wait_for(proc.wait(), timeout=cleanup_timeout)
 
                 # Verify cleanup reduced shim count
                 new_pressure = worker_pressure_stats(force=True)
@@ -1807,20 +1833,31 @@ class WorkerPool:
                     self._reset_count,
                 )
 
-                # Reset counters
+                # Reset counters and timestamp
                 self._reset_count = 0
                 self._last_shim_cleanup_ts = now
 
             except asyncio.TimeoutError:
                 logger.warning(
-                    "Docker shim cleanup timed out after %.1fs (non-fatal, will retry next cycle)",
+                    "Docker shim cleanup timed out after %.1fs; skipping and relying on watchdog (non-fatal)",
                     cleanup_timeout,
                 )
+                # P0 fix: Kill hung subprocess
+                if proc is not None:
+                    try:
+                        proc.kill()
+                        await asyncio.wait_for(proc.wait(), timeout=5.0)
+                    except Exception:
+                        pass
+                # P0 fix: Still update timestamp to prevent retry storms
+                self._last_shim_cleanup_ts = now
             except Exception as exc:
                 logger.warning(
                     "Docker shim cleanup failed: %s (non-fatal, will retry next cycle)",
                     exc,
                 )
+                # P0 fix: Update timestamp on failure to prevent tight retry loop
+                self._last_shim_cleanup_ts = now
 
         except Exception:
             logger.exception("Error in _maybe_cleanup_shims (non-fatal)")

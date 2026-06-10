@@ -169,14 +169,27 @@ class TerminalEnvClient:
         except Exception as exc:
             error_str = str(exc)
             resp_text = ""
+            status_code = 0
+            # P1 fix: Extract status code to treat 500/502/503 as non-fatal
             if hasattr(exc, "response"):
                 try:
                     resp_text = exc.response.text
+                    status_code = getattr(exc.response, "status_code", 0)
                 except Exception:
                     pass
             combined = f"{error_str} {resp_text}"
             if "Unknown run_lease_id" in combined or "Unknown lease" in combined:
                 logger.debug("close(%s): lease already gone, nothing to do.", lease_id)
+                return
+            # P1 fix: Treat server errors (500/502/503) on close as non-fatal
+            # If pool_server crashed mid-close, don't block rollout; watchdog will clean up
+            if status_code in (500, 502, 503):
+                logger.warning(
+                    "close(%s): server error HTTP %d during close, treating as non-fatal: %s",
+                    lease_id,
+                    status_code,
+                    combined[:200],
+                )
                 return
             raise
         if not out.get("ok", False):

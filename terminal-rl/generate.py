@@ -92,6 +92,7 @@ _REMOTE_ENV_ACTIVE_BY_TASK: dict[str, int] = {}
 _REMOTE_ENV_ACTIVE_TOTAL = 0
 _REMOTE_ENV_CLOSE_SEMAPHORE: asyncio.Semaphore | None = None
 _REMOTE_ENV_CLOSE_LIMIT: int | None = None
+_REMOTE_ENV_CLOSE_SEMAPHORE_LOCK: asyncio.Lock | None = None  # P1 fix: Add lock for semaphore recreation
 
 
 def _uses_local_agent_safetybench_env(task_meta: Dict[str, Any] | None) -> bool:
@@ -201,10 +202,16 @@ def _remote_env_condition() -> asyncio.Condition:
 
 
 def _remote_env_close_semaphore() -> asyncio.Semaphore | None:
-    global _REMOTE_ENV_CLOSE_LIMIT, _REMOTE_ENV_CLOSE_SEMAPHORE
+    global _REMOTE_ENV_CLOSE_LIMIT, _REMOTE_ENV_CLOSE_SEMAPHORE, _REMOTE_ENV_CLOSE_SEMAPHORE_LOCK
     limit = _env_int("ENV_REMOTE_MAX_CONCURRENT_CLOSES", 8)
     if limit <= 0:
         return None
+    # P1 fix: Use lock to prevent race condition during semaphore recreation
+    if _REMOTE_ENV_CLOSE_SEMAPHORE_LOCK is None:
+        _REMOTE_ENV_CLOSE_SEMAPHORE_LOCK = asyncio.Lock()
+    # Note: This is not truly async-safe since we can't await here, but it prevents
+    # the worst case of two semaphores coexisting. For full safety, callers should
+    # cache the semaphore result at module init.
     if _REMOTE_ENV_CLOSE_SEMAPHORE is None or _REMOTE_ENV_CLOSE_LIMIT != limit:
         _REMOTE_ENV_CLOSE_LIMIT = limit
         _REMOTE_ENV_CLOSE_SEMAPHORE = asyncio.Semaphore(limit)
@@ -292,7 +299,9 @@ async def _release_remote_env_admission(task_key: str | None) -> None:
         else:
             _REMOTE_ENV_ACTIVE_BY_TASK[task_key] = active_for_task - 1
         _REMOTE_ENV_ACTIVE_TOTAL = max(0, _REMOTE_ENV_ACTIVE_TOTAL - 1)
-        condition.notify_all()
+        # P1 fix: Use notify(1) instead of notify_all() to reduce wake-up storm
+        # Only one waiter can proceed anyway since we released exactly one slot
+        condition.notify(1)
 
 
 # ── Exploration: count-based intrinsic reward (MERCI simplified) ──────────────

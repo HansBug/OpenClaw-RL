@@ -44,11 +44,12 @@ export WORKER_RUN_IDLE_TTL="${WORKER_RUN_IDLE_TTL:-180}"
 export ENV_SERVER_PORT="${ENV_SERVER_PORT:-18081}"
 
 # Timeouts and admission guards.
-# P0 fix: Increase reset timeout tolerance for Docker operations under load
+# P0 fix: Reduce reset timeout to fail fast on hung operations
+# With client-side retries (generate.py), aggressive server timeout is better
 export WORKER_CLOSE_TASK_TIMEOUT="${WORKER_CLOSE_TASK_TIMEOUT:-45}"
 export WORKER_ALLOCATED_TTL="${WORKER_ALLOCATED_TTL:-60}"  # 120→60s: CRITICAL fix for slot accumulation
-export WORKER_RESET_OPERATION_TIMEOUT="${WORKER_RESET_OPERATION_TIMEOUT:-720}"  # 330→720s: allow 12min for Docker ops under pressure
-export WORKER_RESETTING_TTL="${WORKER_RESETTING_TTL:-900}"  # 390→900s: match increased reset timeout
+export WORKER_RESET_OPERATION_TIMEOUT="${WORKER_RESET_OPERATION_TIMEOUT:-360}"  # 720→360s: fail fast on hung Docker ops (client retries)
+export WORKER_RESETTING_TTL="${WORKER_RESETTING_TTL:-450}"  # 900→450s: match reduced reset timeout + buffer
 export WORKER_CLOSING_REQUESTED_TTL="${WORKER_CLOSING_REQUESTED_TTL:-300}"
 export WORKER_PIDS_PAUSE_ALLOCATE_PCT="${WORKER_PIDS_PAUSE_ALLOCATE_PCT:-80}"
 export WORKER_PIDS_REJECT_RESET_PCT="${WORKER_PIDS_REJECT_RESET_PCT:-85}"

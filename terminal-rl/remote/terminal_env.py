@@ -396,7 +396,26 @@ class TerminalEnv:
             ]
             return user_msg, tool_schemas
 
-        return await asyncio.to_thread(_sync_reset)
+        # P0 FIX: Add hard timeout wrapper to prevent thread hang
+        # Even though _sync_reset has internal timeouts, asyncio.to_thread
+        # cannot cancel hung threads. We add external timeout + monitoring.
+        try:
+            return await asyncio.wait_for(
+                asyncio.to_thread(_sync_reset),
+                timeout=self._timeouts.reset_session + 60.0  # Internal timeout + 60s grace
+            )
+        except asyncio.TimeoutError:
+            logger.error(
+                "CRITICAL: reset operation hung beyond internal timeout "
+                f"(timeout={self._timeouts.reset_session}s). Thread may still be running. "
+                "This indicates Docker operations are stuck. Manual intervention may be required."
+            )
+            # Thread will continue running in background - this is a known limitation
+            # of asyncio.to_thread. The watchdog should detect this and restart the worker.
+            raise TimeoutError(
+                f"Reset operation exceeded timeout ({self._timeouts.reset_session + 60.0}s). "
+                "Docker operations may be hung. Worker may need restart."
+            )
 
     async def exec_tool(self, name: str, arguments: dict[str, Any]) -> str:
         if self._agent_safetybench_env is not None:

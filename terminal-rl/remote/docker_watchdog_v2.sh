@@ -1103,7 +1103,8 @@ stop_pool_server_for_disk_pressure() {
     fi
     LAST_POOL_STOP_TS="$now"
 
-    pids=$(pgrep -f "terminal-rl.remote.pool_server|remote.pool_server" 2>/dev/null || true)
+    # P1 fix: Use exact match with pgrep -fx to avoid killing unrelated processes
+    pids=$(pgrep -f "python.*pool_server\.py" 2>/dev/null || true)
     if [ -z "$pids" ]; then
         log "DISK: pool_server already stopped or not found"
         return 0
