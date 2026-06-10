@@ -522,6 +522,10 @@ class WorkerPool:
         self._force_cleanup_task_labels: dict[asyncio.Task, str] = {}
         self._close_requested_release_tasks: dict[str, asyncio.Task] = {}
 
+        # P0 fix: Track reset count for automatic shim cleanup
+        self._reset_count: int = 0
+        self._last_shim_cleanup_ts: float = time.time()
+
     def _new_env(self) -> TerminalEnv:
         return TerminalEnv()
 
@@ -616,6 +620,8 @@ class WorkerPool:
                 if op_name == "reset":
                     run_slot.reset_completed_ts = now
                     run_slot.phase = "ready"
+                    # P0 fix: Track successful resets for shim cleanup trigger
+                    self._reset_count += 1
                 elif op_name == "exec_tool":
                     if run_slot.first_step_ts is None:
                         run_slot.first_step_ts = now
@@ -1732,8 +1738,92 @@ class WorkerPool:
                         "Periodic reaper cleaned up %d idle run slots",
                         len(expired_slots),
                     )
+                # P0 fix: Automatic shim cleanup every 50 resets or when pressure detected
+                await self._maybe_cleanup_shims()
             except Exception:
                 logger.exception("Periodic reaper error")
+
+    async def _maybe_cleanup_shims(self) -> None:
+        """P0 fix: Proactively clean Docker shims to prevent resource exhaustion."""
+        try:
+            now = time.time()
+            cleanup_interval = _env_float("WORKER_SHIM_CLEANUP_INTERVAL", 600.0)  # 10 min default
+            reset_trigger = _env_int("WORKER_SHIM_CLEANUP_RESET_COUNT", 50)  # every 50 resets
+            pressure_threshold = _env_int("WORKER_SHIM_CLEANUP_PRESSURE_THRESHOLD", 140)  # cleanup at 140 shims
+
+            should_cleanup = False
+            reason = ""
+
+            # Check if enough time has passed since last cleanup
+            if now - self._last_shim_cleanup_ts < cleanup_interval:
+                return
+
+            # Trigger 1: Reset count threshold
+            if reset_trigger > 0 and self._reset_count >= reset_trigger:
+                should_cleanup = True
+                reason = f"reset_count={self._reset_count}>={reset_trigger}"
+
+            # Trigger 2: Shim pressure threshold
+            pressure = worker_pressure_stats()
+            shim_count = int(pressure.get("shim", 0))
+            if shim_count >= pressure_threshold:
+                should_cleanup = True
+                reason = f"shim_pressure={shim_count}>={pressure_threshold}"
+
+            if not should_cleanup:
+                return
+
+            logger.warning(
+                "Triggering automatic Docker shim cleanup: reason=%s shim_count=%d reset_count=%d",
+                reason,
+                shim_count,
+                self._reset_count,
+            )
+
+            # Run docker system prune in background with timeout
+            cleanup_timeout = _env_float("WORKER_SHIM_CLEANUP_TIMEOUT", 30.0)
+            try:
+                result = await asyncio.wait_for(
+                    asyncio.create_subprocess_exec(
+                        "docker",
+                        "system",
+                        "prune",
+                        "-f",
+                        "--volumes=false",
+                        stdout=asyncio.subprocess.DEVNULL,
+                        stderr=asyncio.subprocess.PIPE,
+                    ),
+                    timeout=cleanup_timeout,
+                )
+                await asyncio.wait_for(result.wait(), timeout=cleanup_timeout)
+
+                # Verify cleanup reduced shim count
+                new_pressure = worker_pressure_stats(force=True)
+                new_shim_count = int(new_pressure.get("shim", 0))
+                logger.warning(
+                    "Docker shim cleanup completed: shim_count %d→%d reset_count %d→0",
+                    shim_count,
+                    new_shim_count,
+                    self._reset_count,
+                )
+
+                # Reset counters
+                self._reset_count = 0
+                self._last_shim_cleanup_ts = now
+
+            except asyncio.TimeoutError:
+                logger.warning(
+                    "Docker shim cleanup timed out after %.1fs (non-fatal, will retry next cycle)",
+                    cleanup_timeout,
+                )
+            except Exception as exc:
+                logger.warning(
+                    "Docker shim cleanup failed: %s (non-fatal, will retry next cycle)",
+                    exc,
+                )
+
+        except Exception:
+            logger.exception("Error in _maybe_cleanup_shims (non-fatal)")
 
     async def shutdown(self) -> None:
         async with self._lock:

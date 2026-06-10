@@ -256,9 +256,12 @@ class Router:
                     max_attempts,
                     _format_error(exc),
                 )
-                backoff = self.forward_retry_backoff * attempt
-                if backoff > 0:
-                    await asyncio.sleep(backoff)
+                # P0 fix: Exponential backoff with jitter to prevent thundering herd
+                backoff = self.forward_retry_backoff * (2 ** (attempt - 1))
+                jitter = backoff * 0.2 * (hash(f"{worker_url}{path}{attempt}") % 100) / 100.0
+                total_backoff = backoff + jitter
+                if total_backoff > 0:
+                    await asyncio.sleep(total_backoff)
 
     async def forward(
         self,
@@ -601,7 +604,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--forward-timeout",
         type=float,
-        default=float(os.getenv("ROUTER_FORWARD_TIMEOUT", "600.0")),
+        default=float(os.getenv("ROUTER_FORWARD_TIMEOUT", "1800.0")),  # P0 fix: 600→1800s for reset endpoint
         help="HTTP timeout (seconds) when forwarding to a worker",
     )
     parser.add_argument(
@@ -613,8 +616,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--forward-retry-backoff",
         type=float,
-        default=float(os.getenv("ROUTER_FORWARD_RETRY_BACKOFF", "0.2")),
-        help="Linear backoff (seconds) between worker retries",
+        default=float(os.getenv("ROUTER_FORWARD_RETRY_BACKOFF", "2.0")),  # P0 fix: 0.2→2.0s exponential backoff base
+        help="Exponential backoff base (seconds) between worker retries",
     )
     parser.add_argument(
         "--pressure-cooldown",
