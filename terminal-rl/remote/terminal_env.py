@@ -319,6 +319,27 @@ class TerminalEnv:
         output_path.mkdir(parents=True, exist_ok=True)
 
         def _sync_reset() -> tuple[str, list[dict[str, Any]]]:
+            # P0 FIX: Force recreate container to avoid Docker daemon API slowdown
+            # Root cause: containers.get() HTTP call hangs 360s when container runs >1h
+            # Docker daemon state accumulation causes API performance degradation
+            # Solution: Delete old container, create fresh one (fast API response)
+            container_name = f"{self._task_spec.task_name}.{self._run_ctx.uid}.slime-run"
+            try:
+                import subprocess
+                # Force remove old container (timeout 5s, ignore errors)
+                subprocess.run(
+                    ['docker', 'rm', '-f', container_name],
+                    timeout=5,
+                    capture_output=True,
+                    check=False
+                )
+                logger.info(
+                    "Forced container recreation for %s to avoid Docker API slowdown",
+                    container_name
+                )
+            except Exception as e:
+                logger.debug("Container force-remove failed (may not exist): %s", e)
+
             self._trial_handler = TrialHandler(
                 trial_name=f"{self._task_spec.task_name}.{self._run_ctx.uid}.slime-run",
                 input_path=task_path,

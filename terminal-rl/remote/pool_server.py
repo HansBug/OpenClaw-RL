@@ -610,7 +610,7 @@ class WorkerPool:
             return run_slot
 
     async def _finish_run_op(
-        self, run_slot: RunSlot, op_name: str, *, success: bool
+        self, run_slot: RunSlot, op_name: str, *, success: bool, is_timeout_drop: bool = False
     ) -> None:
         close_after: tuple[str, str, RunSlot, str] | None = None
         async with self._lock:
@@ -660,6 +660,18 @@ class WorkerPool:
                 run_lease_id,
                 slot_to_close,
                 reason=close_reason,
+            )
+
+        # FIX-1: Handle timeout drop AFTER _finish_run_op completes to prevent TOCTOU race
+        # This ensures in_flight_ops is decremented before lease removal
+        if is_timeout_drop:
+            logger.info(
+                "Timeout drop deferred until after _finish_run_op: lease=%s op=%s",
+                run_slot.run_lease_id,
+                op_name,
+            )
+            await self._drop_resetting_run_for_timeout(
+                run_slot.run_lease_id, run_slot, timeout=0.0  # timeout already logged earlier
             )
 
     async def _close_run_slot_under_lock(self, run_slot: RunSlot) -> None:
@@ -1057,7 +1069,9 @@ class WorkerPool:
 
     @staticmethod
     def _reset_operation_timeout(timeouts: TaskTimeouts) -> float:
-        configured = _env_float("WORKER_RESET_OPERATION_TIMEOUT", 330.0)
+        # FIX-2: Increase default timeout from 360s to 720s to accommodate worst-case
+        # legitimate operation time (ENSURE_IMAGE_TIMEOUT=300s + RESET_SESSION_TIMEOUT=300s = 600s)
+        configured = _env_float("WORKER_RESET_OPERATION_TIMEOUT", "720.0")
         if configured > 0:
             return configured
         return max(30.0, float(timeouts.ensure_image) + float(timeouts.reset_session) + 30.0)
@@ -1112,31 +1126,51 @@ class WorkerPool:
         task_spec = _build_task_spec(task_meta)
         reset_timeout = self._reset_operation_timeout(timeouts)
 
+        # FIX-2: Progressive timeout - warn at halfway point, fail at full timeout
+        warn_timeout = reset_timeout / 2.0
+        is_timeout_drop = False
         success = False
         try:
             async with run_slot.lock:
+                # Create the reset operation once
+                reset_operation = run_slot.env.reset(
+                    task_meta=task_meta,
+                    task_spec=task_spec,
+                    run_ctx=run_ctx,
+                    timeouts=timeouts,
+                )
                 try:
+                    # First stage: wait with warning timeout
                     user_msg, tool_schemas = await asyncio.wait_for(
-                        run_slot.env.reset(
-                            task_meta=task_meta,
-                            task_spec=task_spec,
-                            run_ctx=run_ctx,
-                            timeouts=timeouts,
-                        ),
-                        timeout=reset_timeout,
+                        reset_operation,
+                        timeout=warn_timeout,
                     )
-                except asyncio.TimeoutError as exc:
-                    await self._drop_resetting_run_for_timeout(
-                        run_lease_id, run_slot, timeout=reset_timeout
+                except asyncio.TimeoutError:
+                    # Warn but continue with remaining time
+                    logger.warning(
+                        "Reset exceeds %.1fs (warn threshold), allowing %.1fs more: lease=%s",
+                        warn_timeout,
+                        reset_timeout - warn_timeout,
+                        run_lease_id,
                     )
-                    raise TimeoutError(
-                        f"WORKER_RESET_TIMEOUT lease_id={run_lease_id} "
-                        f"after {reset_timeout:.1f}s"
-                    ) from exc
+                    try:
+                        # Second stage: continue waiting with remaining timeout
+                        user_msg, tool_schemas = await asyncio.wait_for(
+                            reset_operation,
+                            timeout=reset_timeout - warn_timeout,
+                        )
+                    except asyncio.TimeoutError as exc:
+                        # FIX-1: Mark timeout for deferred cleanup instead of immediate drop
+                        is_timeout_drop = True
+                        raise TimeoutError(
+                            f"WORKER_RESET_TIMEOUT lease_id={run_lease_id} "
+                            f"after {reset_timeout:.1f}s"
+                        ) from exc
                 success = True
                 return {"user_msg": user_msg, "tool_schemas": tool_schemas}
         finally:
-            await self._finish_run_op(run_slot, "reset", success=success)
+            # FIX-1: Pass is_timeout_drop flag to defer cleanup until after in_flight_ops decremented
+            await self._finish_run_op(run_slot, "reset", success=success, is_timeout_drop=is_timeout_drop)
 
     async def reset(
         self,
@@ -2515,6 +2549,21 @@ async def heartbeat(request: Request) -> JSONResponse:
     try:
         await POOL.heartbeat(str(lease_id))
         return JSONResponse({"ok": True})
+    except KeyError as exc:
+        # FIX-3: Return HTTP 410 Gone for expired lease_id to prevent retry cascades
+        logger.warning(
+            "Heartbeat lease_id=%s no longer exists (likely timeout cleanup): %s",
+            lease_id,
+            exc,
+        )
+        return JSONResponse(
+            {
+                "ok": False,
+                "error": "Lease expired or already cleaned up",
+                "code": "LEASE_EXPIRED",
+            },
+            status_code=410,
+        )
     except Exception as exc:
         return JSONResponse({"ok": False, "error": str(exc)}, status_code=500)
 
@@ -2578,6 +2627,21 @@ async def reset(request: Request) -> JSONResponse:
             status_code=429,
             headers={"Retry-After": os.getenv("WORKER_RESET_IN_PROGRESS_RETRY_AFTER", "2")},
         )
+    except KeyError as exc:
+        # FIX-3: Return HTTP 410 Gone for expired lease_id to prevent retry cascades
+        logger.warning(
+            "Reset lease_id=%s no longer exists (likely timeout cleanup): %s",
+            lease_id,
+            exc,
+        )
+        return JSONResponse(
+            {
+                "ok": False,
+                "error": "Lease expired or already cleaned up",
+                "code": "LEASE_EXPIRED",
+            },
+            status_code=410,
+        )
     except Exception as exc:
         logger.exception("Reset failed for lease_id=%s", lease_id)
         try:
@@ -2625,6 +2689,21 @@ async def exec_tool(request: Request) -> JSONResponse:
             str(lease_id), tool_name, arguments=arguments
         )
         return JSONResponse({"ok": True, "observation": observation})
+    except KeyError as exc:
+        # FIX-3: Return HTTP 410 Gone for expired lease_id to prevent retry cascades
+        logger.warning(
+            "Exec_tool lease_id=%s no longer exists (likely timeout cleanup): %s",
+            lease_id,
+            exc,
+        )
+        return JSONResponse(
+            {
+                "ok": False,
+                "error": "Lease expired or already cleaned up",
+                "code": "LEASE_EXPIRED",
+            },
+            status_code=410,
+        )
     except Exception as exc:
         return JSONResponse({"ok": False, "error": str(exc)}, status_code=500)
 
@@ -2653,6 +2732,21 @@ async def evaluate(request: Request) -> JSONResponse:
         if details is not None:
             payload["details"] = details
         return JSONResponse(payload)
+    except KeyError as exc:
+        # FIX-3: Return HTTP 410 Gone for expired lease_id to prevent retry cascades
+        logger.warning(
+            "Evaluate lease_id=%s no longer exists (likely timeout cleanup): %s",
+            lease_id,
+            exc,
+        )
+        return JSONResponse(
+            {
+                "ok": False,
+                "error": "Lease expired or already cleaned up",
+                "code": "LEASE_EXPIRED",
+            },
+            status_code=410,
+        )
     except Exception as exc:
         return JSONResponse({"ok": False, "error": str(exc)}, status_code=500)
 
@@ -2674,6 +2768,21 @@ async def close(request: Request) -> JSONResponse:
     try:
         found = await POOL.close_run(str(lease_id), reason="http_close")
         return JSONResponse({"ok": True, "found": found})
+    except KeyError as exc:
+        # FIX-3: Return HTTP 410 Gone for expired lease_id to prevent retry cascades
+        logger.warning(
+            "Close lease_id=%s no longer exists (likely already cleaned up): %s",
+            lease_id,
+            exc,
+        )
+        return JSONResponse(
+            {
+                "ok": False,
+                "error": "Lease expired or already cleaned up",
+                "code": "LEASE_EXPIRED",
+            },
+            status_code=410,
+        )
     except Exception as exc:
         return JSONResponse({"ok": False, "error": str(exc)}, status_code=500)
 
