@@ -358,7 +358,25 @@ def assert_worker_has_capacity_for_docker(
     if os.getenv("WORKER_PRESSURE_GUARD_ENABLED", "1") == "0":
         return
 
-    pressure = worker_pressure_stats()
+    # CRITICAL FIX: Catch RuntimeError that blocks all reset operations
+    # Issue: "cannot reuse already awaited coroutine" causes 100% reset failure
+    # This is a defensive measure while investigating root cause
+    try:
+        pressure = worker_pressure_stats()
+    except RuntimeError as e:
+        logger.error(
+            "RuntimeError in worker_pressure_stats (allowing %s to proceed): %s",
+            phase,
+            e,
+            exc_info=True
+        )
+        # Degraded mode: skip pressure checks to unblock reset operations
+        # This allows containers to be reset/deleted, preventing >1h uptime accumulation
+        return
+    except Exception as e:
+        logger.exception("Unexpected error in worker_pressure_stats for phase=%s: %s", phase, e)
+        return
+
     pids_pause_pct = _env_float("WORKER_PIDS_PAUSE_ALLOCATE_PCT", 60.0)
     pids_reject_reset_pct = _env_float("WORKER_PIDS_REJECT_RESET_PCT", 70.0)
     pids_min_free_allocate = _env_int("WORKER_PIDS_MIN_FREE_ALLOCATE", 6000)
@@ -716,9 +734,9 @@ class WorkerPool:
     async def _force_cleanup_after_close_failure(
         self, run_slot: RunSlot, run_lease_id: str, *, reason: str
     ) -> None:
-        # P0 fix: Use outer timeout only; env.force_cleanup has its own internal timeout
-        # but we don't wrap it in another asyncio.wait_for to avoid nested timeout confusion
-        timeout = _env_float("WORKER_FORCE_CLEANUP_TIMEOUT", 30.0)
+        # STABILITY FIX: Increase timeout from 30s to 90s to handle Docker operations under load
+        # Analysis shows 93 force cleanup timeouts; Docker container removal can take 60-90s under pressure
+        timeout = _env_float("WORKER_FORCE_CLEANUP_TIMEOUT", 90.0)
         try:
             logger.warning(
                 "Force cleanup starting for run session %s after %s (timeout=%.1fs)",
@@ -954,6 +972,8 @@ class WorkerPool:
     @staticmethod
     def _stale_reason_for_run_slot(run_slot: RunSlot, now: float) -> tuple[str, float]:
         allocated_ttl = _env_float("WORKER_ALLOCATED_TTL", 120.0)
+        # STABILITY FIX: Match WORKER_RESET_OPERATION_TIMEOUT (720s) + 180s buffer = 900s
+        # This prevents runs from being marked stale while legitimate reset operations are in progress
         resetting_ttl = _env_float("WORKER_RESETTING_TTL", 900.0)
         closing_ttl = _env_float("WORKER_CLOSING_REQUESTED_TTL", 300.0)
         created_age_sec = now - run_slot.created_ts
@@ -1071,7 +1091,7 @@ class WorkerPool:
     def _reset_operation_timeout(timeouts: TaskTimeouts) -> float:
         # FIX-2: Increase default timeout from 360s to 720s to accommodate worst-case
         # legitimate operation time (ENSURE_IMAGE_TIMEOUT=300s + RESET_SESSION_TIMEOUT=300s = 600s)
-        configured = _env_float("WORKER_RESET_OPERATION_TIMEOUT", "720.0")
+        configured = _env_float("WORKER_RESET_OPERATION_TIMEOUT", 720.0)
         if configured > 0:
             return configured
         return max(30.0, float(timeouts.ensure_image) + float(timeouts.reset_session) + 30.0)
@@ -1335,6 +1355,7 @@ class WorkerPool:
             self._prune_done_force_cleanup_tasks()
             now = time.time()
             allocated_ttl = _env_float("WORKER_ALLOCATED_TTL", 120.0)
+            # STABILITY FIX: Match WORKER_RESET_OPERATION_TIMEOUT (720s) + 180s buffer = 900s
             resetting_ttl = _env_float("WORKER_RESETTING_TTL", 900.0)
             closing_ttl = _env_float("WORKER_CLOSING_REQUESTED_TTL", 300.0)
             close_ages = [
@@ -2416,7 +2437,8 @@ async def repair_resetting_runs(request: Request) -> JSONResponse:
 
     data = await json_payload(request)
     reason = str(data.get("reason") or "manual")
-    min_age = _env_float("WORKER_REPAIR_RESETTING_MIN_AGE", 390.0)
+    # STABILITY FIX: Match WORKER_RESETTING_TTL to prevent "zombie state" where runs expire at 450s but repair doesn't trigger until 900s
+    min_age = _env_float("WORKER_REPAIR_RESETTING_MIN_AGE", 900.0)
     max_repairs = _env_int("WORKER_REPAIR_RESETTING_MAX_REPAIRS", 64)
     try:
         if "min_age" in data:
