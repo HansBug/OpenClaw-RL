@@ -1,24 +1,23 @@
 #!/usr/bin/env bash
-# Terminal-RL Qwen3-8B training on a single 4-GPU node.
+# Terminal-RL Qwen3-8B mixed-data DAPO baseline without dynamic sampling.
 #
-# Adapted from terminal-rl_qwen3-8b.sh with the same local-env pattern used by
-# swe-rl/scripts/run_swe_rl_8b_remote_1node_v4.sh:
-#   * Hardcode Qwen3-8B / Megatron paths that live under /mnt/shared-storage-user/puyuan
-#   * Use the lightrft_py312 conda env for Ray / sglang
-#   * 4 GPUs: actor=2, rollout=2, TP=2, engine TP=2
-#   * Structured logs at logs/<run_name>/{train.log,router.log,run_config.json}
+# Defaults:
+#   * DATASET=mixed with seta:safety:agentharm = 6:2:2
+#   * ALGO=dapo, DAPO_DYNAMIC_SAMPLING=0
+#   * CUSTOM_CONFIG_PATH=configs/rollout_qwen3_think.yaml
+#   * HARNESS_OPTION=camel-agent, MAX_TURN=10
 #
 # Prerequisites (remote 4-GPU worker):
 #   1. Pool server(s) running on reachable host(s), default port 18081:
 #        bash terminal-rl/remote/run_pool_server_pu_v2.sh
 #   2. WORKER_URLS exported, e.g.
 #        export WORKER_URLS="http://<worker-ip>:18081"
-#   3. ROLLOUT_PROMPT_DATA pointing to a converted seta_env train.jsonl
+#   3. Converted SetA / Agent-SafetyBench / AgentHarm datasets available.
 #
 # Usage:
-#   bash terminal-rl/terminal-rl_qwen3-8b_pu.sh                    # full run
-#   DEBUG_MODE=1 bash terminal-rl/terminal-rl_qwen3-8b_pu.sh       # tiny rollout
-#   NUM_GPUS=4 ACTOR_GPUS=2 ROLLOUT_GPUS=2 bash ... _pu.sh         # override
+#   bash terminal-rl/terminal-rl_qwen3-8b_mixed_dapo_baseline_nodynamic_pu.sh
+#   DEBUG_MODE=1 bash terminal-rl/terminal-rl_qwen3-8b_mixed_dapo_baseline_nodynamic_pu.sh
+#   NUM_GPUS=4 ACTOR_GPUS=2 ROLLOUT_GPUS=2 bash ..._mixed_dapo_baseline_nodynamic_pu.sh
 #
 # Structured reward observability:
 #   TERMINAL_STRUCTURED_METRICS=1 writes per-rollout dataset reward breakdowns
@@ -90,7 +89,7 @@ export REPO_ROOT
 export SLIME_DIR="${SLIME_DIR:-${REPO_ROOT}/slime}"
 export MEGATRON_DIR="${MEGATRON_DIR:-${REPO_ROOT}/Megatron-LM}"
 
-CUSTOM_CONFIG_PATH="${CUSTOM_CONFIG_PATH:-${SCRIPT_DIR}/configs/rollout_qwen3.yaml}"
+CUSTOM_CONFIG_PATH="${CUSTOM_CONFIG_PATH:-${SCRIPT_DIR}/configs/rollout_qwen3_think.yaml}"
 
 # Hardcoded Qwen3-8B (matches swe-rl v4 pattern)
 HF_CKPT="${HF_CKPT:-/mnt/shared-storage-user/puyuan/code/slime/Qwen3-8B/}"
@@ -101,7 +100,7 @@ RUN_TIMESTAMP="${RUN_TIMESTAMP:-$(date +%F_%H%M%S)}"
 DEBUG_MODE="${DEBUG_MODE:-0}"
 # Defaults needed early so the run directory name carries the key experiment
 # identity. Dataset construction and full validation still happen below.
-ALGO="${ALGO:-grpo}"
+ALGO="${ALGO:-dapo}"
 case "${ALGO}" in
   grpo|dapo) ;;
   *)
@@ -110,7 +109,7 @@ case "${ALGO}" in
     ;;
 esac
 export ALGO
-DATASET="${DATASET:-seta}"
+DATASET="${DATASET:-mixed}"
 case "${DATASET}" in
   seta|safety|agentharm|mixed) ;;
   *)
@@ -135,10 +134,14 @@ SETA_SAFETY="${SETA_SAFETY:-none}"
 SAFETY_BENCH_REWARD="${SAFETY_BENCH_REWARD:-dense_rule}"
 AGENTHARM_REWARD="${AGENTHARM_REWARD:-dense_rule}"
 SAFETY_REWARD_COEF="${SAFETY_REWARD_COEF:-0}"
+MIX_SETA_RATIO="${MIX_SETA_RATIO:-6}"
+MIX_SAFETY_RATIO="${MIX_SAFETY_RATIO:-2}"
+MIX_AGENTHARM_RATIO="${MIX_AGENTHARM_RATIO:-2}"
+MIX_MODE="${MIX_MODE:-all_visible}"
 MAX_TURN="${MAX_TURN:-10}"
 DAPO_EPS_CLIP_HIGH="${DAPO_EPS_CLIP_HIGH:-0.28}"
 DAPO_CALCULATE_PER_TOKEN_LOSS="${DAPO_CALCULATE_PER_TOKEN_LOSS:-1}"
-DAPO_DYNAMIC_SAMPLING="${DAPO_DYNAMIC_SAMPLING:-1}"
+DAPO_DYNAMIC_SAMPLING="${DAPO_DYNAMIC_SAMPLING:-0}"
 
 # Exploration defaults are defined in the main script as well as the wrapper so
 # direct invocations remain stable under `set -u`, and Ray runtime_env can always
@@ -148,7 +151,7 @@ DAPO_DYNAMIC_SAMPLING="${DAPO_DYNAMIC_SAMPLING:-1}"
 # switches as disabled.
 EXPLORATION_PROFILE="${EXPLORATION_PROFILE:-${EXPLORE_PROFILE:-off}}"
 EXPLORE_ENTROPY_COEF="${EXPLORE_ENTROPY_COEF:-0.0}"
-EXPLORE_THINK_MODE="${EXPLORE_THINK_MODE:-0}"
+EXPLORE_THINK_MODE="${EXPLORE_THINK_MODE:-1}"
 EXPLORE_TEMP_HIGH="${EXPLORE_TEMP_HIGH:-}"
 EXPLORE_INTRINSIC="${EXPLORE_INTRINSIC:-0}"
 EXPLORE_INTRINSIC_ENABLED="${EXPLORE_INTRINSIC_ENABLED:-${EXPLORE_INTRINSIC}}"
@@ -300,16 +303,16 @@ build_algo_tag() {
 RUN_DATASET_TAG="$(sanitize_run_part "$(build_dataset_tag)")"
 RUN_ALGO_TAG="$(sanitize_run_part "$(build_algo_tag)")"
 RUN_HARNESS_TAG="$(sanitize_run_part "${HARNESS_OPTION}")"
-# Checkpoint saving is OFF by default. Set MAX_CKPT_KEEP=N (N>0) to enable.
+# Checkpoint saving keeps only the latest N checkpoints by default.
 # When enabled, only the latest N checkpoints are kept; older ones are auto-deleted.
-MAX_CKPT_KEEP="${MAX_CKPT_KEEP:-0}"
+MAX_CKPT_KEEP="${MAX_CKPT_KEEP:-2}"
 SAVE_INTERVAL="${SAVE_INTERVAL:-8}"
 if [[ "${DEBUG_MODE}" == "1" ]]; then
-  RUN_NAME="${RUN_NAME:-terminal-rl_qwen3-8b_${NUM_GPUS}gpu_debug_${RUN_DATASET_TAG}_${RUN_ALGO_TAG}_harness-${RUN_HARNESS_TAG}_mt${MAX_TURN}_${RUN_TIMESTAMP}}"
+  RUN_NAME="${RUN_NAME:-terminal-rl_qwen3-8b_${NUM_GPUS}gpu_debug_mixed_dapo_nodynamic_think_s${MIX_SETA_RATIO}_asb${MIX_SAFETY_RATIO}_ah${MIX_AGENTHARM_RATIO}_harness-${RUN_HARNESS_TAG}_mt${MAX_TURN}_${RUN_TIMESTAMP}}"
   # Debug mode: never save checkpoints regardless of MAX_CKPT_KEEP
   MAX_CKPT_KEEP=0
 else
-  RUN_NAME="${RUN_NAME:-terminal-rl_qwen3-8b_${NUM_GPUS}gpu_${RUN_DATASET_TAG}_${RUN_ALGO_TAG}_harness-${RUN_HARNESS_TAG}_mt${MAX_TURN}_${RUN_TIMESTAMP}}"
+  RUN_NAME="${RUN_NAME:-terminal-rl_qwen3-8b_${NUM_GPUS}gpu_mixed_dapo_nodynamic_think_s${MIX_SETA_RATIO}_asb${MIX_SAFETY_RATIO}_ah${MIX_AGENTHARM_RATIO}_harness-${RUN_HARNESS_TAG}_mt${MAX_TURN}_${RUN_TIMESTAMP}}"
 fi
 
 # ── Unified run directory (see STORAGE.md) ───────────────────────────────
@@ -596,10 +599,10 @@ source "${SLIME_DIR}/scripts/models/qwen3-8B.sh"
 #   clawsentry = use ClawSentry safety score (same mechanism as seta)
 #
 # ALGO:
-#   grpo = existing baseline path (default, unchanged)
+#   grpo = existing baseline path
 #   dapo = verl DAPO recipe knobs on top of GRPO estimator:
-#          clip-higher, token-level loss, dynamic sampling, overlong shaping
-ALGO="${ALGO:-grpo}"
+#          clip-higher, token-level loss, optional dynamic sampling, overlong shaping
+ALGO="${ALGO:-dapo}"
 case "${ALGO}" in
   grpo|dapo) ;;
   *)
@@ -609,12 +612,12 @@ case "${ALGO}" in
 esac
 export ALGO
 
-DATASET="${DATASET:-seta}"
+DATASET="${DATASET:-mixed}"
 SETA_SAFETY="${SETA_SAFETY:-none}"
-SAFETY_BENCH_REWARD="${SAFETY_BENCH_REWARD:-rule}"
+SAFETY_BENCH_REWARD="${SAFETY_BENCH_REWARD:-dense_rule}"
 AGENT_SAFETYBENCH_REMOTE_ENV="${AGENT_SAFETYBENCH_REMOTE_ENV:-0}"
 AGENT_SAFETYBENCH_ROOT="${AGENT_SAFETYBENCH_ROOT:-/mnt/shared-storage-user/puyuan/code/Agent-SafetyBench}"
-AGENTHARM_REWARD="${AGENTHARM_REWARD:-rule}"
+AGENTHARM_REWARD="${AGENTHARM_REWARD:-dense_rule}"
 AGENTHARM_REMOTE_ENV="${AGENTHARM_REMOTE_ENV:-0}"
 AGENTHARM_ROOT="${AGENTHARM_ROOT:-/mnt/shared-storage-user/puyuan/code/inspect_evals/src/inspect_evals/agentharm}"
 
@@ -636,6 +639,9 @@ ensure_agentharm_dataset() {
 INCLUDES_SETA="0"
 INCLUDES_SAFETY="0"
 INCLUDES_AGENTHARM="0"
+MIX_SETA_RATIO="${MIX_SETA_RATIO:-6}"
+MIX_SAFETY_RATIO="${MIX_SAFETY_RATIO:-2}"
+MIX_AGENTHARM_RATIO="${MIX_AGENTHARM_RATIO:-2}"
 MIX_MODE="${MIX_MODE:-all_visible}"
 export MIX_MODE
 
@@ -1082,11 +1088,9 @@ if [[ "${DEBUG_MODE}" == "1" ]]; then
   MAX_TOKENS_PER_GPU=8192
 else
   NUM_ROLLOUT="${NUM_ROLLOUT:-2000}"
-  # issue #3 §1: each rollout = ROLLOUT_BATCH_SIZE * N_SAMPLES concurrent lease
-  # requests against the pool. With 1 worker pool (--max-tasks 16 default), the
-  # original 16*8=128 burst easily saturates docker. Drop to 8*4=32 to leave
-  # room for retries and to avoid the connection-reset cascade seen in run-3.
-  ROLLOUT_BATCH_SIZE="${ROLLOUT_BATCH_SIZE:-16}"
+  # each rollout = ROLLOUT_BATCH_SIZE * N_SAMPLES concurrent lease requests.
+  # Keep this baseline explicit and predictable without dynamic sampling.
+  ROLLOUT_BATCH_SIZE="${ROLLOUT_BATCH_SIZE:-8}"
   N_SAMPLES="${N_SAMPLES:-8}"
   MAX_TOKENS_PER_GPU="${MAX_TOKENS_PER_GPU:-16384}"
 fi
@@ -1157,7 +1161,7 @@ DAPO_USE_KL_LOSS="${DAPO_USE_KL_LOSS:-0}"
 DAPO_KL_LOSS_COEF="${DAPO_KL_LOSS_COEF:-0.0}"
 DAPO_KL_LOSS_TYPE="${DAPO_KL_LOSS_TYPE:-k3}"
 DAPO_CALCULATE_PER_TOKEN_LOSS="${DAPO_CALCULATE_PER_TOKEN_LOSS:-1}"
-DAPO_DYNAMIC_SAMPLING="${DAPO_DYNAMIC_SAMPLING:-1}"
+DAPO_DYNAMIC_SAMPLING="${DAPO_DYNAMIC_SAMPLING:-0}"
 DAPO_DYNAMIC_FILTER_PATH="${DAPO_DYNAMIC_FILTER_PATH:-slime.rollout.filter_hub.dynamic_sampling_filters.check_reward_nonzero_std}"
 DAPO_OVER_SAMPLING_BATCH_SIZE="${DAPO_OVER_SAMPLING_BATCH_SIZE:-${ROLLOUT_BATCH_SIZE}}"
 DAPO_FAILED_GROUP_ABORT_MIN_GROUPS="${DAPO_FAILED_GROUP_ABORT_MIN_GROUPS:-${ROLLOUT_BATCH_SIZE}}"

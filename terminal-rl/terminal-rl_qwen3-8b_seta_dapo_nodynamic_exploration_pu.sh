@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
-# Default SETA-only robust exploration launch for Qwen3-8B.
+# Default SETA-only robust exploration launch without dynamic sampling for Qwen3-8B.
 #
 # This wrapper pins the dataset to SETA and enables the robust exploration
-# defaults discussed in the reward review. It delegates execution to
-# terminal-rl_qwen3-8b_exploration_pu.sh so runtime_env propagation and the
-# training command stay centralized.
+# defaults discussed in the reward review. It delegates execution to the mixed
+# nodynamic exploration wrapper so runtime_env propagation and the training
+# command stay centralized.
 
 set -euo pipefail
 
@@ -18,7 +18,7 @@ ALGO="${ALGO:-dapo}"
 HARNESS_OPTION="${HARNESS_OPTION:-camel-agent}"
 
 # Keep the default run name explicit enough for later ablations.
-RUN_ID="${RUN_ID:-terminal-rl_qwen3-8b_${NUM_GPUS}gpu_seta_dapo_exploration_epi_mean_life_label_decay0.995_ngu_dualadv_think_${RUN_TIMESTAMP}}"
+RUN_ID="${RUN_ID:-terminal-rl_qwen3-8b_${NUM_GPUS}gpu_seta_dapo_nodynamic_exploration_epi_mean_life_label_decay0.995_ngu_dualadv_think_${RUN_TIMESTAMP}}"
 RUN_NAME="${RUN_NAME:-${RUN_ID}}"
 
 # Rollout / training size defaults from the mixed robust exploration run.
@@ -27,7 +27,8 @@ N_SAMPLES="${N_SAMPLES:-8}"
 MAX_TURN="${MAX_TURN:-10}"
 MAX_CKPT_KEEP="${MAX_CKPT_KEEP:-2}"
 TRAJECTORY_SAVE_INTERVAL="${TRAJECTORY_SAVE_INTERVAL:-10}"
-EXTRA_DAPO_ARGS="${EXTRA_DAPO_ARGS:---dynamic-sampling-max-groups 64 --dynamic-sampling-max-seconds 1800 --rollout-abort-wait-timeout 300}"
+DAPO_DYNAMIC_SAMPLING="${DAPO_DYNAMIC_SAMPLING:-0}"
+EXTRA_DAPO_ARGS="${EXTRA_DAPO_ARGS:-}"
 ROUTER_READY_WAIT_FOREVER="${ROUTER_READY_WAIT_FOREVER:-1}"
 AUTO_CLOSE_STALE_WORKER_RUNS="${AUTO_CLOSE_STALE_WORKER_RUNS:-1}"
 STALE_WORKER_CLOSE_INTERVAL="${STALE_WORKER_CLOSE_INTERVAL:-10}"
@@ -101,7 +102,7 @@ EXPLORE_SAFETY_FILTER="${EXPLORE_SAFETY_FILTER:-0}"
 
 export RUN_TIMESTAMP NUM_GPUS RUN_ID RUN_NAME
 export DATASET ALGO HARNESS_OPTION
-export ROLLOUT_BATCH_SIZE N_SAMPLES MAX_TURN MAX_CKPT_KEEP TRAJECTORY_SAVE_INTERVAL EXTRA_DAPO_ARGS
+export ROLLOUT_BATCH_SIZE N_SAMPLES MAX_TURN MAX_CKPT_KEEP TRAJECTORY_SAVE_INTERVAL DAPO_DYNAMIC_SAMPLING EXTRA_DAPO_ARGS
 export ROUTER_READY_WAIT_FOREVER AUTO_CLOSE_STALE_WORKER_RUNS STALE_WORKER_CLOSE_INTERVAL STALE_WORKER_CLOSE_TIMEOUT
 export STALE_WORKER_REPAIR_MIN_AGE STALE_WORKER_REPAIR_MAX_REPAIRS
 export SETA_SAFETY SAFETY_REWARD_COEF CUSTOM_CONFIG_PATH TERMINAL_WANDB_METRIC_PROFILE
@@ -123,4 +124,4 @@ export EXPLORE_ADVANTAGE_BONUS EXPLORE_ADVANTAGE_BONUS_MODE EXPLORE_ADVANTAGE_IN
 export EXPLORE_ADVANTAGE_LAMBDA EXPLORE_ADVANTAGE_ARM_WEIGHT_MODE EXPLORE_ADVANTAGE_TRUST_KEY EXPLORE_ADVANTAGE_BONUS_CLIP
 export EXPLORE_CDE_ACTOR EXPLORE_LPRND EXPLORE_SAFETY_FILTER
 
-exec bash "${SCRIPT_DIR}/terminal-rl_qwen3-8b_exploration_pu.sh" "$@"
+exec bash "${SCRIPT_DIR}/terminal-rl_qwen3-8b_mixed_dapo_nodynamic_exploration_pu.sh" "$@"

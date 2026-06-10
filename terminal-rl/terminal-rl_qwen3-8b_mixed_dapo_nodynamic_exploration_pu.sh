@@ -1,17 +1,17 @@
 #!/usr/bin/env bash
-# terminal-rl_qwen3-8b_exploration_pu.sh
-# Default exploration training wrapper around terminal-rl_qwen3-8b_pu.sh.
+# terminal-rl_qwen3-8b_mixed_dapo_nodynamic_exploration_pu.sh
+# Mixed-data DAPO exploration wrapper without dynamic sampling.
 #
 # Defaults use the 2026-06-05 mixed DAPO Agent57/NGU-lite run as the base and
 # enable the robust exploration fixes: length-invariant episodic novelty,
 # coarse lifelong keys, soft trust gate, and dual-stream intrinsic advantage.
 # Override env vars explicitly for ablations or to reproduce the original run.
-# Dataset and algorithm selection intentionally follow terminal-rl_qwen3-8b_pu.sh:
+# Dataset and algorithm selection intentionally follow the mixed nodynamic base script:
 #   DATASET=seta|safety|agentharm|mixed
 #   ALGO=grpo|dapo
 #
 # USAGE:
-#   bash terminal-rl/terminal-rl_qwen3-8b_exploration_pu.sh              # default mixed DAPO robust Agent57/NGU-lite
+#   bash terminal-rl/terminal-rl_qwen3-8b_mixed_dapo_nodynamic_exploration_pu.sh
 #   DATASET=safety ALGO=dapo bash ...exploration_pu.sh                   # ASB + DAPO override
 #   EXPLORATION_PROFILE=robust_dapo_lite bash ...exploration_pu.sh       # conservative DAPO exploration override
 #   EXPLORATION_PROFILE=off EXPLORE_AGENT57_LITE=0 bash ...exploration_pu.sh # baseline-style ablation
@@ -81,7 +81,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &>/dev/null && pwd)"
 
 # Default robust blueprint based on the 2026-06-05 mixed DAPO Agent57/NGU-lite
-# run, with think rollout config enabled by default for new launches.
+# run, with think rollout config enabled by default and DAPO dynamic sampling off.
 export CUSTOM_CONFIG_PATH=/mnt/shared-storage-user/puyuan/code/OpenClaw-RL/terminal-rl/configs/rollout_qwen3_think.yaml
 unset EXPLORE_INTRINSIC_ENABLED EXPLORE_SAFETY_FILTER_ENABLED EXPLORE_LPRND_ENABLED EXPLORE_ADVANTAGE_BONUS_ENABLED EXPLORE_CDE_ACTOR_ENABLED
 NUM_GPUS="${NUM_GPUS:-8}"
@@ -98,10 +98,11 @@ N_SAMPLES="${N_SAMPLES:-8}"
 MAX_TURN="${MAX_TURN:-10}"
 MAX_CKPT_KEEP="${MAX_CKPT_KEEP:-2}"
 TRAJECTORY_SAVE_INTERVAL="${TRAJECTORY_SAVE_INTERVAL:-10}"
-EXTRA_DAPO_ARGS="${EXTRA_DAPO_ARGS:---dynamic-sampling-max-groups 64 --dynamic-sampling-max-seconds 1800 --rollout-abort-wait-timeout 300}"
+DAPO_DYNAMIC_SAMPLING="${DAPO_DYNAMIC_SAMPLING:-0}"
+EXTRA_DAPO_ARGS="${EXTRA_DAPO_ARGS:-}"
 
 # ── Baseline-compatible Dataset / Algorithm Options ─────────────────
-# Keep these names/defaults aligned with terminal-rl_qwen3-8b_pu.sh so switching
+# Keep these names/defaults aligned with the mixed nodynamic base script so switching
 # between the main and exploration scripts does not require mental translation.
 USER_ALGO_SET="${ALGO+x}"
 DATASET="${DATASET:-mixed}"
@@ -135,7 +136,7 @@ case "${HARNESS_OPTION}" in
 esac
 export DATASET ALGO HARNESS_OPTION
 RUN_TIMESTAMP="${RUN_TIMESTAMP:-$(date +%Y-%m-%d_%H%M%S)}"
-RUN_ID="${RUN_ID:-terminal-rl_qwen3-8b_${NUM_GPUS}gpu_mixed_dapo_exploration_epi_mean_life_label_decay0.995_ngu_dualadv_think_${RUN_TIMESTAMP}}"
+RUN_ID="${RUN_ID:-terminal-rl_qwen3-8b_${NUM_GPUS}gpu_mixed_dapo_nodynamic_exploration_epi_mean_life_label_decay0.995_ngu_dualadv_think_s${MIX_SETA_RATIO}_asb${MIX_SAFETY_RATIO}_ah${MIX_AGENTHARM_RATIO}_${RUN_TIMESTAMP}}"
 RUN_NAME="${RUN_NAME:-${RUN_ID}}"
 export NUM_GPUS RUN_TIMESTAMP RUN_ID RUN_NAME
 SETA_SAFETY="${SETA_SAFETY:-none}"
@@ -320,7 +321,7 @@ echo "  RETRY_ATTEMPTS  = ${EXPLORE_RETRY_ATTEMPTS} (traj_gamma=${EXPLORE_RETRY_
 echo "========================================"
 
 # ── 1. Entropy bonus -> pass to baseline via EXTRA_ALGO_ARGS ──
-# Bug fix: the old wrapper used EXTRA_GRPO_ARGS only. terminal-rl_qwen3-8b_pu.sh
+# Bug fix: the old wrapper used EXTRA_GRPO_ARGS only. The base script
 # intentionally ignores EXTRA_GRPO_ARGS when ALGO=dapo, so entropy silently
 # disappeared exactly in the DAPO exploration setting this script is meant to run.
 # EXTRA_ALGO_ARGS is consumed by both GRPO and DAPO branches.
@@ -457,7 +458,7 @@ fi
 export CUSTOM_CONFIG_PATH
 export MIX_MODE SAVE_INTERVAL_SETA SAVE_INTERVAL_ASB SAVE_INTERVAL_AGENTHARM AVE_INTERVAL_AGENTHARM
 export MIX_SETA_RATIO MIX_SAFETY_RATIO MIX_AGENTHARM_RATIO
-export ROLLOUT_BATCH_SIZE N_SAMPLES MAX_TURN MAX_CKPT_KEEP TRAJECTORY_SAVE_INTERVAL EXTRA_DAPO_ARGS
+export ROLLOUT_BATCH_SIZE N_SAMPLES MAX_TURN MAX_CKPT_KEEP TRAJECTORY_SAVE_INTERVAL DAPO_DYNAMIC_SAMPLING EXTRA_DAPO_ARGS
 export EXPLORATION_PROFILE
 export EXPLORE_ENTROPY_COEF EXPLORE_THINK_MODE EXPLORE_TEMP_HIGH
 export EXPLORE_INTRINSIC EXPLORE_INTRINSIC_COEF EXPLORE_INTRINSIC_SCHEDULE EXPLORE_INTRINSIC_DECAY_STEPS EXPLORE_INTRINSIC_REDUCER EXPLORE_INTRINSIC_GRANULARITY EXPLORE_INTRINSIC_SCOPE EXPLORE_SCORE_BONUS_COMPONENTS
@@ -472,5 +473,5 @@ export EXPLORE_CDE_ACTOR EXPLORE_CDE_ACTOR_OMEGA EXPLORE_CDE_ACTOR_KAPPA EXPLORE
 export EXPLORE_RETRY_ATTEMPTS EXPLORE_RETRY_TRAJ_GAMMA
 export TERMINAL_STRUCTURED_METRICS TERMINAL_METRICS_JSONL TERMINAL_WANDB_METRIC_PROFILE
 
-# ── 12. Execute baseline script ──
-exec bash "${SCRIPT_DIR}/terminal-rl_qwen3-8b_pu.sh" "$@"
+# ── 12. Execute mixed nodynamic baseline script ──
+exec bash "${SCRIPT_DIR}/terminal-rl_qwen3-8b_mixed_dapo_nodynamic_pu.sh" "$@"

@@ -2179,6 +2179,9 @@ async def generate(
             "ENV_RESET_HTTP_TIMEOUT",
             float(timeouts.reset_session) + 30.0,
         )
+        reset_max_retries = _env_int("ENV_RESET_MAX_RETRIES", 2)  # P0 FIX: Default 2 retries
+        reset_retry_backoff = _env_float("ENV_RESET_RETRY_BACKOFF", 10.0)  # P0 FIX: 10s backoff
+
         reset_kwargs = {
             "lease_id": lease_id,
             "task_meta": task_meta,
@@ -2190,12 +2193,61 @@ async def generate(
                 f"{task_key}:{run_ctx.uid}:{run_ctx.group_index}:"
                 f"{run_ctx.sample_index}:reset"
             )
-        reset_coro = env_client.reset(**reset_kwargs)
-        reset_payload = await _await_with_optional_timeout(
-            reset_coro,
-            reset_http_timeout,
-            op_name=f"{_log_tag} env reset",
-        )
+
+        # P0 FIX: Retry reset on timeout to prevent slot leaks (RLINFRA 9.8:1 → 1.3:1)
+        reset_payload = None
+        reset_start_time = time.time()
+        for reset_attempt in range(1, reset_max_retries + 1):
+            try:
+                reset_coro = env_client.reset(**reset_kwargs)
+                reset_payload = await _await_with_optional_timeout(
+                    reset_coro,
+                    reset_http_timeout,
+                    op_name=f"{_log_tag} env reset attempt {reset_attempt}/{reset_max_retries}",
+                )
+                reset_elapsed = time.time() - reset_start_time
+                if reset_attempt > 1:
+                    logger.warning(
+                        "%s Reset succeeded on attempt %d/%d after %.1fs (previous attempts timed out)",
+                        _log_tag,
+                        reset_attempt,
+                        reset_max_retries,
+                        reset_elapsed,
+                    )
+                break  # Success
+            except (TimeoutError, asyncio.TimeoutError) as reset_exc:
+                if reset_attempt < reset_max_retries:
+                    logger.warning(
+                        "%s Reset attempt %d/%d timed out after %.1fs, retrying in %.1fs...",
+                        _log_tag,
+                        reset_attempt,
+                        reset_max_retries,
+                        reset_http_timeout,
+                        reset_retry_backoff,
+                    )
+                    await asyncio.sleep(reset_retry_backoff)
+                    continue
+                else:
+                    # Final failure: proactively close lease to prevent slot leak
+                    logger.error(
+                        "%s Reset failed after %d attempts (%.1fs total), closing lease %s to prevent slot leak",
+                        _log_tag,
+                        reset_max_retries,
+                        time.time() - reset_start_time,
+                        lease_id,
+                    )
+                    try:
+                        await env_client.close(lease_id)
+                    except Exception as close_exc:
+                        logger.debug(
+                            "%s Best-effort close after reset failure: %s",
+                            _log_tag,
+                            close_exc,
+                        )
+                    raise reset_exc
+
+        if reset_payload is None:
+            raise RuntimeError(f"{_log_tag} Reset failed: no payload after {reset_max_retries} retries")
         user_msg = str(reset_payload.get("user_msg", ""))
         raw_tools = list(reset_payload.get("tool_schemas", []))
         logger.info("%s Start terminal rollout", _log_tag)
