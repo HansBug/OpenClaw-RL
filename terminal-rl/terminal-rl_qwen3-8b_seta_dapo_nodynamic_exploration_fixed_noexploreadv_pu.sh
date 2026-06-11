@@ -1,10 +1,9 @@
 #!/usr/bin/env bash
-# Default SETA-only robust exploration launch without dynamic sampling for Qwen3-8B.
+# SETA-only fixed-controller exploration launch with dual-advantage disabled.
 #
-# This wrapper pins the dataset to SETA and enables the robust exploration
-# defaults discussed in the reward review. It delegates execution to the mixed
-# nodynamic exploration wrapper so runtime_env propagation and the training
-# command stay centralized.
+# This ablation keeps the simhash/lifelong exploration stack and the
+# baseline-matched rollout batch size, but disables the post-normalization
+# dual-stream advantage bonus and uses fixed arm scheduling instead of UCB.
 
 set -euo pipefail
 
@@ -17,11 +16,11 @@ DATASET="${DATASET:-seta}"
 ALGO="${ALGO:-dapo}"
 HARNESS_OPTION="${HARNESS_OPTION:-camel-agent}"
 
-# Keep the default run name explicit enough for later ablations.
-RUN_ID="${RUN_ID:-terminal-rl_qwen3-8b_${NUM_GPUS}gpu_seta_dapo_nodynamic_exploration_simhash_life_fp_ucb_dualadv_think_${RUN_TIMESTAMP}}"
+# Explicitly mark this run as the fixed-controller/no-explore-adv ablation.
+RUN_ID="${RUN_ID:-terminal-rl_qwen3-8b_${NUM_GPUS}gpu_seta_dapo_nodynamic_exploration_simhash_life_fp_fixed_noexploreadv_think_${RUN_TIMESTAMP}}"
 RUN_NAME="${RUN_NAME:-${RUN_ID}}"
 
-# Match the DAPO baseline rollout batch size by default.
+# Match the DAPO baseline rollout batch size; the ablation variable is dual advantage.
 ROLLOUT_BATCH_SIZE="${ROLLOUT_BATCH_SIZE:-8}"
 N_SAMPLES="${N_SAMPLES:-8}"
 MAX_TURN="${MAX_TURN:-10}"
@@ -71,7 +70,7 @@ EXPLORE_AGENT57_NGU_LIFE_MOD_MODE="${EXPLORE_AGENT57_NGU_LIFE_MOD_MODE:-standard
 EXPLORE_AGENT57_NGU_LIFE_MOD_STD_CLIP="${EXPLORE_AGENT57_NGU_LIFE_MOD_STD_CLIP:-5.0}"
 EXPLORE_AGENT57_NGU_MOD_CLIP="${EXPLORE_AGENT57_NGU_MOD_CLIP:-5.0}"
 EXPLORE_AGENT57_MAX_BONUS="${EXPLORE_AGENT57_MAX_BONUS:-0.05}"
-EXPLORE_AGENT57_CONTROLLER="${EXPLORE_AGENT57_CONTROLLER:-ucb}"
+EXPLORE_AGENT57_CONTROLLER="${EXPLORE_AGENT57_CONTROLLER:-fixed}"
 EXPLORE_AGENT57_UCB_C="${EXPLORE_AGENT57_UCB_C:-0.5}"
 EXPLORE_AGENT57_UCB_WINDOW="${EXPLORE_AGENT57_UCB_WINDOW:-256}"
 EXPLORE_AGENT57_UCB_EPSILON="${EXPLORE_AGENT57_UCB_EPSILON:-0.05}"
@@ -122,7 +121,7 @@ EXPLORE_AGENT57_TRUST_FAILED="${EXPLORE_AGENT57_TRUST_FAILED:-0.1}"
 EXPLORE_AGENT57_TRUST_PARSE_ERROR="${EXPLORE_AGENT57_TRUST_PARSE_ERROR:-0.1}"
 EXPLORE_AGENT57_TRUST_WARMUP="${EXPLORE_AGENT57_TRUST_WARMUP:-0.3}"
 
-EXPLORE_ADVANTAGE_BONUS="${EXPLORE_ADVANTAGE_BONUS:-1}"
+EXPLORE_ADVANTAGE_BONUS="${EXPLORE_ADVANTAGE_BONUS:-0}"
 EXPLORE_ADVANTAGE_BONUS_MODE="${EXPLORE_ADVANTAGE_BONUS_MODE:-dual_stream}"
 EXPLORE_ADVANTAGE_INTRINSIC_KEY="${EXPLORE_ADVANTAGE_INTRINSIC_KEY:-explore_agent57_intrinsic_signal}"
 EXPLORE_ADVANTAGE_LAMBDA="${EXPLORE_ADVANTAGE_LAMBDA:-0.05}"

@@ -1,15 +1,18 @@
 from __future__ import annotations
 
 import hashlib
+import fcntl
 import json
 import logging
 import math
 import os
 import re
+import shutil
 import time
 import uuid
 from copy import deepcopy
 from dataclasses import asdict, is_dataclass
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 import asyncio
@@ -1357,6 +1360,419 @@ def _should_save_trajectory(run_ctx: RunContext, interval: int) -> bool:
     return int(step) % interval == 0
 
 
+def _trajectory_save_policy() -> str:
+    raw = os.getenv("TRAJECTORY_SAVE_POLICY", "step_interval").strip().lower()
+    if raw in {"", "legacy", "interval"}:
+        return "step_interval"
+    if raw in {"task_timeseries", "task-time-series", "task_step", "task-step"}:
+        return "task_timeseries"
+    logger.warning("Unknown TRAJECTORY_SAVE_POLICY=%r; using step_interval", raw)
+    return "step_interval"
+
+
+def _trajectory_env_int(name: str, default: int) -> int:
+    return _env_int(name, default)
+
+
+def _trajectory_task_save_interval(default_interval: int) -> int:
+    raw = os.getenv("TRAJECTORY_TASK_SAVE_INTERVAL", "").strip()
+    if not raw:
+        return default_interval
+    value = _optional_int(raw)
+    if value is None:
+        logger.warning(
+            "Invalid TRAJECTORY_TASK_SAVE_INTERVAL=%r; using %d",
+            raw,
+            default_interval,
+        )
+        return default_interval
+    return value
+
+
+def _trajectory_reward_strata() -> set[str]:
+    raw = os.getenv("TRAJECTORY_SAVE_REWARD_STRATA", "best,worst")
+    values = {
+        part.strip().lower()
+        for part in raw.split(",")
+        if part.strip()
+    }
+    allowed = {"best", "worst", "latest"}
+    unknown = values - allowed
+    if unknown:
+        logger.warning(
+            "Ignoring unknown TRAJECTORY_SAVE_REWARD_STRATA entries: %s",
+            sorted(unknown),
+        )
+    values &= allowed
+    return values or {"best", "worst"}
+
+
+def _trajectory_step_value(run_ctx: RunContext) -> int | None:
+    for value in (run_ctx.train_step, run_ctx.rollout_step, run_ctx.rollout_id):
+        step = _optional_int(value)
+        if step is not None:
+            return step
+    return None
+
+
+def _trajectory_task_id(task_spec: TaskSpec) -> str:
+    name = str(task_spec.task_name or "unknown")
+    path = str(task_spec.task_path or "")
+    digest = hashlib.sha1(f"{name}\n{path}".encode("utf-8")).hexdigest()[:8]
+    slug = _sanitize_filename(name)[:96].strip("._-") or "unknown"
+    return f"{slug}-{digest}"
+
+
+def _trajectory_reward_value(reward: Dict[str, Any]) -> float | None:
+    for key in ("total_reward", "score", "raw_reward", "raw_score", "accuracy"):
+        value = reward.get(key)
+        try:
+            if value is None or value == "":
+                continue
+            numeric = float(value)
+        except (TypeError, ValueError):
+            continue
+        if math.isfinite(numeric):
+            return numeric
+    return None
+
+
+def _format_reward_for_filename(value: float | None) -> str:
+    if value is None:
+        return "na"
+    text = f"{value:+.3f}"
+    return (
+        text.replace("+", "p")
+        .replace("-", "m")
+        .replace(".", "p")
+    )
+
+
+def _trajectory_index_path(save_dir: Path) -> Path:
+    return save_dir / "index.jsonl"
+
+
+@contextmanager
+def _trajectory_index_lock(save_dir: Path):
+    lock_path = save_dir / ".index.lock"
+    fh = None
+    locked = False
+    try:
+        fh = lock_path.open("a+")
+        try:
+            fcntl.flock(fh.fileno(), fcntl.LOCK_EX)
+            locked = True
+        except Exception as exc:
+            logger.warning("[traj-save] could not lock %s: %s", lock_path, exc)
+        yield
+    finally:
+        if fh is not None:
+            if locked:
+                try:
+                    fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
+                except Exception:
+                    pass
+            fh.close()
+
+
+def _trajectory_record_dir(save_dir: Path, record: dict[str, Any]) -> Path | None:
+    rel_path = record.get("rel_path")
+    if rel_path:
+        path = save_dir / str(rel_path)
+    else:
+        raw_path = record.get("path")
+        if not raw_path:
+            return None
+        path = Path(str(raw_path))
+        if not path.is_absolute():
+            path = save_dir / path
+    try:
+        resolved_root = save_dir.resolve()
+        resolved_path = path.resolve()
+    except Exception:
+        return None
+    if resolved_path.parent != resolved_root:
+        return None
+    return resolved_path
+
+
+def _trajectory_load_index(save_dir: Path) -> list[dict[str, Any]]:
+    index_path = _trajectory_index_path(save_dir)
+    if not index_path.exists():
+        return []
+    active: dict[str, dict[str, Any]] = {}
+    try:
+        for line in index_path.read_text().splitlines():
+            if not line.strip():
+                continue
+            try:
+                record = json.loads(line)
+            except Exception:
+                continue
+            rel_path = str(record.get("rel_path") or "")
+            if not rel_path:
+                continue
+            event = str(record.get("event") or "save")
+            if event == "delete":
+                active.pop(rel_path, None)
+                continue
+            if event == "save":
+                record_dir = _trajectory_record_dir(save_dir, record)
+                if record_dir is not None and (record_dir / "traj.json").exists():
+                    active[rel_path] = record
+    except Exception as exc:
+        logger.warning("[traj-save] failed reading %s: %s", index_path, exc)
+        return []
+    return list(active.values())
+
+
+def _trajectory_append_index(save_dir: Path, record: dict[str, Any]) -> None:
+    index_path = _trajectory_index_path(save_dir)
+    with index_path.open("a", encoding="utf-8") as fh:
+        fh.write(json.dumps(_jsonable(record), ensure_ascii=False, default=str))
+        fh.write("\n")
+
+
+def _trajectory_record_reward(record: dict[str, Any]) -> float | None:
+    for key in ("reward", "total_reward", "raw_reward", "raw_score"):
+        try:
+            value = record.get(key)
+            if value is None or value == "":
+                continue
+            numeric = float(value)
+        except (TypeError, ValueError):
+            continue
+        if math.isfinite(numeric):
+            return numeric
+    return None
+
+
+def _trajectory_record_ts(record: dict[str, Any]) -> int:
+    value = _optional_int(record.get("ts_ns"))
+    if value is not None:
+        return value
+    value = _optional_int(record.get("created_ts_ns"))
+    if value is not None:
+        return value
+    return 0
+
+
+def _trajectory_keep_subset(
+    records: list[dict[str, Any]],
+    limit: int,
+    strata: set[str],
+) -> set[str]:
+    if limit <= 0 or len(records) <= limit:
+        return {str(r.get("rel_path")) for r in records if r.get("rel_path")}
+
+    chosen: list[dict[str, Any]] = []
+
+    def add(record: dict[str, Any] | None) -> None:
+        if not record or len(chosen) >= limit:
+            return
+        rel_path = str(record.get("rel_path") or "")
+        if rel_path and all(str(r.get("rel_path") or "") != rel_path for r in chosen):
+            chosen.append(record)
+
+    latest = max(records, key=_trajectory_record_ts, default=None)
+    add(latest)
+    reward_records = [
+        record for record in records
+        if _trajectory_record_reward(record) is not None
+    ]
+    if "best" in strata and reward_records:
+        add(max(reward_records, key=lambda r: _trajectory_record_reward(r) or 0.0))
+    if "worst" in strata and reward_records:
+        add(min(reward_records, key=lambda r: _trajectory_record_reward(r) or 0.0))
+    if "latest" in strata:
+        add(latest)
+    for record in sorted(records, key=_trajectory_record_ts, reverse=True):
+        add(record)
+        if len(chosen) >= limit:
+            break
+    return {str(r.get("rel_path")) for r in chosen if r.get("rel_path")}
+
+
+def _trajectory_cleanup(
+    save_dir: Path,
+    active_records: list[dict[str, Any]],
+    *,
+    task_max_per_step: int,
+    task_max_per_task: int,
+    max_total: int,
+    strata: set[str],
+) -> int:
+    to_delete: set[str] = set()
+
+    if task_max_per_step > 0:
+        by_task_step: dict[tuple[str, str], list[dict[str, Any]]] = {}
+        for record in active_records:
+            key = (
+                str(record.get("task_id") or record.get("task_name") or "unknown"),
+                str(record.get("train_step") if record.get("train_step") is not None else "na"),
+            )
+            by_task_step.setdefault(key, []).append(record)
+        for records in by_task_step.values():
+            keep = _trajectory_keep_subset(records, task_max_per_step, strata)
+            for record in records:
+                rel_path = str(record.get("rel_path") or "")
+                if rel_path and rel_path not in keep:
+                    to_delete.add(rel_path)
+
+    remaining = [
+        record for record in active_records
+        if str(record.get("rel_path") or "") not in to_delete
+    ]
+    if task_max_per_task > 0:
+        by_task: dict[str, list[dict[str, Any]]] = {}
+        for record in remaining:
+            key = str(record.get("task_id") or record.get("task_name") or "unknown")
+            by_task.setdefault(key, []).append(record)
+        for records in by_task.values():
+            keep = _trajectory_keep_subset(records, task_max_per_task, strata)
+            for record in records:
+                rel_path = str(record.get("rel_path") or "")
+                if rel_path and rel_path not in keep:
+                    to_delete.add(rel_path)
+
+    remaining = [
+        record for record in active_records
+        if str(record.get("rel_path") or "") not in to_delete
+    ]
+    if max_total > 0 and len(remaining) > max_total:
+        keep = _trajectory_keep_subset(remaining, max_total, strata | {"latest"})
+        for record in remaining:
+            rel_path = str(record.get("rel_path") or "")
+            if rel_path and rel_path not in keep:
+                to_delete.add(rel_path)
+
+    deleted = 0
+    for rel_path in sorted(to_delete):
+        record = next(
+            (r for r in active_records if str(r.get("rel_path") or "") == rel_path),
+            None,
+        )
+        if record is None:
+            continue
+        target = _trajectory_record_dir(save_dir, record)
+        if target is None or not target.exists():
+            continue
+        try:
+            shutil.rmtree(target)
+            deleted += 1
+            _trajectory_append_index(
+                save_dir,
+                {
+                    "event": "delete",
+                    "schema_version": 1,
+                    "rel_path": rel_path,
+                    "path": str(target),
+                    "deleted_ts_ns": time.time_ns(),
+                    "reason": "retention_limit",
+                },
+            )
+        except Exception as exc:
+            logger.warning("[traj-save] cleanup failed for %s: %s", target, exc)
+    return deleted
+
+
+def _trajectory_save_decision(
+    *,
+    policy: str,
+    run_ctx: RunContext,
+    task_id: str,
+    reward: float | None,
+    interval: int,
+    active_records: list[dict[str, Any]],
+) -> dict[str, Any]:
+    step = _trajectory_step_value(run_ctx)
+    decision: dict[str, Any] = {
+        "policy": policy,
+        "saved": False,
+        "reason": "skipped",
+        "train_step": step,
+        "task_id": task_id,
+        "reward": reward,
+        "legacy_interval": interval,
+    }
+
+    if policy == "step_interval":
+        should_save = _should_save_trajectory(run_ctx, interval)
+        decision.update(
+            {
+                "saved": bool(should_save),
+                "reason": "legacy_interval" if should_save else "legacy_interval_skip",
+            }
+        )
+        return decision
+
+    if policy != "task_timeseries":
+        decision["reason"] = "unknown_policy"
+        return decision
+
+    task_interval = _trajectory_task_save_interval(interval)
+    max_per_step = _trajectory_env_int("TRAJECTORY_TASK_MAX_PER_STEP", 2)
+    max_per_task = _trajectory_env_int("TRAJECTORY_TASK_MAX_PER_TASK", 24)
+    max_total = _trajectory_env_int("TRAJECTORY_MAX_TOTAL", 5000)
+    strata = _trajectory_reward_strata()
+    decision.update(
+        {
+            "task_save_interval": task_interval,
+            "task_max_per_step": max_per_step,
+            "task_max_per_task": max_per_task,
+            "max_total": max_total,
+            "reward_strata": sorted(strata),
+        }
+    )
+
+    if task_interval <= 0:
+        decision["reason"] = "task_interval_disabled"
+        return decision
+    if step is not None and int(step) % task_interval != 0:
+        decision["reason"] = "task_interval_skip"
+        return decision
+
+    same_task_step = [
+        record for record in active_records
+        if str(record.get("task_id") or record.get("task_name") or "unknown") == task_id
+        and str(record.get("train_step") if record.get("train_step") is not None else "na")
+        == str(step if step is not None else "na")
+    ]
+    decision["existing_task_step_count"] = len(same_task_step)
+    if max_per_step <= 0 or len(same_task_step) < max_per_step:
+        decision.update({"saved": True, "reason": "task_step_slot"})
+        return decision
+
+    reward_records = [
+        record for record in same_task_step
+        if _trajectory_record_reward(record) is not None
+    ]
+    if reward is not None and reward_records:
+        rewards = [_trajectory_record_reward(record) for record in reward_records]
+        rewards = [value for value in rewards if value is not None]
+        if "best" in strata and rewards and reward > max(rewards):
+            decision.update({"saved": True, "reason": "task_step_best"})
+            return decision
+        if "worst" in strata and rewards and reward < min(rewards):
+            decision.update({"saved": True, "reason": "task_step_worst"})
+            return decision
+
+    decision["reason"] = "task_step_quota"
+    return decision
+
+
+def _attach_trajectory_save_metadata(
+    samples: list[Sample],
+    sample: Sample,
+    metadata: dict[str, Any],
+) -> None:
+    targets = samples if samples else [sample]
+    for target in targets:
+        if not isinstance(target.metadata, dict):
+            target.metadata = {}
+        target.metadata["trajectory_save"] = _jsonable(metadata)
+
+
 def _jsonable(obj: Any) -> Any:
     if obj is None or isinstance(obj, (bool, int, float, str)):
         return obj
@@ -1412,6 +1828,12 @@ def _exploration_audit_from_reward(reward: Dict[str, Any]) -> Dict[str, Any]:
         "explore_agent57_lifelong_capacity",
         "explore_agent57_trust_gate_mode",
         "explore_agent57_trust",
+        "explore_agent57_episodic_action_count",
+        "explore_agent57_episodic_empty_bucket_count",
+        "explore_agent57_episodic_empty_bucket_rate",
+        "explore_agent57_episodic_exact_repeat_count",
+        "explore_agent57_episodic_candidate_count_mean",
+        "explore_agent57_episodic_probe_count_mean",
         "explore_agent57_lifelong_raw",
         "explore_agent57_lifelong_z",
         "explore_agent57_lifelong_stat_n",
@@ -1468,35 +1890,44 @@ def _save_rollout_artifacts(
         save_dir = _get_terminal_save_dir()
         if save_dir is None:
             return
-        if not _should_save_trajectory(run_ctx, trajectory_save_interval):
-            return
 
         # Only save trajectories worth analyzing:
         # - Skip if no turns recorded (reset failed, no model output)
         # - Skip if status is FAILED and raw_score is 0 (infra failure, not model failure)
         if not turn_records:
+            _attach_trajectory_save_metadata(
+                samples,
+                sample,
+                {
+                    "saved": False,
+                    "policy": _trajectory_save_policy(),
+                    "reason": "no_turns",
+                    "train_step": _trajectory_step_value(run_ctx),
+                    "rollout_id": run_ctx.rollout_id,
+                    "uid": run_ctx.uid,
+                },
+            )
             return
         if str(status) == "Status.FAILED" and raw_score == 0.0 and len(turn_records) <= 1:
+            _attach_trajectory_save_metadata(
+                samples,
+                sample,
+                {
+                    "saved": False,
+                    "policy": _trajectory_save_policy(),
+                    "reason": "infra_failure_short_rollout",
+                    "train_step": _trajectory_step_value(run_ctx),
+                    "rollout_id": run_ctx.rollout_id,
+                    "uid": run_ctx.uid,
+                },
+            )
             return
         primary_metadata = (
             samples[0].metadata
             if samples and isinstance(samples[0].metadata, dict)
             else (sample.metadata if isinstance(sample.metadata, dict) else {})
         )
-        ts = time.strftime("%Y%m%d_%H%M%S")
-        ts_ns = time.time_ns()
         dataset_slug = _trajectory_dataset_slug(primary_metadata.get("data_source"))
-        stem = (
-            f"{dataset_slug}_t{_sanitize_filename(task_spec.task_name)}"
-            f"_r{run_ctx.rollout_id if run_ctx.rollout_id is not None else 'na'}"
-            f"_st{run_ctx.train_step if run_ctx.train_step is not None else 'na'}"
-            f"_g{run_ctx.group_index if run_ctx.group_index is not None else 'na'}"
-            f"_s{run_ctx.sample_index if run_ctx.sample_index is not None else 'na'}"
-            f"_{run_ctx.uid[:8]}"
-            f"_{ts}"
-        )
-        run_dir = save_dir / stem
-        run_dir.mkdir(parents=True, exist_ok=True)
 
         # Build reward breakdown from the first trainable sample (all samples
         # in a rollout share accuracy/raw/base; turn_idx differs per sample).
@@ -1544,6 +1975,12 @@ def _save_rollout_artifacts(
                 "explore_agent57_lifelong_obs_mode",
                 "explore_agent57_trust_gate_mode",
                 "explore_agent57_trust",
+                "explore_agent57_episodic_action_count",
+                "explore_agent57_episodic_empty_bucket_count",
+                "explore_agent57_episodic_empty_bucket_rate",
+                "explore_agent57_episodic_exact_repeat_count",
+                "explore_agent57_episodic_candidate_count_mean",
+                "explore_agent57_episodic_probe_count_mean",
                 "explore_agent57_lifelong_raw",
                 "explore_agent57_lifelong_z",
                 "explore_agent57_lifelong_stat_n",
@@ -1618,10 +2055,77 @@ def _save_rollout_artifacts(
             if isinstance(primary_reward_details, dict)
             else None
         )
+        task_id = _trajectory_task_id(task_spec)
+        policy = _trajectory_save_policy()
+        reward_value = _trajectory_reward_value(reward_breakdown)
+        with _trajectory_index_lock(save_dir):
+            active_records = _trajectory_load_index(save_dir)
+            save_decision = _trajectory_save_decision(
+                policy=policy,
+                run_ctx=run_ctx,
+                task_id=task_id,
+                reward=reward_value,
+                interval=trajectory_save_interval,
+                active_records=active_records,
+            )
+        if not save_decision.get("saved"):
+            decision_metadata = {
+                **save_decision,
+                "dataset_slug": dataset_slug,
+                "task_name": task_spec.task_name,
+                "task_path": task_spec.task_path,
+                "rollout_id": run_ctx.rollout_id,
+                "group_index": run_ctx.group_index,
+                "sample_index": run_ctx.sample_index,
+                "uid": run_ctx.uid,
+            }
+            _attach_trajectory_save_metadata(samples, sample, decision_metadata)
+            if _env_bool("TRAJECTORY_SAVE_LOG_DECISIONS", False):
+                logger.info(
+                    "[traj-save] skipped task=%s step=%s policy=%s reason=%s",
+                    task_spec.task_name,
+                    save_decision.get("train_step"),
+                    policy,
+                    save_decision.get("reason"),
+                )
+            return
+
+        ts = time.strftime("%Y%m%d_%H%M%S")
+        ts_ns = time.time_ns()
+        step_for_name = _trajectory_step_value(run_ctx)
+        reward_for_name = _format_reward_for_filename(reward_value)
+        uid = str(run_ctx.uid or uuid.uuid4().hex)
+        stem = (
+            f"{dataset_slug}_task-{_sanitize_filename(task_id)[:120]}"
+            f"_iter{step_for_name if step_for_name is not None else 'na'}"
+            f"_rew{reward_for_name}"
+            f"_r{run_ctx.rollout_id if run_ctx.rollout_id is not None else 'na'}"
+            f"_g{run_ctx.group_index if run_ctx.group_index is not None else 'na'}"
+            f"_s{run_ctx.sample_index if run_ctx.sample_index is not None else 'na'}"
+            f"_{uid[:8]}"
+            f"_{ts}"
+        )
+        run_dir = save_dir / stem
+        run_dir.mkdir(parents=True, exist_ok=True)
+        decision_metadata = {
+            **save_decision,
+            "dataset_slug": dataset_slug,
+            "task_name": task_spec.task_name,
+            "task_path": task_spec.task_path,
+            "rollout_id": run_ctx.rollout_id,
+            "group_index": run_ctx.group_index,
+            "sample_index": run_ctx.sample_index,
+            "uid": uid,
+            "path": str(run_dir),
+            "rel_path": run_dir.name,
+            "traj_path": str(run_dir / "traj.json"),
+            "meta_path": str(run_dir / "meta.json"),
+        }
 
         traj_payload = {
             "trajectory_format": "openclaw-terminal-rl-1",
             "info": {
+                "task_id": task_id,
                 "task_name": task_spec.task_name,
                 "task_path": task_spec.task_path,
                 "data_source": primary_metadata.get("data_source"),
@@ -1640,6 +2144,9 @@ def _save_rollout_artifacts(
                 "safety_coef": safety_coef,
                 "prm_coef": prm_coef,
                 "trajectory_save_interval": trajectory_save_interval,
+                "trajectory_save_policy": policy,
+                "trajectory_save_reason": save_decision.get("reason"),
+                "trajectory_save": _jsonable(decision_metadata),
                 "trajectory_uncertainty": _jsonable(
                     primary_metadata.get("trajectory_uncertainty")
                 ),
@@ -1655,6 +2162,7 @@ def _save_rollout_artifacts(
         )
 
         meta_payload = {
+            "task_id": task_id,
             "task_name": task_spec.task_name,
             "task_path": task_spec.task_path,
             "instruction": task_spec.instruction,
@@ -1683,12 +2191,69 @@ def _save_rollout_artifacts(
             "exploration_reward": reward_breakdown.get("exploration_reward", 0.0),
             "total_reward": reward_breakdown.get("total_reward", reward_breakdown.get("score")),
             "trajectory_save_interval": trajectory_save_interval,
+            "trajectory_save_policy": policy,
+            "trajectory_save_reason": save_decision.get("reason"),
+            "trajectory_save": _jsonable(decision_metadata),
             "ts_ns": ts_ns,
         }
         (run_dir / "meta.json").write_text(
             json.dumps(meta_payload, ensure_ascii=False, indent=2, default=str)
         )
-        logger.info("[traj-save] wrote %s (turns=%d)", run_dir, len(turn_records))
+        cleanup_deleted = 0
+        index_record = {
+            "event": "save",
+            "schema_version": 1,
+            "path": str(run_dir),
+            "rel_path": run_dir.name,
+            "traj_path": str(run_dir / "traj.json"),
+            "meta_path": str(run_dir / "meta.json"),
+            "task_id": task_id,
+            "task_name": task_spec.task_name,
+            "task_path": task_spec.task_path,
+            "data_source": primary_metadata.get("data_source"),
+            "dataset_slug": dataset_slug,
+            "safety_split": primary_metadata.get("safety_split"),
+            "uid": uid,
+            "group_index": run_ctx.group_index,
+            "sample_index": run_ctx.sample_index,
+            "rollout_id": run_ctx.rollout_id,
+            "train_step": _trajectory_step_value(run_ctx),
+            "rollout_step": run_ctx.rollout_step,
+            "status": str(status),
+            "num_turns": len(turn_records),
+            "reward": reward_value,
+            "raw_score": reward_breakdown.get("raw_score"),
+            "raw_reward": reward_breakdown.get("raw_reward"),
+            "task_reward": reward_breakdown.get("task_reward", reward_breakdown.get("base_score")),
+            "exploration_reward": reward_breakdown.get("exploration_reward", 0.0),
+            "total_reward": reward_breakdown.get("total_reward", reward_breakdown.get("score")),
+            "policy": policy,
+            "decision_reason": save_decision.get("reason"),
+            "created_at": ts,
+            "ts_ns": ts_ns,
+        }
+        with _trajectory_index_lock(save_dir):
+            _trajectory_append_index(save_dir, index_record)
+            if policy == "task_timeseries":
+                cleanup_deleted = _trajectory_cleanup(
+                    save_dir,
+                    _trajectory_load_index(save_dir),
+                    task_max_per_step=_trajectory_env_int("TRAJECTORY_TASK_MAX_PER_STEP", 2),
+                    task_max_per_task=_trajectory_env_int("TRAJECTORY_TASK_MAX_PER_TASK", 24),
+                    max_total=_trajectory_env_int("TRAJECTORY_MAX_TOTAL", 5000),
+                    strata=_trajectory_reward_strata(),
+                )
+        decision_metadata["cleanup_deleted_count"] = cleanup_deleted
+        _attach_trajectory_save_metadata(samples, sample, decision_metadata)
+        logger.info(
+            "[traj-save] wrote %s (turns=%d policy=%s reason=%s reward=%s cleanup_deleted=%d)",
+            run_dir,
+            len(turn_records),
+            policy,
+            save_decision.get("reason"),
+            reward_value,
+            cleanup_deleted,
+        )
     except Exception as exc:
         logger.warning(
             "[traj-save] failed for task=%s uid=%s: %s",
@@ -3117,7 +3682,7 @@ async def generate(
             _explore_debug = _explore_debug_metrics(
                 status=status,
                 base_score_mean=_base_score_mean,
-                total_bonus=_explore_score_bonus,
+                total_bonus=_explore_total,
                 intrinsic_scaled=_intr_for_total,
                 safety_penalty=_safe_penalty,
                 lprnd_bonus=_lprnd_bonus,
@@ -3201,6 +3766,7 @@ async def generate(
                         s.reward["explore_cde_actor_scaled"] = _cde_actor["scaled"]
                         s.reward["explore_cde_actor_clipped"] = _cde_actor["clipped"]
                     s.reward["explore_total_bonus"] = _explore_score_bonus
+                    s.reward["explore_score_bonus"] = _explore_score_bonus
                     s.reward["explore_all_bonus"] = _explore_total
                     s.reward["explore_score_bonus_components"] = _EXPLORE_SCORE_BONUS_COMPONENTS
                     s.reward.update(_explore_debug)
