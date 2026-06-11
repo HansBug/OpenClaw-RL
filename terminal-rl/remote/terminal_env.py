@@ -7,6 +7,7 @@ import os
 import re
 import subprocess
 import inspect
+import time
 from functools import partial
 from pathlib import Path
 from typing import Any
@@ -25,7 +26,8 @@ from .agentharm_env import AgentHarmEnv
 from .agent_safetybench_env import AgentSafetyBenchEnv
 from .docker_compose_utils import compose_up_no_build, prepare_task_docker_image
 
-logger = logging.getLogger(__name__)
+logger = logging.getLogger("terminal.env.worker.terminal_env")
+logger.setLevel(logging.INFO)
 
 
 def _env_bool(name: str, default: bool) -> bool:
@@ -123,12 +125,44 @@ def _force_remove_docker_objects(
             timeout=timeout,
         )
 
+    direct_removed = False
+    direct_name = (client_container_name or "").strip()
+    if direct_name:
+        try:
+            removed = _run(["docker", "rm", "-f", direct_name])
+            if removed.returncode == 0:
+                direct_removed = True
+                logger.warning(
+                    "Force docker rm exact finished for TerminalEnv %s name=%s rc=%s stdout=%s stderr=%s",
+                    trial_name,
+                    direct_name,
+                    removed.returncode,
+                    removed.stdout.strip()[:300],
+                    removed.stderr.strip()[:300],
+                )
+            else:
+                logger.warning(
+                    "Force docker rm exact did not remove container for TerminalEnv %s name=%s rc=%s stdout=%s stderr=%s",
+                    trial_name,
+                    direct_name,
+                    removed.returncode,
+                    removed.stdout.strip()[:300],
+                    removed.stderr.strip()[:300],
+                )
+        except Exception as exc:
+            logger.warning(
+                "Force docker rm exact failed for TerminalEnv %s name=%s: %s",
+                trial_name,
+                direct_name,
+                exc,
+            )
+
     try:
         listed = _run(
             [
                 "docker",
                 "ps",
-                "-aq",
+                "-a",
                 "--format",
                 "{{.ID}}\t{{.Names}}\t{{.Image}}\t{{.Status}}",
             ]
@@ -192,6 +226,17 @@ def _force_remove_docker_objects(
                     ",".join(chunk),
                     exc,
                 )
+    elif direct_removed:
+        logger.warning(
+            "Force cleanup removed exact Docker container for TerminalEnv %s (%s) "
+            "and matched no additional containers; client_container=%s "
+            "image_prefixes=%s projects=%s",
+            trial_name,
+            reason,
+            client_container_name or "",
+            ",".join(sorted(image_prefixes)) or "",
+            ",".join(sorted(project_names)) or "",
+        )
     else:
         logger.warning(
             "Force cleanup matched no Docker containers for TerminalEnv %s (%s); "
@@ -347,10 +392,39 @@ class TerminalEnv:
                 run_ctx=run_ctx,
             )
 
-        image_prep = await asyncio.to_thread(
-            prepare_task_docker_image,
-            task=task_meta,
-            timeout=self._timeouts.ensure_image,
+        reset_started = time.monotonic()
+        image_prepare_started = time.monotonic()
+        logger.info(
+            "TerminalEnv reset image prepare starting task=%s uid=%s timeout=%.1fs",
+            self._task_spec.task_name,
+            self._run_ctx.uid,
+            self._timeouts.ensure_image,
+        )
+        try:
+            image_prep = await asyncio.to_thread(
+                prepare_task_docker_image,
+                task=task_meta,
+                timeout=self._timeouts.ensure_image,
+            )
+        except Exception:
+            logger.exception(
+                "TerminalEnv reset image prepare failed task=%s uid=%s elapsed=%.1fs "
+                "total_elapsed=%.1fs",
+                self._task_spec.task_name,
+                self._run_ctx.uid,
+                time.monotonic() - image_prepare_started,
+                time.monotonic() - reset_started,
+            )
+            raise
+        logger.info(
+            "TerminalEnv reset image prepare finished task=%s uid=%s mode=%s "
+            "image=%s elapsed=%.1fs total_elapsed=%.1fs",
+            self._task_spec.task_name,
+            self._run_ctx.uid,
+            getattr(image_prep, "mode", ""),
+            getattr(image_prep, "client_image_name", ""),
+            time.monotonic() - image_prepare_started,
+            time.monotonic() - reset_started,
         )
 
         dataset_dir = str(os.getenv("DATASET_DIR", "")).strip()
@@ -408,30 +482,63 @@ class TerminalEnv:
                 no_rebuild=True,
                 cleanup=False,
             )
-            if image_prep.mode == "pull":
-                compose_up_no_build(
-                    self._terminal,
-                    timeout=self._timeouts.reset_session,
-                    container_name=self._trial_handler.client_container_name,
-                    logger=logger,
-                )
-            else:
-                import inspect
-                if "timeout" in inspect.signature(self._terminal.start).parameters:
-                    self._terminal.start(timeout=self._timeouts.reset_session)
-                else:
-                    self._terminal.start()
-                try:
-                    from .docker_compose_utils import (
-                        _apply_container_runtime_limits,
-                    )
-
-                    _apply_container_runtime_limits(
-                        self._trial_handler.client_container_name,
+            docker_start_started = time.monotonic()
+            logger.info(
+                "TerminalEnv docker start starting task=%s uid=%s container=%s "
+                "mode=%s timeout=%.1fs",
+                self._task_spec.task_name,
+                self._run_ctx.uid,
+                self._trial_handler.client_container_name,
+                image_prep.mode,
+                self._timeouts.reset_session,
+            )
+            try:
+                if image_prep.mode == "pull":
+                    compose_up_no_build(
+                        self._terminal,
+                        timeout=self._timeouts.reset_session,
+                        container_name=self._trial_handler.client_container_name,
                         logger=logger,
                     )
-                except Exception:
-                    pass
+                else:
+                    import inspect
+                    if "timeout" in inspect.signature(self._terminal.start).parameters:
+                        self._terminal.start(timeout=self._timeouts.reset_session)
+                    else:
+                        self._terminal.start()
+                    try:
+                        from .docker_compose_utils import (
+                            _apply_container_runtime_limits,
+                        )
+
+                        _apply_container_runtime_limits(
+                            self._trial_handler.client_container_name,
+                            logger=logger,
+                        )
+                    except Exception:
+                        pass
+            except Exception:
+                logger.exception(
+                    "TerminalEnv docker start failed task=%s uid=%s container=%s "
+                    "mode=%s elapsed=%.1fs total_elapsed=%.1fs",
+                    self._task_spec.task_name,
+                    self._run_ctx.uid,
+                    self._trial_handler.client_container_name,
+                    image_prep.mode,
+                    time.monotonic() - docker_start_started,
+                    time.monotonic() - reset_started,
+                )
+                raise
+            logger.info(
+                "TerminalEnv docker start finished task=%s uid=%s container=%s "
+                "mode=%s elapsed=%.1fs total_elapsed=%.1fs",
+                self._task_spec.task_name,
+                self._run_ctx.uid,
+                self._trial_handler.client_container_name,
+                image_prep.mode,
+                time.monotonic() - docker_start_started,
+                time.monotonic() - reset_started,
+            )
 
             session_logs_dir = (
                 self._trial_handler.trial_paths.sessions_path
@@ -459,24 +566,28 @@ class TerminalEnv:
             ]
             return user_msg, tool_schemas
 
-        # P0 FIX: Add hard timeout wrapper to prevent thread hang
-        # Even though _sync_reset has internal timeouts, asyncio.to_thread
-        # cannot cancel hung threads. We add external timeout + monitoring.
+        # Keep a bounded wrapper around Docker/session startup, but leave enough
+        # grace for slow compose starts after image preparation has completed.
+        reset_thread_timeout = _env_float(
+            "TERMINAL_ENV_RESET_THREAD_TIMEOUT",
+            float(self._timeouts.reset_session) + 120.0,
+        )
         try:
             return await asyncio.wait_for(
                 asyncio.to_thread(_sync_reset),
-                timeout=self._timeouts.reset_session + 60.0  # Internal timeout + 60s grace
+                timeout=reset_thread_timeout,
             )
         except asyncio.TimeoutError:
             logger.error(
                 "CRITICAL: reset operation hung beyond internal timeout "
-                f"(timeout={self._timeouts.reset_session}s). Thread may still be running. "
+                f"(timeout={reset_thread_timeout}s, reset_session={self._timeouts.reset_session}s). "
+                "Thread may still be running. "
                 "This indicates Docker operations are stuck. Manual intervention may be required."
             )
             # Thread will continue running in background - this is a known limitation
             # of asyncio.to_thread. The watchdog should detect this and restart the worker.
             raise TimeoutError(
-                f"Reset operation exceeded timeout ({self._timeouts.reset_session + 60.0}s). "
+                f"Reset operation exceeded timeout ({reset_thread_timeout}s). "
                 "Docker operations may be hung. Worker may need restart."
             )
 

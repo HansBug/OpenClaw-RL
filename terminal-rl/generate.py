@@ -2117,11 +2117,49 @@ async def generate(
         rollout_step=rollout_step,
     )
     run_ctx_payload = run_ctx.to_payload()
+
+    def _timeout_arg(
+        attr_name: str,
+        env_name: str,
+        default: float,
+        *,
+        minimum: float | None = None,
+    ) -> float:
+        raw = getattr(args, attr_name, None)
+        if raw is None:
+            raw = os.getenv(env_name)
+        if raw is None or raw == "":
+            value = default
+        else:
+            try:
+                value = float(raw)
+            except (TypeError, ValueError):
+                value = default
+        if value <= 0:
+            value = default
+        if minimum is not None and value < minimum:
+            value = minimum
+        return value
+
     timeouts = TaskTimeouts(
-        ensure_image=getattr(args, "ensure_image_timeout", 300.0),
-        reset_session=getattr(args, "reset_session_timeout", 300.0),
-        close_session=getattr(args, "close_session_timeout", 60.0),
-        eval=getattr(args, "eval_timeout", 600.0),
+        ensure_image=_timeout_arg(
+            "ensure_image_timeout",
+            "ENSURE_IMAGE_TIMEOUT",
+            1200.0,
+            minimum=1200.0,
+        ),
+        reset_session=_timeout_arg(
+            "reset_session_timeout",
+            "RESET_SESSION_TIMEOUT",
+            600.0,
+            minimum=600.0,
+        ),
+        close_session=_timeout_arg(
+            "close_session_timeout",
+            "CLOSE_SESSION_TIMEOUT",
+            60.0,
+        ),
+        eval=_timeout_arg("eval_timeout", "EVAL_TIMEOUT", 600.0),
     )
     timeouts_payload = timeouts.to_payload()
 
@@ -2184,9 +2222,12 @@ async def generate(
         env_client, lease_id = await _create_env_client(
             task_spec, run_ctx, task_meta=task_meta
         )
+        default_reset_http_timeout = (
+            float(timeouts.ensure_image) + float(timeouts.reset_session) + 300.0
+        )
         reset_http_timeout = _env_float(
             "ENV_RESET_HTTP_TIMEOUT",
-            float(timeouts.reset_session) + 30.0,
+            default_reset_http_timeout,
         )
         reset_kwargs = {
             "lease_id": lease_id,

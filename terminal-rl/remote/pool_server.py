@@ -31,17 +31,35 @@ def _parse_timeout_overrides(
     if not isinstance(payload, dict):
         return base
 
-    def _pick(key: str, default: float) -> float:
+    def _pick(key: str, default: float, *, minimum: float | None = None) -> float:
         raw = payload.get(key, default)
         try:
             value = float(raw)
         except (TypeError, ValueError):
             return default
-        return value if value > 0 else default
+        if value <= 0:
+            return default
+        if minimum is not None and value < minimum:
+            logger.debug(
+                "Raising client timeout override %s=%.1fs to worker floor %.1fs",
+                key,
+                value,
+                minimum,
+            )
+            return minimum
+        return value
 
     return TaskTimeouts(
-        ensure_image=_pick("ensure_image", base.ensure_image),
-        reset_session=_pick("reset_session", base.reset_session),
+        ensure_image=_pick(
+            "ensure_image",
+            base.ensure_image,
+            minimum=base.ensure_image,
+        ),
+        reset_session=_pick(
+            "reset_session",
+            base.reset_session,
+            minimum=base.reset_session,
+        ),
         close_session=_pick("close_session", base.close_session),
         eval=_pick("eval", base.eval),
     )
@@ -974,7 +992,7 @@ class WorkerPool:
         allocated_ttl = _env_float("WORKER_ALLOCATED_TTL", 120.0)
         # Keep this above WORKER_RESET_OPERATION_TIMEOUT so legitimate reset
         # operations are not reaped before their timeout handler runs.
-        resetting_ttl = _env_float("WORKER_RESETTING_TTL", 450.0)
+        resetting_ttl = _env_float("WORKER_RESETTING_TTL", 2100.0)
         closing_ttl = _env_float("WORKER_CLOSING_REQUESTED_TTL", 300.0)
         created_age_sec = now - run_slot.created_ts
         reset_age_sec = (
@@ -1089,10 +1107,13 @@ class WorkerPool:
 
     @staticmethod
     def _reset_operation_timeout(timeouts: TaskTimeouts) -> float:
-        configured = _env_float("WORKER_RESET_OPERATION_TIMEOUT", 360.0)
+        configured = _env_float("WORKER_RESET_OPERATION_TIMEOUT", 0.0)
         if configured > 0:
             return configured
-        return max(30.0, float(timeouts.ensure_image) + float(timeouts.reset_session) + 30.0)
+        return max(
+            30.0,
+            float(timeouts.ensure_image) + float(timeouts.reset_session) + 120.0,
+        )
 
     async def _drop_resetting_run_for_timeout(
         self, run_lease_id: str, run_slot: RunSlot, *, timeout: float
@@ -1146,7 +1167,8 @@ class WorkerPool:
 
         # Use a Task instead of a bare coroutine. wait_for() cancels its awaitable
         # on timeout, and bare coroutines cannot be awaited again after that.
-        warn_timeout = max(0.1, reset_timeout / 2.0)
+        warn_after = _env_float("WORKER_RESET_WARN_AFTER", 300.0)
+        warn_timeout = max(0.1, min(reset_timeout / 2.0, warn_after))
         remaining_timeout = max(0.1, reset_timeout - warn_timeout)
         is_timeout_drop = False
         success = False
@@ -1375,7 +1397,7 @@ class WorkerPool:
             self._prune_done_force_cleanup_tasks()
             now = time.time()
             allocated_ttl = _env_float("WORKER_ALLOCATED_TTL", 120.0)
-            resetting_ttl = _env_float("WORKER_RESETTING_TTL", 450.0)
+            resetting_ttl = _env_float("WORKER_RESETTING_TTL", 2100.0)
             closing_ttl = _env_float("WORKER_CLOSING_REQUESTED_TTL", 300.0)
             close_ages = [
                 now - started for started in self._closing_task_started.values()
@@ -1790,9 +1812,10 @@ class WorkerPool:
     ) -> None:
         if not slots:
             return
+        per_slot_timeout = _env_float("WORKER_FORCE_CLEANUP_TIMEOUT", 90.0)
         timeout = _env_float(
             "WORKER_SHUTDOWN_FORCE_CLEANUP_TIMEOUT",
-            max(10.0, min(120.0, len(slots) * 2.0)),
+            max(30.0, per_slot_timeout + 10.0),
         )
         logger.warning(
             "Batch force cleanup starting for %d run slot(s), reason=%s timeout=%.1fs",
@@ -1800,25 +1823,29 @@ class WorkerPool:
             reason,
             timeout,
         )
-        cleanup_tasks = [
-            asyncio.create_task(
-                self._force_cleanup_after_close_failure(run_slot, run_lease_id, reason=reason)
+        cleanup_tasks: dict[asyncio.Task[Any], str] = {}
+        for task_key, run_lease_id, run_slot in slots:
+            task = asyncio.create_task(
+                self._force_cleanup_after_close_failure(
+                    run_slot,
+                    run_lease_id,
+                    reason=reason,
+                )
             )
-            for _task_key, run_lease_id, run_slot in slots
-        ]
-        try:
-            await asyncio.wait_for(
-                asyncio.gather(*cleanup_tasks, return_exceptions=True),
-                timeout=timeout,
-            )
-        except asyncio.TimeoutError:
+            cleanup_tasks[task] = f"{task_key}:{run_lease_id}"
+
+        done, pending = await asyncio.wait(cleanup_tasks, timeout=timeout)
+        if pending:
             logger.warning(
-                "Batch force cleanup timed out with %d cleanup task(s) still pending",
-                sum(1 for task in cleanup_tasks if not task.done()),
+                "Batch force cleanup timed out with %d cleanup task(s) still pending: %s",
+                len(pending),
+                ",".join(cleanup_tasks[task] for task in pending),
             )
-            for task in cleanup_tasks:
+            for task in pending:
                 task.cancel()
-            await asyncio.gather(*cleanup_tasks, return_exceptions=True)
+            await asyncio.gather(*pending, return_exceptions=True)
+        if done:
+            await asyncio.gather(*done, return_exceptions=True)
         logger.warning("Batch force cleanup finished for reason=%s", reason)
 
     async def periodic_reap(self, interval: float = 60.0) -> None:
@@ -2456,7 +2483,7 @@ async def repair_resetting_runs(request: Request) -> JSONResponse:
 
     data = await json_payload(request)
     reason = str(data.get("reason") or "manual")
-    min_age = _env_float("WORKER_REPAIR_RESETTING_MIN_AGE", 450.0)
+    min_age = _env_float("WORKER_REPAIR_RESETTING_MIN_AGE", 2100.0)
     max_repairs = _env_int("WORKER_REPAIR_RESETTING_MAX_REPAIRS", 64)
     try:
         if "min_age" in data:
@@ -2880,12 +2907,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--ensure-image-timeout",
         type=float,
-        default=float(os.getenv("ENSURE_IMAGE_TIMEOUT", "300.0")),
+        default=float(os.getenv("ENSURE_IMAGE_TIMEOUT", "1200.0")),
     )
     parser.add_argument(
         "--reset-session-timeout",
         type=float,
-        default=float(os.getenv("RESET_SESSION_TIMEOUT", "300.0")),
+        default=float(os.getenv("RESET_SESSION_TIMEOUT", "600.0")),
     )
     parser.add_argument(
         "--close-session-timeout",
