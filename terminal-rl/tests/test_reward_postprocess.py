@@ -59,7 +59,11 @@ def test_dual_stream_advantage_adds_group_normalized_intrinsic(monkeypatch):
     assert raw == [1.0, 1.0]
     assert adjusted == [-0.05, 0.1]
     assert samples[0].reward["explore_post_norm_bonus_mode"] == "dual_stream"
+    assert samples[1].reward["explore_post_norm_base_reward"] == 0.0
+    assert samples[1].reward["explore_post_norm_intrinsic_value"] == 1.0
     assert samples[1].reward["explore_post_norm_intrinsic_advantage"] == 0.5
+    assert samples[1].reward["explore_post_norm_trust"] == 1.0
+    assert samples[1].reward["explore_post_norm_adjusted_reward"] == 0.1
 
 
 def test_component_postnorm_mode_remains_backward_compatible(monkeypatch):
@@ -83,3 +87,5 @@ def test_component_postnorm_mode_remains_backward_compatible(monkeypatch):
 
     assert adjusted == [0.25]
     assert sample.reward["explore_post_norm_bonus_mode"] == "component"
+    assert sample.reward["explore_post_norm_base_reward"] == 0.0
+    assert sample.reward["explore_post_norm_adjusted_reward"] == 0.25

@@ -74,7 +74,7 @@ def test_backends_ignore_malformed_state_dict_entries():
     simhash.load_state_dict({"buckets": {"1010": "bad"}})
     assert simhash.compute_novelty("") == 1.0
     simhash.add("")
-    assert simhash.compute_novelty("") == 0.0
+    assert simhash.compute_novelty("") == simhash.novelty_floor
 
 
 def test_simhash_knn_empty_repeat_capacity_and_roundtrip():
@@ -85,6 +85,7 @@ def test_simhash_knn_empty_repeat_capacity_and_roundtrip():
             k=2,
             distance_metric="cosine",
             random_seed=7,
+            novelty_floor=0.05,
         )
     )
     vector = [1.0, 0.0, 0.0, 0.0]
@@ -92,7 +93,7 @@ def test_simhash_knn_empty_repeat_capacity_and_roundtrip():
     assert memory.compute_novelty(vector) == 1.0
     memory.add(vector)
     duplicate = memory.compute_novelty(vector)
-    assert duplicate == 0.0
+    assert duplicate == 0.05
 
     memory.add(vector)
     memory.add(vector)
@@ -102,6 +103,29 @@ def test_simhash_knn_empty_repeat_capacity_and_roundtrip():
     restored.load_state_dict(memory.state_dict())
 
     assert restored.compute_novelty(vector) == duplicate
+
+
+def test_simhash_knn_records_query_stats_and_floor():
+    memory = SimHashKNNEpisodicMemory(
+        SimHashKNNEpisodicMemoryConfig(
+            hash_bits=8,
+            bucket_capacity=8,
+            k=1,
+            random_seed=13,
+            multi_probe_radius=1,
+            novelty_floor=0.07,
+        )
+    )
+    state = {"signature": "shell|service|atd|start", "obs": "success"}
+
+    assert memory.compute_novelty(state) == 1.0
+    assert memory.last_query_stats()["empty_bucket"] == 1.0
+    memory.add(state)
+
+    assert memory.compute_novelty(state) == 0.07
+    stats = memory.last_query_stats()
+    assert stats["exact_repeat"] == 1.0
+    assert stats["probe_count"] == 9
 
 
 def test_simhash_knn_supports_l2_and_string_states():
@@ -131,5 +155,10 @@ def test_episodic_backend_factory_env_aliases(monkeypatch):
     assert isinstance(create_episodic_memory_backend(), CountBasedEpisodicMemory)
 
     monkeypatch.setenv("EXPLORE_AGENT57_EPISODIC_BACKEND", "knn")
+    monkeypatch.setenv("EXPLORE_AGENT57_EPISODIC_MULTI_PROBE_RADIUS", "2")
+    monkeypatch.setenv("EXPLORE_AGENT57_EPISODIC_NOVELTY_FLOOR", "0.11")
     assert resolve_episodic_backend_name("knn") == "simhash_knn"
-    assert isinstance(create_episodic_memory_backend(), SimHashKNNEpisodicMemory)
+    backend = create_episodic_memory_backend()
+    assert isinstance(backend, SimHashKNNEpisodicMemory)
+    assert backend.multi_probe_radius == 2
+    assert backend.novelty_floor == 0.11

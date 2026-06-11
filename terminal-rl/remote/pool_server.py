@@ -19,7 +19,7 @@ from fastapi.responses import JSONResponse, Response
 
 from ..custom_types import RunContext, TaskSpec, TaskTimeouts
 from ..request_utils import json_payload
-from .terminal_env import TerminalEnv
+from .terminal_env import TerminalEnv, force_remove_orphan_docker_objects
 
 logger = logging.getLogger("terminal.env.worker")
 app = FastAPI()
@@ -540,10 +540,18 @@ class WorkerPool:
         self.output_root.mkdir(parents=True, exist_ok=True)
         self.default_timeouts = default_timeouts
         self.idempotency_ttl = idempotency_ttl
-        self.close_task_timeout = _env_float(
+        legacy_close_task_timeout = _env_float(
             "WORKER_CLOSE_TASK_TIMEOUT",
             max(30.0, float(default_timeouts.close_session) + 30.0),
         )
+        self.close_queue_timeout = _env_float(
+            "WORKER_CLOSE_QUEUE_TIMEOUT", legacy_close_task_timeout
+        )
+        self.close_session_timeout = _env_float(
+            "WORKER_CLOSE_SESSION_TIMEOUT",
+            max(30.0, float(default_timeouts.close_session)),
+        )
+        self.close_task_timeout = self.close_queue_timeout + self.close_session_timeout
 
         self._tasks: dict[str, TaskSlot] = {}
         self._run_to_task: dict[str, str] = {}
@@ -562,6 +570,7 @@ class WorkerPool:
         # P0 fix: Track reset count for automatic shim cleanup
         self._reset_count: int = 0
         self._last_shim_cleanup_ts: float = time.time()
+        self._last_orphan_sweep_ts: float = 0.0
 
     def _new_env(self) -> TerminalEnv:
         return TerminalEnv()
@@ -596,6 +605,16 @@ class WorkerPool:
             f"container_status={info.get('status') or '?'} "
             f"trial={info.get('trial_name') or '?'}"
         )
+
+    def _active_container_names_locked(self) -> set[str]:
+        names: set[str] = set()
+        for task_slot in self._tasks.values():
+            for run_slot in task_slot.runs.values():
+                info = self._run_slot_container_info(run_slot)
+                name = info.get("name")
+                if isinstance(name, str) and name:
+                    names.add(name)
+        return names
 
     def _pop_run_slot_locked(
         self, run_lease_id: str
@@ -713,17 +732,14 @@ class WorkerPool:
     async def _close_run_slot_under_lock(self, run_slot: RunSlot) -> None:
         async with run_slot.lock:
             run_slot.phase = "closing"
-            # P1 fix: Add timeout to prevent lock from being held indefinitely if env.close() hangs
-            close_timeout = _env_float(
-                "WORKER_CLOSE_SESSION_TIMEOUT",
-                max(30.0, float(self.default_timeouts.close_session)),
-            )
             try:
-                await asyncio.wait_for(run_slot.env.close(), timeout=close_timeout)
+                await asyncio.wait_for(
+                    run_slot.env.close(), timeout=self.close_session_timeout
+                )
             except asyncio.TimeoutError:
                 logger.warning(
                     "env.close() timed out after %.1fs for lease=%s; proceeding to force_cleanup",
-                    close_timeout,
+                    self.close_session_timeout,
                     run_slot.run_lease_id,
                 )
                 raise
@@ -746,8 +762,22 @@ class WorkerPool:
         return len(done)
 
     async def _close_run_slot_with_semaphore(self, run_slot: RunSlot) -> None:
-        async with self._close_sem:
+        try:
+            await asyncio.wait_for(
+                self._close_sem.acquire(), timeout=self.close_queue_timeout
+            )
+        except asyncio.TimeoutError:
+            logger.warning(
+                "Timed out waiting %.1fs for close semaphore lease=%s; "
+                "proceeding to force_cleanup",
+                self.close_queue_timeout,
+                run_slot.run_lease_id,
+            )
+            raise
+        try:
             await self._close_run_slot_under_lock(run_slot)
+        finally:
+            self._close_sem.release()
 
     async def _force_cleanup_after_close_failure(
         self, run_slot: RunSlot, run_lease_id: str, *, reason: str
@@ -788,18 +818,16 @@ class WorkerPool:
     ) -> None:
         logger.warning("%s %s (task=%s)", reason, run_lease_id, task_key)
         try:
-            await asyncio.wait_for(
-                self._close_run_slot_with_semaphore(run_slot),
-                timeout=self.close_task_timeout,
-            )
+            await self._close_run_slot_with_semaphore(run_slot)
         except asyncio.TimeoutError:
             logger.warning(
-                "Timed out closing run session %s after %.1fs while waiting for "
-                "the close semaphore, run lock, and/or env.close(); dropping it "
+                "Timed out closing run session %s "
+                "(queue_timeout=%.1fs session_timeout=%.1fs); dropping it "
                 "from the pool so the close backlog can drain. Watchdog/preflight "
                 "cleanup will remove any orphan Docker objects.",
                 run_lease_id,
-                self.close_task_timeout,
+                self.close_queue_timeout,
+                self.close_session_timeout,
             )
             await self._force_cleanup_after_close_failure(
                 run_slot, run_lease_id, reason="close_timeout"
@@ -1295,10 +1323,12 @@ class WorkerPool:
                 try:
                     run_slot = self._get_run_slot(run_lease_id)
                 except KeyError:
-                    raise RuntimeError(
-                        f"WORKER_RESET_STALE lease_id={run_lease_id} "
-                        "completed after run was removed"
+                    logger.info(
+                        "Reset completed after lease=%s was already removed; "
+                        "returning reset result without caching it.",
+                        run_lease_id,
                     )
+                    return result
                 if run_slot.reset_future is future:
                     run_slot.reset_result = dict(result)
             return result
@@ -1497,6 +1527,9 @@ class WorkerPool:
                 "closing_requested_runs": closing_requested_runs,
                 "pending_closes": len(self._closing_tasks),
                 "pending_force_cleanups": len(self._force_cleanup_tasks),
+                "close_queue_timeout": self.close_queue_timeout,
+                "close_session_timeout": self.close_session_timeout,
+                "close_task_timeout": self.close_task_timeout,
                 "pending_close_age_sec": pending_close_age_sec,
                 "pending_force_cleanup_age_sec": pending_force_cleanup_age_sec,
                 "phase_counts": phase_counts,
@@ -1865,8 +1898,52 @@ class WorkerPool:
                     )
                 # P0 fix: Automatic shim cleanup every 50 resets or when pressure detected
                 await self._maybe_cleanup_shims()
+                await self._maybe_cleanup_orphan_docker_containers()
             except Exception:
                 logger.exception("Periodic reaper error")
+
+    async def _maybe_cleanup_orphan_docker_containers(self) -> None:
+        if os.getenv("WORKER_ORPHAN_DOCKER_SWEEP", "1") != "1":
+            return
+        now = time.time()
+        interval = max(1.0, _env_float("WORKER_ORPHAN_DOCKER_SWEEP_INTERVAL", 60.0))
+        if now - self._last_orphan_sweep_ts < interval:
+            return
+        self._last_orphan_sweep_ts = now
+
+        async with self._lock:
+            active_container_names = self._active_container_names_locked()
+
+        min_age_sec = max(0.0, _env_float("WORKER_ORPHAN_DOCKER_SWEEP_MIN_AGE", 600.0))
+        max_remove = _env_int("WORKER_ORPHAN_DOCKER_SWEEP_MAX_REMOVE", 128)
+        timeout = max(1.0, _env_float("WORKER_ORPHAN_DOCKER_SWEEP_TIMEOUT", 30.0))
+        try:
+            removed = await asyncio.wait_for(
+                asyncio.to_thread(
+                    force_remove_orphan_docker_objects,
+                    active_container_names=active_container_names,
+                    reason="periodic_reap",
+                    min_age_sec=min_age_sec,
+                    max_remove=max_remove,
+                ),
+                timeout=timeout,
+            )
+            if removed:
+                logger.warning(
+                    "Periodic orphan Docker sweep removed %d stale container(s) "
+                    "active=%d min_age=%.1fs",
+                    removed,
+                    len(active_container_names),
+                    min_age_sec,
+                )
+        except asyncio.TimeoutError:
+            logger.warning(
+                "Periodic orphan Docker sweep timed out after %.1fs active=%d",
+                timeout,
+                len(active_container_names),
+            )
+        except Exception:
+            logger.exception("Periodic orphan Docker sweep failed")
 
     async def _maybe_cleanup_shims(self) -> None:
         """P0 fix: Proactively clean Docker shims to prevent resource exhaustion."""

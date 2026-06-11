@@ -30,10 +30,14 @@ from custom_types import (
 from inference_client import SGLangTurnClient
 from agent_runner import create_agent_runner, normalize_harness_option
 from env_client import TerminalEnvClient
+from agent57_episodic_memory import create_episodic_memory_backend
 from explore_agent57_lite import (
+    coarse_observation_fingerprint as _agent57_coarse_observation_fingerprint,
+    coarse_observation_label as _agent57_coarse_observation_label,
     compute_ngu_lite_bonus as _agent57_compute_ngu_lite_bonus,
     compute_lifelong_bonus as _agent57_compute_lifelong_bonus,
     config_from_env as _agent57_config_from_env,
+    exit_code_bucket as _agent57_exit_code_bucket,
     record_arm_event as _agent57_record_arm_event,
 )
 from safety_reward import (
@@ -319,7 +323,22 @@ _EXPLORE_SCORE_BONUS_COMPONENTS = os.getenv("EXPLORE_SCORE_BONUS_COMPONENTS", "l
 #                  sub-goal/skill granularity per the LaMer/Agent57 analysis.
 _EXPLORE_INTRINSIC_GRANULARITY = os.getenv("EXPLORE_INTRINSIC_GRANULARITY", "raw").strip().lower()
 _EXPLORE_INTRINSIC_SCOPE = os.getenv("EXPLORE_INTRINSIC_SCOPE", "process").strip().lower()
+_EXPLORE_AGENT57_EPISODIC_OBS_MODE = (
+    os.getenv(
+        "EXPLORE_AGENT57_EPISODIC_OBS_MODE",
+        os.getenv("EXPLORE_AGENT57_LIFELONG_OBS_MODE", "fingerprint"),
+    )
+    .strip()
+    .lower()
+)
+if _EXPLORE_AGENT57_EPISODIC_OBS_MODE not in {"fingerprint", "label", "none"}:
+    _EXPLORE_AGENT57_EPISODIC_OBS_MODE = "fingerprint"
+_EXPLORE_AGENT57_EPISODIC_INCLUDE_TURN = _env_bool(
+    "EXPLORE_AGENT57_EPISODIC_INCLUDE_TURN",
+    True,
+)
 _CMD_COUNTER: Dict[str, int] = {}  # process-level counter for command novelty
+_AGENT57_LAST_EPISODIC_STATS: Dict[str, float] = {}
 
 # ── Exploration: LP-RND lifelong novelty (草案 C, zero-extra-param) ───────────
 # Reuses the rollout_log_probs already computed by slime (no extra forward pass).
@@ -432,18 +451,110 @@ def _stable_json(value: Any, limit: int = 512) -> str:
     return text[:limit]
 
 
-def _iter_explore_actions(turn_records: List[Dict[str, Any]]) -> List[Dict[str, str]]:
+def _explore_len_bucket(text: str) -> str:
+    size = len(text)
+    if size == 0:
+        return "len0"
+    if size < 80:
+        return "lenS"
+    if size < 512:
+        return "lenM"
+    if size < 2048:
+        return "lenL"
+    return "lenXL"
+
+
+def _explore_path_signature(value: Any) -> str:
+    text = str(value or "").strip()
+    if not text:
+        return "unknown"
+    text = re.sub(r"/+", "/", text)
+    if text != "/":
+        text = text.rstrip("/")
+    return text[:160]
+
+
+def _explore_structured_tool_signature(
+    tool_name: str,
+    args: Any,
+) -> tuple[str, str]:
+    """Return a compact signature/family for non-command structured tools.
+
+    Avoid hashing full payloads such as file contents into exploration keys. The
+    key should capture the operation and target, not every byte written.
+    """
+    tool = str(tool_name or "tool").strip() or "tool"
+    if not isinstance(args, dict):
+        args_text = _stable_json(args)
+        return f"{tool}|{args_text[:160]}", f"{tool}:structured"
+
+    path_value = None
+    for key in (
+        "file_path",
+        "path",
+        "target_path",
+        "filename",
+        "dest",
+        "destination",
+        "repo_path",
+    ):
+        if args.get(key):
+            path_value = args.get(key)
+            break
+    if path_value is not None:
+        path = _explore_path_signature(path_value)
+        ext = Path(path).suffix[:16] or "noext"
+        parts = [tool, f"path:{path}", f"ext:{ext}"]
+        if "content" in args:
+            parts.append(f"content:{_explore_len_bucket(str(args.get('content') or ''))}")
+        return "|".join(parts), f"{tool}:file"
+
+    stable_keys = []
+    for key in ("query", "url", "package", "name", "id"):
+        value = args.get(key)
+        if value:
+            stable_keys.append(f"{key}:{str(value)[:80]}")
+    if stable_keys:
+        return "|".join([tool, *stable_keys]), f"{tool}:structured"
+
+    return f"{tool}|schema:{','.join(sorted(str(k) for k in args.keys()))[:120]}", f"{tool}:structured"
+
+
+def _explore_turn_bucket(turn_idx: Any) -> str:
+    try:
+        idx = int(turn_idx)
+    except (TypeError, ValueError):
+        return "turn_unknown"
+    if idx <= 0:
+        return "turn0"
+    if idx <= 2:
+        return "turn1_2"
+    if idx <= 5:
+        return "turn3_5"
+    return "turn6p"
+
+
+def _explore_observation_bucket(value: Any, mode: str) -> str:
+    if mode == "none":
+        return "obs_ignored"
+    if mode == "label":
+        return _agent57_coarse_observation_label(value)
+    return _agent57_coarse_observation_fingerprint(value)
+
+
+def _iter_explore_actions(turn_records: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """Extract action strings used by intrinsic reward and safety diagnostics.
 
     Older code looked only at turn["command"], but current terminal-rl trajectories
     store most actions as structured tool_calls. Missing those calls makes command
     novelty and danger filtering silently no-op for real rollouts.
     """
-    actions: List[Dict[str, str]] = []
+    actions: List[Dict[str, Any]] = []
     for tr in turn_records or []:
         turn_idx = tr.get("turn_idx")
         legacy_cmd = str(tr.get("command", "") or "").strip()
         if legacy_cmd:
+            result = tr.get("result") or tr.get("observation") or tr.get("output")
             actions.append(
                 {
                     "tool_name": "shell",
@@ -451,6 +562,13 @@ def _iter_explore_actions(turn_records: List[Dict[str, Any]]) -> List[Dict[str, 
                     "signature": f"shell|{_cmd_signature(legacy_cmd)}",
                     "danger_text": legacy_cmd,
                     "turn_idx": str(turn_idx) if turn_idx is not None else "",
+                    "turn_bucket": _explore_turn_bucket(turn_idx),
+                    "result": result,
+                    "obs_bucket": _explore_observation_bucket(
+                        result,
+                        _EXPLORE_AGENT57_EPISODIC_OBS_MODE,
+                    ),
+                    "exit_bucket": _agent57_exit_code_bucket(result),
                 }
             )
 
@@ -463,7 +581,7 @@ def _iter_explore_actions(turn_records: List[Dict[str, Any]]) -> List[Dict[str, 
                 args = call.get("arguments")
             command_text = ""
             if isinstance(args, dict):
-                for key in ("command", "cmd", "script", "code", "query"):
+                for key in ("command", "cmd", "script", "code"):
                     value = args.get(key)
                     if value:
                         command_text = str(value).strip()
@@ -473,21 +591,48 @@ def _iter_explore_actions(turn_records: List[Dict[str, Any]]) -> List[Dict[str, 
 
             args_text = _stable_json(args)
             raw = f"{tool_name}:{command_text or args_text}"
-            signature = (
-                f"{tool_name}|{_cmd_signature(command_text)}"
-                if command_text
-                else f"{tool_name}|{args_text[:160]}"
-            )
+            if command_text:
+                signature = f"{tool_name}|{_cmd_signature(command_text)}"
+                action_family = ""
+            else:
+                signature, action_family = _explore_structured_tool_signature(
+                    tool_name,
+                    args,
+                )
+            result = call.get("result")
+            if result is None:
+                result = call.get("observation") or call.get("output")
             actions.append(
                 {
                     "tool_name": tool_name,
                     "raw": raw,
                     "signature": signature,
+                    "action_family": action_family,
                     "danger_text": command_text or args_text,
                     "turn_idx": str(turn_idx) if turn_idx is not None else "",
+                    "turn_bucket": _explore_turn_bucket(turn_idx),
+                    "result": result,
+                    "obs_bucket": _explore_observation_bucket(
+                        result,
+                        _EXPLORE_AGENT57_EPISODIC_OBS_MODE,
+                    ),
+                    "exit_bucket": _agent57_exit_code_bucket(result),
                 }
             )
     return actions
+
+
+def _explore_agent57_episodic_state(action: Dict[str, Any]) -> Dict[str, Any]:
+    state: Dict[str, Any] = {
+        "tool": str(action.get("tool_name") or "tool"),
+        "signature": str(action.get("signature") or action.get("raw") or "unknown"),
+    }
+    if _EXPLORE_AGENT57_EPISODIC_OBS_MODE != "none":
+        state["observation"] = str(action.get("obs_bucket") or "no_result")
+        state["exit"] = str(action.get("exit_bucket") or "exit_unknown")
+    if _EXPLORE_AGENT57_EPISODIC_INCLUDE_TURN:
+        state["turn"] = str(action.get("turn_bucket") or "turn_unknown")
+    return state
 
 
 def _explore_intrinsic_bonus(turn_records: List[Dict[str, Any]]) -> float:
@@ -532,21 +677,47 @@ def _explore_episode_signature_novelty(
     *,
     reducer: str = "sum",
 ) -> float:
-    """Episode-local signature novelty used by Agent57 NGU-lite product mode."""
+    """Episode-local novelty used by Agent57 NGU-lite product mode."""
+    global _AGENT57_LAST_EPISODIC_STATS
+    _AGENT57_LAST_EPISODIC_STATS = {}
     if not turn_records:
         return 0.0
     total = 0.0
     action_count = 0
     episode_counter: Dict[str, int] = {}
+    episodic_memory = create_episodic_memory_backend(_AGENT57_CONFIG.episodic_backend)
+    empty_bucket_count = 0.0
+    exact_repeat_count = 0.0
+    candidate_count_total = 0.0
+    probe_count_total = 0.0
     for action in _iter_explore_actions(turn_records):
         action_count += 1
+        if episodic_memory is not None:
+            state = _explore_agent57_episodic_state(action)
+            total += float(episodic_memory.compute_novelty(state))
+            query_stats_fn = getattr(episodic_memory, "last_query_stats", None)
+            query_stats = query_stats_fn() if callable(query_stats_fn) else {}
+            empty_bucket_count += float(query_stats.get("empty_bucket", 0.0) or 0.0)
+            exact_repeat_count += float(query_stats.get("exact_repeat", 0.0) or 0.0)
+            candidate_count_total += float(query_stats.get("candidate_count", 0.0) or 0.0)
+            probe_count_total += float(query_stats.get("probe_count", 0.0) or 0.0)
+            episodic_memory.add(state)
+            continue
         key_src = action["signature"]
         key = hashlib.md5(key_src.encode()).hexdigest()[:10]
         episode_counter[key] = episode_counter.get(key, 0) + 1
         total += 1.0 / math.sqrt(episode_counter[key])
-    if reducer == "mean" and action_count > 0:
-        return total / action_count
-    return total
+    value = total / action_count if reducer == "mean" and action_count > 0 else total
+    if action_count > 0:
+        _AGENT57_LAST_EPISODIC_STATS = {
+            "explore_agent57_episodic_action_count": float(action_count),
+            "explore_agent57_episodic_empty_bucket_count": float(empty_bucket_count),
+            "explore_agent57_episodic_empty_bucket_rate": float(empty_bucket_count / action_count),
+            "explore_agent57_episodic_exact_repeat_count": float(exact_repeat_count),
+            "explore_agent57_episodic_candidate_count_mean": float(candidate_count_total / action_count),
+            "explore_agent57_episodic_probe_count_mean": float(probe_count_total / action_count),
+        }
+    return value
 
 
 def _explore_score_bonus_from_components(
@@ -2897,6 +3068,7 @@ async def generate(
                     ),
                 )
                 _agent57_metrics.update(_agent57_ngu_metrics)
+                _agent57_metrics.update(_AGENT57_LAST_EPISODIC_STATS)
                 _agent57_bonus = float(
                     _agent57_ngu_metrics.get("explore_agent57_ngu_bonus", 0.0)
                     or 0.0

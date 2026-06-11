@@ -113,6 +113,7 @@ def _install_import_stubs(monkeypatch):
 
     terminal_env_mod = types.ModuleType("terminal-rl.remote.terminal_env")
     terminal_env_mod.TerminalEnv = _DummyEnv
+    terminal_env_mod.force_remove_orphan_docker_objects = lambda **_kwargs: 0
 
     monkeypatch.setitem(sys.modules, "uvicorn", types.ModuleType("uvicorn"))
     monkeypatch.setitem(sys.modules, "fastapi", fastapi_mod)
@@ -460,7 +461,6 @@ def test_reaper_removes_stale_allocated_run(monkeypatch, tmp_path):
         assert env.close_count == 1
 
     asyncio.run(_case())
-
 
 def test_pending_close_repair_allows_negative_active_limit(monkeypatch, tmp_path):
     async def _case():

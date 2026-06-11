@@ -185,6 +185,8 @@ def _dual_stream_post_process(
         bonus = max(-clip, min(clip, raw_bonus)) if clip > 0 else raw_bonus
         adjusted[i] += bonus
         if isinstance(reward, dict):
+            reward["explore_post_norm_base_reward"] = base_rewards[i]
+            reward["explore_post_norm_intrinsic_value"] = intrinsic_values[i]
             reward["explore_post_norm_bonus_raw"] = raw_bonus
             reward["explore_post_norm_bonus"] = bonus
             reward["explore_post_norm_bonus_coef"] = lambda_coef
@@ -193,6 +195,8 @@ def _dual_stream_post_process(
             reward["explore_post_norm_intrinsic_key"] = intrinsic_key
             reward["explore_post_norm_intrinsic_advantage"] = intrinsic_adv[i]
             reward["explore_post_norm_arm_weight"] = arm_weight
+            reward["explore_post_norm_trust"] = trust
+            reward["explore_post_norm_adjusted_reward"] = adjusted[i]
             reward["postprocess_total_reward"] = adjusted[i]
             _sync_reward_aliases(
                 reward,
@@ -226,12 +230,14 @@ def post_process_rewards(args: Any, samples: list[Any]) -> tuple[list[float], li
         adjusted[i] += bonus
         reward = getattr(sample, "reward", None)
         if isinstance(reward, dict):
+            reward["explore_post_norm_base_reward"] = rewards[i]
             reward["explore_post_norm_bonus_raw"] = raw_bonus
             reward["explore_post_norm_bonus"] = bonus
             reward["explore_post_norm_bonus_coef"] = coef
             reward["explore_post_norm_bonus_clip"] = clip
             reward["explore_post_norm_bonus_mode"] = "component"
             reward["explore_post_norm_bonus_components"] = ",".join(component_names)
+            reward["explore_post_norm_adjusted_reward"] = adjusted[i]
             reward["postprocess_total_reward"] = adjusted[i]
             _sync_reward_aliases(
                 reward,

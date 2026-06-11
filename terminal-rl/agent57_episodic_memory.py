@@ -4,6 +4,7 @@ from abc import ABC, abstractmethod
 from collections import OrderedDict
 from dataclasses import dataclass
 import hashlib
+import itertools
 import json
 import math
 import os
@@ -226,6 +227,8 @@ class SimHashKNNEpisodicMemoryConfig:
     vector_dim: int = 128
     random_seed: int | None = None
     epsilon: float = 1e-8
+    multi_probe_radius: int = 1
+    novelty_floor: float = 0.05
 
 
 class SimHashKNNEpisodicMemory(EpisodicMemoryBackend):
@@ -242,9 +245,12 @@ class SimHashKNNEpisodicMemory(EpisodicMemoryBackend):
         self.distance_metric = self._normalize_distance(self.config.distance_metric)
         self.vector_dim = max(1, int(self.config.vector_dim))
         self.epsilon = max(1e-12, float(self.config.epsilon))
+        self.multi_probe_radius = max(0, int(self.config.multi_probe_radius))
+        self.novelty_floor = min(1.0, max(0.0, float(self.config.novelty_floor)))
         self._rng = np.random.default_rng(self.config.random_seed)
         self._hyperplanes: np.ndarray | None = None
         self._buckets: OrderedDict[str, list[np.ndarray]] = OrderedDict()
+        self._last_query_stats: dict[str, Any] = {}
 
     def add(self, state: Any) -> None:
         vector = self._vector(state)
@@ -257,17 +263,49 @@ class SimHashKNNEpisodicMemory(EpisodicMemoryBackend):
 
     def compute_novelty(self, state: Any) -> float:
         vector = self._vector(state)
-        candidates = self._buckets.get(self._bucket_key(vector), [])
+        bucket_keys = self._probe_bucket_keys(vector)
+        candidates: list[np.ndarray] = []
+        for key in bucket_keys:
+            candidates.extend(self._buckets.get(key, []))
         if not candidates:
+            self._last_query_stats = {
+                "empty_bucket": 1.0,
+                "exact_repeat": 0.0,
+                "candidate_count": 0,
+                "probe_count": len(bucket_keys),
+            }
             return 1.0
         distances = sorted(self._distance(vector, candidate) for candidate in candidates)
         nearest = distances[: min(self.k, len(distances))]
         if not nearest:
+            self._last_query_stats = {
+                "empty_bucket": 1.0,
+                "exact_repeat": 0.0,
+                "candidate_count": len(candidates),
+                "probe_count": len(bucket_keys),
+            }
             return 1.0
         mean_dist = sum(nearest) / len(nearest)
         if not math.isfinite(mean_dist):
+            self._last_query_stats = {
+                "empty_bucket": 0.0,
+                "exact_repeat": 0.0,
+                "candidate_count": len(candidates),
+                "probe_count": len(bucket_keys),
+            }
             return 1.0
-        return max(0.0, min(1.0, mean_dist / (mean_dist + 1.0)))
+        exact_repeat = any(distance <= self.epsilon for distance in nearest)
+        novelty = max(0.0, min(1.0, mean_dist / (mean_dist + 1.0)))
+        self._last_query_stats = {
+            "empty_bucket": 0.0,
+            "exact_repeat": 1.0 if exact_repeat else 0.0,
+            "candidate_count": len(candidates),
+            "probe_count": len(bucket_keys),
+        }
+        return max(self.novelty_floor, novelty)
+
+    def last_query_stats(self) -> dict[str, Any]:
+        return dict(self._last_query_stats)
 
     def reset(self) -> None:
         self._buckets.clear()
@@ -282,6 +320,8 @@ class SimHashKNNEpisodicMemory(EpisodicMemoryBackend):
                 "distance_metric": self.distance_metric,
                 "vector_dim": self.vector_dim,
                 "epsilon": self.epsilon,
+                "multi_probe_radius": self.multi_probe_radius,
+                "novelty_floor": self.novelty_floor,
             },
             "hyperplanes": (
                 self._hyperplanes.tolist() if self._hyperplanes is not None else None
@@ -304,6 +344,14 @@ class SimHashKNNEpisodicMemory(EpisodicMemoryBackend):
         )
         self.vector_dim = max(1, int(config.get("vector_dim", self.vector_dim)))
         self.epsilon = max(1e-12, float(config.get("epsilon", self.epsilon)))
+        self.multi_probe_radius = max(
+            0,
+            int(config.get("multi_probe_radius", self.multi_probe_radius)),
+        )
+        self.novelty_floor = min(
+            1.0,
+            max(0.0, float(config.get("novelty_floor", self.novelty_floor))),
+        )
 
         raw_planes = state.get("hyperplanes") if isinstance(state, dict) else None
         if raw_planes is None:
@@ -350,6 +398,22 @@ class SimHashKNNEpisodicMemory(EpisodicMemoryBackend):
         assert self._hyperplanes is not None
         bits = (self._hyperplanes @ vector) >= 0.0
         return "".join("1" if bit else "0" for bit in bits.tolist())
+
+    def _probe_bucket_keys(self, vector: np.ndarray) -> list[str]:
+        key = self._bucket_key(vector)
+        radius = min(max(0, self.multi_probe_radius), 2)
+        if radius <= 0:
+            return [key]
+        keys = [key]
+        bit_count = len(key)
+        chars = list(key)
+        for distance in range(1, radius + 1):
+            for indices in itertools.combinations(range(bit_count), distance):
+                probe = chars.copy()
+                for idx in indices:
+                    probe[idx] = "0" if probe[idx] == "1" else "1"
+                keys.append("".join(probe))
+        return keys
 
     def _distance(self, left: np.ndarray, right: np.ndarray) -> float:
         if self.distance_metric == "l2":
@@ -466,6 +530,23 @@ def create_episodic_memory_backend(
                 _env_optional_int("EXPLORE_AGENT57_EPISODIC_RANDOM_SEED")
                 if os.getenv("EXPLORE_AGENT57_EPISODIC_RANDOM_SEED") is not None
                 else _env_optional_int("EPISODIC_MEMORY_RANDOM_SEED")
+            ),
+            multi_probe_radius=max(
+                0,
+                _env_int(
+                    "EXPLORE_AGENT57_EPISODIC_MULTI_PROBE_RADIUS",
+                    _env_int("EPISODIC_MEMORY_MULTI_PROBE_RADIUS", 1),
+                ),
+            ),
+            novelty_floor=min(
+                1.0,
+                max(
+                    0.0,
+                    _env_float(
+                        "EXPLORE_AGENT57_EPISODIC_NOVELTY_FLOOR",
+                        _env_float("EPISODIC_MEMORY_NOVELTY_FLOOR", 0.05),
+                    ),
+                ),
             ),
         )
     )

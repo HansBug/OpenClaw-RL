@@ -128,6 +128,10 @@ class Agent57LiteConfig:
     lifelong_include_task: bool
     lifelong_include_turn: bool
     lifelong_obs_mode: str
+    lifelong_hierarchical: bool
+    lifelong_task_weight: float
+    lifelong_skill_weight: float
+    lifelong_global_weight: float
     trust_gate_mode: str
     trust_completed: float
     trust_truncated: float
@@ -135,6 +139,8 @@ class Agent57LiteConfig:
     trust_parse_error: float
     trust_warmup: float
     state_path: str
+    sqlite_busy_timeout_ms: int
+    sqlite_wal: bool
     success_threshold: float
 
     @property
@@ -261,6 +267,22 @@ def config_from_env() -> Agent57LiteConfig:
             "EXPLORE_AGENT57_LIFELONG_INCLUDE_TURN", False
         ),
         lifelong_obs_mode=obs_mode,
+        lifelong_hierarchical=_env_bool(
+            "EXPLORE_AGENT57_LIFELONG_HIERARCHICAL",
+            key_version == "v2",
+        ),
+        lifelong_task_weight=max(
+            0.0,
+            _env_float("EXPLORE_AGENT57_LIFELONG_TASK_WEIGHT", 0.5),
+        ),
+        lifelong_skill_weight=max(
+            0.0,
+            _env_float("EXPLORE_AGENT57_LIFELONG_SKILL_WEIGHT", 0.35),
+        ),
+        lifelong_global_weight=max(
+            0.0,
+            _env_float("EXPLORE_AGENT57_LIFELONG_GLOBAL_WEIGHT", 0.15),
+        ),
         trust_gate_mode=trust_gate_mode,
         trust_completed=max(0.0, _env_float("EXPLORE_AGENT57_TRUST_COMPLETED", 1.0)),
         trust_truncated=max(0.0, _env_float("EXPLORE_AGENT57_TRUST_TRUNCATED", 0.3)),
@@ -268,6 +290,11 @@ def config_from_env() -> Agent57LiteConfig:
         trust_parse_error=max(0.0, _env_float("EXPLORE_AGENT57_TRUST_PARSE_ERROR", 0.1)),
         trust_warmup=max(0.0, _env_float("EXPLORE_AGENT57_TRUST_WARMUP", 0.3)),
         state_path=_default_state_path(),
+        sqlite_busy_timeout_ms=max(
+            1,
+            _env_int("EXPLORE_AGENT57_SQLITE_BUSY_TIMEOUT_MS", 30000),
+        ),
+        sqlite_wal=_env_bool("EXPLORE_AGENT57_SQLITE_WAL", False),
         success_threshold=_env_float("EXPLORE_AGENT57_SUCCESS_THRESHOLD", 0.0),
     )
 
@@ -310,11 +337,27 @@ def _ensure_column(conn: sqlite3.Connection, table: str, name: str, ddl: str) ->
             raise
 
 
-def _connect(path: str) -> sqlite3.Connection:
+def _connect(
+    path: str,
+    *,
+    busy_timeout_ms: int = 5000,
+    wal: bool = False,
+) -> sqlite3.Connection:
     db_path = Path(path)
     db_path.parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(str(db_path), timeout=5.0, isolation_level=None)
-    conn.execute("PRAGMA busy_timeout=5000")
+    timeout_ms = max(1, int(busy_timeout_ms))
+    conn = sqlite3.connect(
+        str(db_path),
+        timeout=float(timeout_ms) / 1000.0,
+        isolation_level=None,
+    )
+    conn.execute(f"PRAGMA busy_timeout={timeout_ms}")
+    if wal:
+        try:
+            conn.execute("PRAGMA journal_mode=WAL")
+        except sqlite3.OperationalError:
+            # Shared filesystems may reject WAL; continue with rollback journal.
+            pass
     path_key = str(db_path)
     if path_key not in _SQLITE_SCHEMA_INITIALIZED:
         with _SQLITE_SCHEMA_LOCK:
@@ -361,7 +404,11 @@ def _sqlite_next_counts(config: Agent57LiteConfig, keys: Iterable[str]) -> tuple
     unique_keys = list(dict.fromkeys(keys))
     if not unique_keys:
         return 0, []
-    conn = _connect(config.state_path)
+    conn = _connect(
+        config.state_path,
+        busy_timeout_ms=config.sqlite_busy_timeout_ms,
+        wal=config.sqlite_wal,
+    )
     try:
         conn.execute("BEGIN IMMEDIATE")
         row = conn.execute(
@@ -376,11 +423,16 @@ def _sqlite_next_counts(config: Agent57LiteConfig, keys: Iterable[str]) -> tuple
         counts_before: list[float] = []
         for key in unique_keys:
             row = conn.execute(
-                "SELECT count FROM lifelong_counts WHERE key=?", (key,)
+                "SELECT count, last_seen FROM lifelong_counts WHERE key=?", (key,)
             ).fetchone()
-            before = float(row[0]) if row else 0.0
+            before = _decayed_count(
+                config,
+                float(row[0]) if row else 0.0,
+                int(row[1]) if row else 0,
+                seen,
+            )
             counts_before.append(before)
-            after = before * config.lifelong_count_decay + 1.0
+            after = before + 1.0
             if row:
                 conn.execute(
                     "UPDATE lifelong_counts SET count=?, last_seen=? WHERE key=?",
@@ -413,18 +465,222 @@ def _sqlite_next_counts(config: Agent57LiteConfig, keys: Iterable[str]) -> tuple
         conn.close()
 
 
-def _local_next_counts(config: Agent57LiteConfig, keys: Iterable[str]) -> tuple[int, list[float]]:
-    global _LOCAL_TRAJ_SEEN
+def _decayed_count(
+    config: Agent57LiteConfig,
+    count: float,
+    last_seen: int,
+    seen_now: int,
+) -> float:
+    value = max(0.0, float(count))
+    decay = min(1.0, max(0.0, float(config.lifelong_count_decay)))
+    if value <= 0.0 or decay >= 1.0:
+        return value
+    gap = max(0, int(seen_now) - int(last_seen))
+    if gap <= 0:
+        return value
+    if decay <= 0.0:
+        return 0.0
+    return value * (decay ** gap)
+
+
+def _lifelong_raw_from_counts(config: Agent57LiteConfig, counts_before: list[float]) -> float:
+    if counts_before:
+        raw = sum(1.0 / math.sqrt(c + 1.0) for c in counts_before) / len(counts_before)
+    else:
+        raw = 0.0
+    return min(config.lifelong_clip, max(0.0, raw)) if config.lifelong_clip > 0 else raw
+
+
+def _normalize_key_groups(keys: Iterable[str] | dict[str, Iterable[str]]) -> dict[str, list[str]]:
+    if isinstance(keys, dict):
+        return {
+            str(level): [str(key) for key in values]
+            for level, values in keys.items()
+            if values
+        }
+    return {"task": [str(key) for key in keys]}
+
+
+def _flatten_key_groups(key_groups: dict[str, list[str]]) -> list[str]:
+    flattened: list[str] = []
+    for keys in key_groups.values():
+        flattened.extend(keys)
+    return list(dict.fromkeys(flattened))
+
+
+def _raw_from_key_counts(
+    config: Agent57LiteConfig,
+    keys: list[str],
+    counts_by_key: dict[str, float],
+) -> float:
     unique_keys = list(dict.fromkeys(keys))
+    return _lifelong_raw_from_counts(
+        config,
+        [float(counts_by_key.get(key, 0.0)) for key in unique_keys],
+    )
+
+
+def _lifelong_raw_from_key_groups(
+    config: Agent57LiteConfig,
+    key_groups: dict[str, list[str]],
+    counts_by_key: dict[str, float],
+) -> tuple[float, dict[str, float]]:
+    raw_by_level = {
+        level: _raw_from_key_counts(config, keys, counts_by_key)
+        for level, keys in key_groups.items()
+        if keys
+    }
+    if not raw_by_level:
+        return 0.0, {}
+    if not config.lifelong_hierarchical:
+        return raw_by_level.get("task", next(iter(raw_by_level.values()))), raw_by_level
+
+    weights = {
+        "task": config.lifelong_task_weight,
+        "skill": config.lifelong_skill_weight,
+        "global": config.lifelong_global_weight,
+    }
+    active_weights = {
+        level: max(0.0, float(weights.get(level, 0.0)))
+        for level in raw_by_level
+    }
+    total_weight = sum(active_weights.values())
+    if total_weight <= 0.0:
+        return raw_by_level.get("task", next(iter(raw_by_level.values()))), raw_by_level
+    raw = sum(raw_by_level[level] * active_weights[level] for level in raw_by_level) / total_weight
+    raw = min(config.lifelong_clip, max(0.0, raw)) if config.lifelong_clip > 0 else raw
+    return raw, raw_by_level
+
+
+def _sqlite_next_counts_and_raw_stats(
+    config: Agent57LiteConfig,
+    keys: Iterable[str] | dict[str, Iterable[str]],
+) -> tuple[int, dict[str, float], float, int, float, float, dict[str, float], float]:
+    key_groups = _normalize_key_groups(keys)
+    unique_keys = _flatten_key_groups(key_groups)
+    if not unique_keys:
+        return 0, {}, 0.0, 0, 0.0, 0.0, {}, 0.0
+    conn = _connect(
+        config.state_path,
+        busy_timeout_ms=config.sqlite_busy_timeout_ms,
+        wal=config.sqlite_wal,
+    )
+    try:
+        wait_start = time.perf_counter()
+        conn.execute("BEGIN IMMEDIATE")
+        lock_wait_ms = (time.perf_counter() - wait_start) * 1000.0
+        row = conn.execute(
+            "SELECT value FROM meta WHERE name='lifelong_traj_seen'"
+        ).fetchone()
+        seen = int(row[0]) if row else 0
+        conn.execute(
+            "INSERT INTO meta(name, value) VALUES('lifelong_traj_seen', 1) "
+            "ON CONFLICT(name) DO UPDATE SET value=value+1"
+        )
+        next_seen = seen + 1
+        counts_before: dict[str, float] = {}
+        for key in unique_keys:
+            row = conn.execute(
+                "SELECT count, last_seen FROM lifelong_counts WHERE key=?", (key,)
+            ).fetchone()
+            before = _decayed_count(
+                config,
+                float(row[0]) if row else 0.0,
+                int(row[1]) if row else 0,
+                seen,
+            )
+            counts_before[key] = before
+            after = before + 1.0
+            if row:
+                conn.execute(
+                    "UPDATE lifelong_counts SET count=?, last_seen=? WHERE key=?",
+                    (after, next_seen, key),
+                )
+            else:
+                conn.execute(
+                    "INSERT INTO lifelong_counts(key, count, last_seen) VALUES(?, ?, ?)",
+                    (key, after, next_seen),
+                )
+        if config.lifelong_capacity > 0:
+            row = conn.execute("SELECT COUNT(*) FROM lifelong_counts").fetchone()
+            overflow = int(row[0]) - config.lifelong_capacity if row else 0
+            if overflow > 0:
+                conn.execute(
+                    "DELETE FROM lifelong_counts WHERE key IN ("
+                    "SELECT key FROM lifelong_counts ORDER BY last_seen ASC LIMIT ?"
+                    ")",
+                    (overflow,),
+                )
+
+        raw, raw_by_level = _lifelong_raw_from_key_groups(
+            config,
+            key_groups,
+            counts_before,
+        )
+        rows = {
+            str(name): float(value)
+            for name, value in conn.execute(
+                "SELECT name, value FROM meta WHERE name IN "
+                "('lifelong_raw_n', 'lifelong_raw_mean', 'lifelong_raw_m2')"
+            )
+        }
+        n_before = int(rows.get("lifelong_raw_n", 0.0))
+        mean_before = float(rows.get("lifelong_raw_mean", 0.0))
+        m2_before = float(rows.get("lifelong_raw_m2", 0.0))
+        std_before = math.sqrt(max(0.0, m2_before / max(1, n_before - 1))) if n_before > 1 else 0.0
+        n_after = n_before + 1
+        delta = raw - mean_before
+        mean_after = mean_before + delta / n_after
+        delta2 = raw - mean_after
+        m2_after = m2_before + delta * delta2
+        for name, value in (
+            ("lifelong_raw_n", float(n_after)),
+            ("lifelong_raw_mean", float(mean_after)),
+            ("lifelong_raw_m2", float(m2_after)),
+        ):
+            conn.execute(
+                "INSERT INTO meta(name, value) VALUES(?, ?) "
+                "ON CONFLICT(name) DO UPDATE SET value=excluded.value",
+                (name, value),
+            )
+        conn.execute("COMMIT")
+        return seen, counts_before, raw, n_before, mean_before, std_before, raw_by_level, lock_wait_ms
+    except Exception:
+        try:
+            conn.execute("ROLLBACK")
+        except Exception:
+            pass
+        raise
+    finally:
+        conn.close()
+
+
+def _local_next_counts(config: Agent57LiteConfig, keys: Iterable[str]) -> tuple[int, list[float]]:
+    seen, counts_by_key = _local_next_key_counts(config, keys)
+    return seen, [float(counts_by_key.get(str(key), 0.0)) for key in list(dict.fromkeys(keys))]
+
+
+def _local_next_key_counts(
+    config: Agent57LiteConfig,
+    keys: Iterable[str] | dict[str, Iterable[str]],
+) -> tuple[int, dict[str, float]]:
+    global _LOCAL_TRAJ_SEEN
+    key_groups = _normalize_key_groups(keys)
+    unique_keys = _flatten_key_groups(key_groups)
     with _LOCAL_LOCK:
         seen = _LOCAL_TRAJ_SEEN
         _LOCAL_TRAJ_SEEN += 1
         next_seen = _LOCAL_TRAJ_SEEN
-        counts_before: list[float] = []
+        counts_before: dict[str, float] = {}
         for key in unique_keys:
-            before = float(_LOCAL_COUNTS.get(key, 0.0))
-            counts_before.append(before)
-            _LOCAL_COUNTS[key] = before * config.lifelong_count_decay + 1.0
+            before = _decayed_count(
+                config,
+                float(_LOCAL_COUNTS.get(key, 0.0)),
+                int(_LOCAL_COUNT_LAST_SEEN.get(key, 0)),
+                seen,
+            )
+            counts_before[key] = before
+            _LOCAL_COUNTS[key] = before + 1.0
             _LOCAL_COUNT_LAST_SEEN[key] = next_seen
         if config.lifelong_capacity > 0 and len(_LOCAL_COUNTS) > config.lifelong_capacity:
             overflow = len(_LOCAL_COUNTS) - config.lifelong_capacity
@@ -436,7 +692,11 @@ def _local_next_counts(config: Agent57LiteConfig, keys: Iterable[str]) -> tuple[
 
 
 def _sqlite_lifelong_raw_stats(config: Agent57LiteConfig, raw: float) -> tuple[int, float, float]:
-    conn = _connect(config.state_path)
+    conn = _connect(
+        config.state_path,
+        busy_timeout_ms=config.sqlite_busy_timeout_ms,
+        wal=config.sqlite_wal,
+    )
     try:
         conn.execute("BEGIN IMMEDIATE")
         rows = {
@@ -598,6 +858,35 @@ def _result_text(value: Any) -> str:
     return str(value)
 
 
+def _canonical_observation_text(text: str) -> str:
+    normalized = str(text or "")
+    normalized = re.sub(
+        r"\b(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun)\s+"
+        r"(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s+"
+        r"\d{1,2}\s+\d{2}:\d{2}:\d{2}\s+\d{4}\b",
+        "<datetime>",
+        normalized,
+        flags=re.IGNORECASE,
+    )
+    normalized = re.sub(
+        r"\b\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}(?::\d{2})?(?:Z|[+-]\d{2}:?\d{2})?\b",
+        "<datetime>",
+        normalized,
+    )
+    normalized = re.sub(r"\b\d{1,2}:\d{2}(?::\d{2})?\b", "<time>", normalized)
+    normalized = re.sub(r"\bjob\s+\d+\s+at\b", "job <id> at", normalized, flags=re.IGNORECASE)
+    normalized = re.sub(r"\bpid\s*[:=]?\s*\d+\b", "pid <id>", normalized, flags=re.IGNORECASE)
+    normalized = re.sub(r"(?m)^\s*\d+\s*$", "<num>", normalized)
+    normalized = re.sub(r"\b0x[0-9a-fA-F]+\b", "<hex>", normalized)
+    normalized = re.sub(
+        r"\b[0-9a-fA-F]{8,}\b",
+        "<hex>",
+        normalized,
+    )
+    normalized = re.sub(r"\b\d{2,}\b", "<num>", normalized)
+    return normalized
+
+
 def exit_code_bucket(value: Any) -> str:
     if isinstance(value, dict):
         for key in ("exit_code", "returncode", "return_code", "code"):
@@ -615,11 +904,19 @@ def exit_code_bucket(value: Any) -> str:
         return "exit127"
     if "permission denied" in low:
         return "exit126"
+    if (
+        "command executed successfully" in low
+        or "content successfully written" in low
+        or re.search(r"\.\.\.\s*done\.?$", low.strip())
+        or "all tests passed" in low
+        or "tests passed" in low
+    ):
+        return "exit0"
     return "exit_unknown"
 
 
 def coarse_observation_fingerprint(value: Any) -> str:
-    text = _result_text(value)
+    text = _canonical_observation_text(_result_text(value))
     low = text.lower()
     if not low.strip():
         return "empty"
@@ -631,7 +928,9 @@ def coarse_observation_fingerprint(value: Any) -> str:
         ("traceback", ("traceback", "exception:", "error:")),
         ("assertion", ("assertionerror", "assertion failed")),
         ("test_fail", ("failed", "failure", "tests failed")),
-        ("test_pass", ("all tests passed", "passed", "success")),
+        ("success_no_output", ("command executed successfully (no output)",)),
+        ("operation_success", ("command executed successfully", "content successfully written", "successfully written")),
+        ("test_pass", ("all tests passed", "tests passed", "passed")),
         ("install", ("apt-get", "pip install", "npm install")),
         ("build", ("building", "compiling", "make:", "cmake")),
     )
@@ -644,7 +943,7 @@ def coarse_observation_fingerprint(value: Any) -> str:
 
 def coarse_observation_label(value: Any) -> str:
     """Return a low-cardinality observation label for count-based lifelong keys."""
-    text = _result_text(value)
+    text = _canonical_observation_text(_result_text(value))
     low = text.lower()
     if not low.strip():
         return "empty"
@@ -656,7 +955,9 @@ def coarse_observation_label(value: Any) -> str:
         ("traceback", ("traceback", "exception:", "error:")),
         ("assertion", ("assertionerror", "assertion failed")),
         ("test_fail", ("failed", "failure", "tests failed")),
-        ("test_pass", ("all tests passed", "passed", "success")),
+        ("success_no_output", ("command executed successfully (no output)",)),
+        ("operation_success", ("command executed successfully", "content successfully written", "successfully written")),
+        ("test_pass", ("all tests passed", "tests passed", "passed")),
         ("install", ("apt-get", "pip install", "npm install")),
         ("build", ("building", "compiling", "make:", "cmake")),
     )
@@ -731,6 +1032,9 @@ class V1LifelongKeyBuilder(LifelongKeyBuilder):
 
 
 def _command_family(action: dict[str, Any]) -> str:
+    explicit = str(action.get("action_family") or "").strip().lower()
+    if explicit:
+        return re.sub(r"[^a-z0-9_.-]+", "_", explicit)[:80]
     tool = str(action.get("tool_name") or "tool").strip().lower() or "tool"
     signature = str(action.get("signature") or action.get("raw") or "")
     parts = [part for part in signature.split("|") if part]
@@ -764,6 +1068,9 @@ def _is_test_action(action: dict[str, Any]) -> bool:
 
 
 def _is_file_mod_action(action: dict[str, Any]) -> bool:
+    tool = str(action.get("tool_name") or "").strip().lower()
+    if tool in {"shell_write_content_to_file", "write_file", "edit_file"}:
+        return True
     text = _action_flag_text(action)
     return bool(
         re.search(
@@ -863,6 +1170,63 @@ class V2LifelongKeyBuilder(LifelongKeyBuilder):
             keys.append(_stable_hash("\n".join(parts), 16))
         return keys
 
+    def key_groups(
+        self,
+        actions: list[dict[str, Any]],
+        turn_records: list[dict[str, Any]],
+        metadata: dict[str, Any] | None = None,
+    ) -> dict[str, list[str]]:
+        task_keys = self.keys(actions, turn_records, metadata)
+        if not self.config.lifelong_hierarchical:
+            return {"task": task_keys}
+
+        skill_result_fps = _turn_result_fingerprints(turn_records, obs_mode="label")
+        dataset = _normalize_dataset(
+            _metadata_value(metadata, "agent57_dataset")
+            or _metadata_value(metadata, "data_source")
+            or _metadata_value(metadata, "task_meta", "data_source")
+        )
+        split = str(
+            _metadata_value(metadata, "safety_split")
+            or _metadata_value(metadata, "task_meta", "safety_split")
+            or _metadata_value(metadata, "task_meta", "agentharm_task_type")
+            or ""
+        ).strip().lower()
+
+        skill_keys: list[str] = []
+        global_keys: list[str] = []
+        for idx, action in enumerate(actions or []):
+            if idx < len(skill_result_fps):
+                obs_label, exit_fp = skill_result_fps[idx]
+            else:
+                obs_label, exit_fp = "no_result", "exit_unknown"
+            common = ["v2"]
+            if self.config.lifelong_include_dataset:
+                common.append(f"dataset:{dataset}")
+                if split:
+                    common.append(f"split:{split[:80]}")
+            family = _command_family(action)
+            flags = [
+                f"family:{family}",
+                f"test:{int(_is_test_action(action))}",
+                f"filemod:{int(_is_file_mod_action(action))}",
+            ]
+            skill_parts = [
+                *common,
+                "level:skill",
+                *flags,
+                f"obs:{obs_label}",
+                f"exit:{exit_fp}",
+            ]
+            global_parts = [
+                *common,
+                "level:global",
+                *flags,
+            ]
+            skill_keys.append(f"skill:{_stable_hash(chr(10).join(skill_parts), 16)}")
+            global_keys.append(f"global:{_stable_hash(chr(10).join(global_parts), 16)}")
+        return {"task": task_keys, "skill": skill_keys, "global": global_keys}
+
 
 def _key_builder(config: Agent57LiteConfig | None) -> LifelongKeyBuilder:
     if config is not None and config.lifelong_key_version == "v2":
@@ -878,6 +1242,19 @@ def lifelong_keys(
     metadata: dict[str, Any] | None = None,
 ) -> list[str]:
     return _key_builder(config).keys(actions, turn_records, metadata)
+
+
+def lifelong_key_groups(
+    actions: list[dict[str, Any]],
+    turn_records: list[dict[str, Any]],
+    *,
+    config: Agent57LiteConfig | None = None,
+    metadata: dict[str, Any] | None = None,
+) -> dict[str, list[str]]:
+    builder = _key_builder(config)
+    if isinstance(builder, V2LifelongKeyBuilder):
+        return builder.key_groups(actions, turn_records, metadata)
+    return {"task": builder.keys(actions, turn_records, metadata)}
 
 
 def _status_value(status: Any) -> str:
@@ -958,6 +1335,8 @@ def compute_lifelong_bonus(
         "explore_agent57_lifelong_enabled": bool(config.lifelong_enabled),
         "explore_agent57_lifelong_backend": config.lifelong_backend,
         "explore_agent57_lifelong_state_path": config.state_path,
+        "explore_agent57_sqlite_busy_timeout_ms": int(config.sqlite_busy_timeout_ms),
+        "explore_agent57_sqlite_wal": bool(config.sqlite_wal),
         "explore_agent57_lifelong_coef": float(config.lifelong_coef),
         "explore_agent57_lifelong_clip": float(config.lifelong_clip),
         "explore_agent57_lifelong_warmup": int(config.lifelong_warmup),
@@ -968,6 +1347,10 @@ def compute_lifelong_bonus(
         "explore_agent57_lifelong_include_task": bool(config.lifelong_include_task),
         "explore_agent57_lifelong_include_turn": bool(config.lifelong_include_turn),
         "explore_agent57_lifelong_obs_mode": config.lifelong_obs_mode,
+        "explore_agent57_lifelong_hierarchical": bool(config.lifelong_hierarchical),
+        "explore_agent57_lifelong_task_weight": float(config.lifelong_task_weight),
+        "explore_agent57_lifelong_skill_weight": float(config.lifelong_skill_weight),
+        "explore_agent57_lifelong_global_weight": float(config.lifelong_global_weight),
         "explore_agent57_trust_gate_mode": config.trust_gate_mode,
         "explore_agent57_trust": 0.0,
         "explore_agent57_lifelong_raw": 0.0,
@@ -980,6 +1363,15 @@ def compute_lifelong_bonus(
         "explore_agent57_lifelong_bonus": 0.0,
         "explore_agent57_lifelong_bonus_unclipped": 0.0,
         "explore_agent57_lifelong_unique_keys": 0,
+        "explore_agent57_lifelong_key_count": 0,
+        "explore_agent57_lifelong_duplicate_key_count": 0,
+        "explore_agent57_lifelong_task_unique_keys": 0,
+        "explore_agent57_lifelong_skill_unique_keys": 0,
+        "explore_agent57_lifelong_global_unique_keys": 0,
+        "explore_agent57_lifelong_task_raw": 0.0,
+        "explore_agent57_lifelong_skill_raw": 0.0,
+        "explore_agent57_lifelong_global_raw": 0.0,
+        "explore_agent57_sqlite_lock_wait_ms": 0.0,
         "explore_agent57_lifelong_seen_before": 0,
         "explore_agent57_lifelong_warmup_remaining": int(config.lifelong_warmup),
         "explore_agent57_lifelong_eligible": 0.0,
@@ -989,17 +1381,44 @@ def compute_lifelong_bonus(
     }
     if not config.active or not config.lifelong_enabled:
         return metrics
-    keys = lifelong_keys(actions, turn_records, config=config, metadata=metadata)
-    metrics["explore_agent57_lifelong_unique_keys"] = len(set(keys))
+    key_groups = lifelong_key_groups(actions, turn_records, config=config, metadata=metadata)
+    total_key_count = sum(len(level_keys) for level_keys in key_groups.values())
+    keys = _flatten_key_groups(key_groups)
+    metrics["explore_agent57_lifelong_key_count"] = int(total_key_count)
+    metrics["explore_agent57_lifelong_unique_keys"] = int(len(set(keys)))
+    metrics["explore_agent57_lifelong_duplicate_key_count"] = int(
+        max(0, total_key_count - len(set(keys)))
+    )
+    for level in ("task", "skill", "global"):
+        level_keys = key_groups.get(level, [])
+        metrics[f"explore_agent57_lifelong_{level}_unique_keys"] = int(
+            len(set(level_keys))
+        )
     if not keys:
         metrics["explore_agent57_lifelong_suppressed_reason"] = "no_actions"
         return metrics
 
     try:
         if config.lifelong_backend == "sqlite":
-            seen_before, counts_before = _sqlite_next_counts(config, keys)
+            (
+                seen_before,
+                counts_by_key,
+                raw,
+                stat_n,
+                stat_mean,
+                stat_std,
+                raw_by_level,
+                lock_wait_ms,
+            ) = _sqlite_next_counts_and_raw_stats(config, key_groups)
         else:
-            seen_before, counts_before = _local_next_counts(config, keys)
+            seen_before, counts_by_key = _local_next_key_counts(config, key_groups)
+            raw, raw_by_level = _lifelong_raw_from_key_groups(
+                config,
+                key_groups,
+                counts_by_key,
+            )
+            stat_n, stat_mean, stat_std = _lifelong_raw_stats(config, raw)
+            lock_wait_ms = 0.0
     except Exception as exc:
         metrics["explore_agent57_lifelong_suppressed_reason"] = (
             f"state_error:{type(exc).__name__}"
@@ -1007,19 +1426,14 @@ def compute_lifelong_bonus(
         return metrics
 
     metrics["explore_agent57_lifelong_seen_before"] = int(seen_before)
+    metrics["explore_agent57_sqlite_lock_wait_ms"] = float(lock_wait_ms)
     warmup_remaining = max(0, config.lifelong_warmup - seen_before - 1)
     metrics["explore_agent57_lifelong_warmup_remaining"] = int(warmup_remaining)
-    if counts_before:
-        raw = sum(1.0 / math.sqrt(c + 1.0) for c in counts_before) / len(counts_before)
-    else:
-        raw = 0.0
-    raw = min(config.lifelong_clip, max(0.0, raw)) if config.lifelong_clip > 0 else raw
     metrics["explore_agent57_lifelong_raw"] = float(raw)
-    try:
-        stat_n, stat_mean, stat_std = _lifelong_raw_stats(config, raw)
-    except Exception as exc:
-        stat_n, stat_mean, stat_std = 0, 0.0, 0.0
-        metrics["explore_agent57_lifelong_stat_error"] = f"{type(exc).__name__}"
+    for level in ("task", "skill", "global"):
+        metrics[f"explore_agent57_lifelong_{level}_raw"] = float(
+            raw_by_level.get(level, 0.0)
+        )
     life_mod, life_z = _life_mod_from_raw(
         config,
         raw,
@@ -1136,7 +1550,11 @@ def _sqlite_arm_stats(
     *,
     dataset: str | None = None,
 ) -> list[dict[str, float]]:
-    conn = _connect(config.state_path)
+    conn = _connect(
+        config.state_path,
+        busy_timeout_ms=config.sqlite_busy_timeout_ms,
+        wal=config.sqlite_wal,
+    )
     try:
         if dataset:
             rows = conn.execute(
@@ -1370,7 +1788,11 @@ def record_arm_event(
     }
     if config.lifelong_backend == "sqlite":
         try:
-            conn = _connect(config.state_path)
+            conn = _connect(
+                config.state_path,
+                busy_timeout_ms=config.sqlite_busy_timeout_ms,
+                wal=config.sqlite_wal,
+            )
             try:
                 conn.execute(
                     "INSERT INTO arm_events"

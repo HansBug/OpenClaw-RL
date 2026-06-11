@@ -38,6 +38,12 @@ def test_agent57_config_defaults_preserve_additive_mode(monkeypatch):
         "EXPLORE_AGENT57_LIFELONG_COUNT_DECAY",
         "EXPLORE_AGENT57_LIFELONG_CAPACITY",
         "EXPLORE_AGENT57_LIFELONG_OBS_MODE",
+        "EXPLORE_AGENT57_LIFELONG_HIERARCHICAL",
+        "EXPLORE_AGENT57_LIFELONG_TASK_WEIGHT",
+        "EXPLORE_AGENT57_LIFELONG_SKILL_WEIGHT",
+        "EXPLORE_AGENT57_LIFELONG_GLOBAL_WEIGHT",
+        "EXPLORE_AGENT57_SQLITE_BUSY_TIMEOUT_MS",
+        "EXPLORE_AGENT57_SQLITE_WAL",
         "EXPLORE_AGENT57_TRUST_GATE",
     ):
         monkeypatch.delenv(name, raising=False)
@@ -54,6 +60,9 @@ def test_agent57_config_defaults_preserve_additive_mode(monkeypatch):
     assert config.lifelong_count_decay == 1.0
     assert config.lifelong_capacity == 0
     assert config.lifelong_obs_mode == "fingerprint"
+    assert config.lifelong_hierarchical is False
+    assert config.sqlite_busy_timeout_ms == 30000
+    assert config.sqlite_wal is False
     assert config.trust_gate_mode == "hard"
 
 
@@ -100,6 +109,28 @@ def test_ngu_lite_bonus_stays_zero_when_lifelong_not_eligible(monkeypatch):
 
     assert metrics["explore_agent57_ngu_bonus"] == 0.0
     assert metrics["explore_agent57_ngu_episodic"] == 10.0
+
+
+def test_observation_buckets_separate_command_success_from_test_pass():
+    command_success = "Command executed successfully (no output)."
+    file_success = "Content successfully written to '/tmp/audit.sh' in Docker container."
+    test_success = "1 passed in 0.12s"
+
+    assert a57.coarse_observation_fingerprint(command_success) == "success_no_output:lenS"
+    assert a57.coarse_observation_label(command_success) == "success_no_output:lenS"
+    assert a57.exit_code_bucket(command_success) == "exit0"
+    assert a57.coarse_observation_fingerprint(file_success).startswith("operation_success:")
+    assert a57.coarse_observation_label(file_success).startswith("operation_success:")
+    assert a57.exit_code_bucket(file_success) == "exit0"
+    assert a57.coarse_observation_fingerprint(test_success).startswith("test_pass:")
+    assert a57.coarse_observation_label(test_success).startswith("test_pass:")
+
+
+def test_observation_fingerprint_canonicalizes_dynamic_numbers():
+    left = "job 1 at Thu Jun 11 07:39:00 2026\n92"
+    right = "job 2 at Thu Jun 11 07:41:00 2026\n93"
+
+    assert a57.coarse_observation_fingerprint(left) == a57.coarse_observation_fingerprint(right)
 
 
 def test_ngu_lite_bonus_soft_trust_scales_product(monkeypatch):
@@ -344,6 +375,141 @@ def test_lifelong_local_counts_support_decay_and_capacity(monkeypatch):
 
     assert math.isclose(second["explore_agent57_lifelong_raw"], 1.0 / math.sqrt(2.0))
     assert len(a57._LOCAL_COUNTS) == 1
+
+
+def test_lifelong_local_counts_decay_by_last_seen_gap(monkeypatch):
+    _reset_local_agent57_state()
+    monkeypatch.setenv("EXPLORE_AGENT57_LITE", "1")
+    monkeypatch.setenv("EXPLORE_AGENT57_LIFELONG", "1")
+    monkeypatch.setenv("EXPLORE_AGENT57_LIFELONG_BACKEND", "local")
+    monkeypatch.setenv("EXPLORE_AGENT57_LIFELONG_WARMUP", "0")
+    monkeypatch.setenv("EXPLORE_AGENT57_LIFELONG_COUNT_DECAY", "0.5")
+    config = a57.config_from_env()
+    turns = [{"turn_idx": 0, "command": "pytest", "result": {"exit_code": 0}}]
+
+    action_a = [{"tool_name": "shell", "signature": "shell|pytest", "raw": "pytest"}]
+    action_b = [{"tool_name": "shell", "signature": "shell|ls", "raw": "ls"}]
+    a57.compute_lifelong_bonus(
+        config=config,
+        arm_id=0,
+        actions=action_a,
+        turn_records=turns,
+        status="completed",
+        parse_error_count=0,
+    )
+    a57.compute_lifelong_bonus(
+        config=config,
+        arm_id=0,
+        actions=action_b,
+        turn_records=turns,
+        status="completed",
+        parse_error_count=0,
+    )
+    third = a57.compute_lifelong_bonus(
+        config=config,
+        arm_id=0,
+        actions=action_a,
+        turn_records=turns,
+        status="completed",
+        parse_error_count=0,
+    )
+
+    assert math.isclose(third["explore_agent57_lifelong_raw"], 1.0 / math.sqrt(1.5))
+
+
+def test_lifelong_hierarchical_key_reuses_skill_across_tasks(monkeypatch):
+    _reset_local_agent57_state()
+    monkeypatch.setenv("EXPLORE_AGENT57_LITE", "1")
+    monkeypatch.setenv("EXPLORE_AGENT57_LIFELONG", "1")
+    monkeypatch.setenv("EXPLORE_AGENT57_LIFELONG_BACKEND", "local")
+    monkeypatch.setenv("EXPLORE_AGENT57_LIFELONG_KEY_VERSION", "v2")
+    monkeypatch.setenv("EXPLORE_AGENT57_LIFELONG_INCLUDE_DATASET", "1")
+    monkeypatch.setenv("EXPLORE_AGENT57_LIFELONG_INCLUDE_TASK", "1")
+    monkeypatch.setenv("EXPLORE_AGENT57_LIFELONG_HIERARCHICAL", "1")
+    monkeypatch.setenv("EXPLORE_AGENT57_LIFELONG_TASK_WEIGHT", "0")
+    monkeypatch.setenv("EXPLORE_AGENT57_LIFELONG_SKILL_WEIGHT", "1")
+    monkeypatch.setenv("EXPLORE_AGENT57_LIFELONG_GLOBAL_WEIGHT", "0")
+    monkeypatch.setenv("EXPLORE_AGENT57_LIFELONG_WARMUP", "0")
+    config = a57.config_from_env()
+    action = [{"tool_name": "shell", "signature": "shell|pgrep|atd", "raw": "pgrep atd"}]
+    turns_a = [{"turn_idx": 0, "command": "pgrep atd", "result": {"stdout": "92"}}]
+    turns_b = [{"turn_idx": 0, "command": "pgrep atd", "result": {"stdout": "93"}}]
+
+    a57.compute_lifelong_bonus(
+        config=config,
+        arm_id=0,
+        actions=action,
+        turn_records=turns_a,
+        status="completed",
+        parse_error_count=0,
+        metadata={"data_source": "seta", "task_path": "seta_env/1"},
+    )
+    second = a57.compute_lifelong_bonus(
+        config=config,
+        arm_id=0,
+        actions=action,
+        turn_records=turns_b,
+        status="completed",
+        parse_error_count=0,
+        metadata={"data_source": "seta", "task_path": "seta_env/2"},
+    )
+
+    assert second["explore_agent57_lifelong_task_raw"] == 1.0
+    assert math.isclose(second["explore_agent57_lifelong_skill_raw"], 1.0 / math.sqrt(2.0))
+    assert math.isclose(second["explore_agent57_lifelong_raw"], 1.0 / math.sqrt(2.0))
+
+
+def test_lifelong_sqlite_updates_counts_and_stats_in_one_path(tmp_path, monkeypatch):
+    db_path = tmp_path / "agent57.sqlite3"
+    monkeypatch.setenv("EXPLORE_AGENT57_LITE", "1")
+    monkeypatch.setenv("EXPLORE_AGENT57_LIFELONG", "1")
+    monkeypatch.setenv("EXPLORE_AGENT57_LIFELONG_BACKEND", "sqlite")
+    monkeypatch.setenv("EXPLORE_AGENT57_STATE_PATH", str(db_path))
+    monkeypatch.setenv("EXPLORE_AGENT57_LIFELONG_WARMUP", "0")
+    monkeypatch.setenv("EXPLORE_AGENT57_ARM_BETAS", "0.02")
+    monkeypatch.setenv("EXPLORE_AGENT57_SQLITE_BUSY_TIMEOUT_MS", "12345")
+    monkeypatch.setenv("EXPLORE_AGENT57_SQLITE_WAL", "0")
+    a57._SQLITE_SCHEMA_INITIALIZED.discard(str(db_path))
+    config = a57.config_from_env()
+    actions = [{"tool_name": "shell", "signature": "shell|pytest", "raw": "pytest"}]
+    turns = [{"turn_idx": 0, "command": "pytest", "result": {"exit_code": 0}}]
+
+    first = a57.compute_lifelong_bonus(
+        config=config,
+        arm_id=0,
+        actions=actions,
+        turn_records=turns,
+        status="completed",
+        parse_error_count=0,
+        metadata={"data_source": "seta", "task_path": "seta_env/1"},
+    )
+    second = a57.compute_lifelong_bonus(
+        config=config,
+        arm_id=0,
+        actions=actions,
+        turn_records=turns,
+        status="completed",
+        parse_error_count=0,
+        metadata={"data_source": "seta", "task_path": "seta_env/1"},
+    )
+
+    assert first["explore_agent57_sqlite_busy_timeout_ms"] == 12345
+    assert first["explore_agent57_sqlite_wal"] is False
+    assert first["explore_agent57_lifelong_seen_before"] == 0
+    assert second["explore_agent57_lifelong_seen_before"] == 1
+    assert second["explore_agent57_lifelong_stat_n"] == 1
+    assert math.isclose(second["explore_agent57_lifelong_raw"], 1.0 / math.sqrt(2.0))
+
+    conn = sqlite3.connect(db_path)
+    try:
+        meta = dict(conn.execute("SELECT name, value FROM meta").fetchall())
+        count = conn.execute("SELECT count FROM lifelong_counts").fetchone()[0]
+    finally:
+        conn.close()
+
+    assert int(meta["lifelong_traj_seen"]) == 2
+    assert int(meta["lifelong_raw_n"]) == 2
+    assert count > 1.0
 
 
 def test_standardized_life_mod_override_drives_ngu_product(monkeypatch):

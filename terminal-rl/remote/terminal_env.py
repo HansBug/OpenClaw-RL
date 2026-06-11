@@ -8,6 +8,7 @@ import re
 import subprocess
 import inspect
 import time
+from concurrent.futures import ThreadPoolExecutor
 from functools import partial
 from pathlib import Path
 from typing import Any
@@ -29,6 +30,9 @@ from .docker_compose_utils import compose_up_no_build, prepare_task_docker_image
 logger = logging.getLogger("terminal.env.worker.terminal_env")
 logger.setLevel(logging.INFO)
 
+_TASK_CONTAINER_RE = re.compile(r"^[0-9]+-[A-Za-z0-9]{8}-slime-run$")
+_DOCKER_CLEANUP_EXECUTOR: ThreadPoolExecutor | None = None
+
 
 def _env_bool(name: str, default: bool) -> bool:
     raw = os.getenv(name)
@@ -46,6 +50,28 @@ def _env_float(name: str, default: float) -> float:
     except ValueError:
         logger.warning("Invalid %s=%r; using default %s", name, raw, default)
         return default
+
+
+def _env_int(name: str, default: int) -> int:
+    raw = os.getenv(name)
+    if raw is None or raw == "":
+        return default
+    try:
+        return int(raw)
+    except ValueError:
+        logger.warning("Invalid %s=%r; using default %s", name, raw, default)
+        return default
+
+
+def _docker_cleanup_executor() -> ThreadPoolExecutor:
+    global _DOCKER_CLEANUP_EXECUTOR
+    if _DOCKER_CLEANUP_EXECUTOR is None:
+        workers = max(1, _env_int("TERMINAL_ENV_DOCKER_CLEANUP_WORKERS", 8))
+        _DOCKER_CLEANUP_EXECUTOR = ThreadPoolExecutor(
+            max_workers=workers,
+            thread_name_prefix="openclaw-docker-cleanup",
+        )
+    return _DOCKER_CLEANUP_EXECUTOR
 
 
 def _docker_name_variants(value: str | None) -> set[str]:
@@ -92,6 +118,44 @@ def _docker_image_prefixes(*values: str | None) -> set[str]:
         if task_match:
             prefixes.add(f"tb__{task_match.group(1)}__")
     return {prefix for prefix in prefixes if prefix.startswith("tb__")}
+
+
+def _docker_status_age_seconds(status: str) -> float | None:
+    text = (status or "").strip().lower()
+    if not text:
+        return None
+    if "less than a second" in text:
+        return 0.0
+    if "about a minute" in text or "a minute" in text:
+        return 60.0
+    match = re.search(
+        r"(\d+)\s+"
+        r"(second|seconds|minute|minutes|hour|hours|day|days|week|weeks|month|months)",
+        text,
+    )
+    if match is None:
+        return None
+    value = int(match.group(1))
+    unit = match.group(2)
+    if unit.startswith("second"):
+        return float(value)
+    if unit.startswith("minute"):
+        return float(value * 60)
+    if unit.startswith("hour"):
+        return float(value * 3600)
+    if unit.startswith("day"):
+        return float(value * 86400)
+    if unit.startswith("week"):
+        return float(value * 7 * 86400)
+    if unit.startswith("month"):
+        return float(value * 30 * 86400)
+    return None
+
+
+def _is_task_container(name: str, image: str) -> bool:
+    if _TASK_CONTAINER_RE.match(name or ""):
+        return True
+    return bool((name or "").endswith("-slime-run") and (image or "").startswith("tb__"))
 
 
 def _force_remove_docker_objects(
@@ -275,6 +339,156 @@ def _force_remove_docker_objects(
             pass
 
 
+def _attach_detached_cleanup_logger(
+    fut: asyncio.Future[Any], *, trial_name: str, reason: str
+) -> None:
+    def _on_done(done: asyncio.Future[Any]) -> None:
+        try:
+            done.result()
+        except asyncio.CancelledError:
+            logger.warning(
+                "Detached Docker cleanup was cancelled for TerminalEnv %s (%s)",
+                trial_name,
+                reason,
+            )
+        except Exception:
+            logger.exception(
+                "Detached Docker cleanup failed for TerminalEnv %s (%s)",
+                trial_name,
+                reason,
+            )
+        else:
+            logger.warning(
+                "Detached Docker cleanup finished for TerminalEnv %s (%s)",
+                trial_name,
+                reason,
+            )
+
+    fut.add_done_callback(_on_done)
+
+
+async def _force_remove_docker_objects_async(
+    *,
+    trial_name: str,
+    client_container_name: str | None,
+    docker_image_name_prefix: str | None = None,
+    reason: str,
+) -> None:
+    loop = asyncio.get_running_loop()
+    fut = loop.run_in_executor(
+        _docker_cleanup_executor(),
+        partial(
+            _force_remove_docker_objects,
+            trial_name=trial_name,
+            client_container_name=client_container_name,
+            docker_image_name_prefix=docker_image_name_prefix,
+            reason=reason,
+        ),
+    )
+    try:
+        await asyncio.shield(fut)
+    except asyncio.CancelledError:
+        logger.warning(
+            "Docker cleanup detached after cancellation for TerminalEnv %s (%s); "
+            "cleanup will continue in the executor.",
+            trial_name,
+            reason,
+        )
+        _attach_detached_cleanup_logger(fut, trial_name=trial_name, reason=reason)
+        raise
+
+
+def force_remove_orphan_docker_objects(
+    *,
+    active_container_names: set[str],
+    reason: str,
+    min_age_sec: float,
+    max_remove: int,
+) -> int:
+    if not _env_bool("TERMINAL_ENV_FORCE_DOCKER_CLEANUP", True):
+        return 0
+
+    timeout = float(os.getenv("TERMINAL_ENV_FORCE_DOCKER_CLEANUP_TIMEOUT", "20"))
+    try:
+        listed = subprocess.run(
+            [
+                "docker",
+                "ps",
+                "-a",
+                "--format",
+                "{{.ID}}\t{{.Names}}\t{{.Image}}\t{{.Status}}",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+        )
+    except Exception as exc:
+        logger.warning("Orphan Docker sweep could not list containers (%s): %s", reason, exc)
+        return 0
+
+    active = {name for name in active_container_names if name}
+    candidates: list[tuple[str, str, str, str, float]] = []
+    for line in listed.stdout.splitlines():
+        parts = line.split("\t")
+        if len(parts) < 2:
+            continue
+        container_id, name = parts[0], parts[1]
+        image = parts[2] if len(parts) > 2 else ""
+        status = parts[3] if len(parts) > 3 else ""
+        if name in active or not _is_task_container(name, image):
+            continue
+        age_sec = _docker_status_age_seconds(status)
+        if age_sec is None or age_sec < min_age_sec:
+            continue
+        candidates.append((container_id, name, image, status, age_sec))
+        if max_remove > 0 and len(candidates) >= max_remove:
+            break
+
+    if not candidates:
+        return 0
+
+    logger.warning(
+        "Orphan Docker sweep removing %d stale task container(s) reason=%s "
+        "min_age=%.1fs active=%d samples=%s",
+        len(candidates),
+        reason,
+        min_age_sec,
+        len(active),
+        "; ".join(
+            f"{cid[:12]} name={name} image={image} status={status}"
+            for cid, name, image, status, _age in candidates[:8]
+        ),
+    )
+
+    removed_count = 0
+    for start in range(0, len(candidates), 20):
+        chunk = candidates[start : start + 20]
+        ids = [item[0] for item in chunk]
+        try:
+            removed = subprocess.run(
+                ["docker", "rm", "-f", *ids],
+                capture_output=True,
+                text=True,
+                timeout=timeout,
+            )
+            if removed.returncode == 0:
+                removed_count += len(ids)
+            logger.warning(
+                "Orphan Docker sweep rm finished ids=%s rc=%s stdout=%s stderr=%s",
+                ",".join(cid[:12] for cid in ids),
+                removed.returncode,
+                removed.stdout.strip()[:300],
+                removed.stderr.strip()[:300],
+            )
+        except Exception as exc:
+            logger.warning(
+                "Orphan Docker sweep rm failed ids=%s: %s",
+                ",".join(cid[:12] for cid in ids),
+                exc,
+            )
+    return removed_count
+
+
 def _stop_terminal_compat(terminal: Terminal, timeout: float) -> None:
     try:
         supports_timeout = "timeout" in inspect.signature(terminal.stop).parameters
@@ -357,6 +571,7 @@ class TerminalEnv:
         self._agent_safetybench_env: AgentSafetyBenchEnv | None = None
         self._agentharm_env: AgentHarmEnv | None = None
         self._eval_attempt = 0
+        self._last_eval: dict[str, Any] | None = None
         self._last_trial_name: str | None = None
         self._last_client_container_name: str | None = None
         self._last_docker_image_name_prefix: str | None = None
@@ -376,6 +591,7 @@ class TerminalEnv:
         self._run_ctx = run_ctx
         self._timeouts = timeouts
         self._eval_attempt = 0
+        self._last_eval = None
 
         if task_meta.get("data_source") == "agent_safetybench":
             self._agent_safetybench_env = AgentSafetyBenchEnv()
@@ -672,9 +888,15 @@ class TerminalEnv:
                     task_name,
                     test_timeout_sec,
                 )
-                raise RuntimeError(
-                    f"Evaluation tests timed out for task={task_name} after {test_timeout_sec:.1f}s"
-                ) from exc
+                self._last_eval = {
+                    "mode": "terminal_tests",
+                    "score": 0.0,
+                    "reason": "eval_timeout",
+                    "task": task_name,
+                    "timeout_sec": test_timeout_sec,
+                    "error": str(exc),
+                }
+                return 0.0
 
             test_output = test_session.capture_pane(capture_entire=True)
             try:
@@ -688,11 +910,26 @@ class TerminalEnv:
                     exc,
                     tail,
                 )
-                raise RuntimeError(
-                    f"Failed to parse test output for task={task_name} with parser={type(self._parser).__name__}: {exc}"
-                ) from exc
+                self._last_eval = {
+                    "mode": "terminal_tests",
+                    "score": 0.0,
+                    "reason": "eval_parse_failed",
+                    "task": task_name,
+                    "parser": type(self._parser).__name__,
+                    "error": str(exc),
+                }
+                return 0.0
 
             if not parser_results:
+                self._last_eval = {
+                    "mode": "terminal_tests",
+                    "score": 0.0,
+                    "reason": "eval_no_results",
+                    "task": task_name,
+                    "parser": type(self._parser).__name__,
+                    "total": 0,
+                    "passed": 0,
+                }
                 return 0.0
             passed = sum(
                 1
@@ -702,6 +939,7 @@ class TerminalEnv:
             reward = (
                 float(passed / len(parser_results)) if len(parser_results) > 0 else 0.0
             )
+            self._last_eval = None
             return reward
 
         return await asyncio.wait_for(
@@ -716,7 +954,7 @@ class TerminalEnv:
         if self._agentharm_env is not None:
             details = getattr(self._agentharm_env, "_last_eval", None)
             return details if isinstance(details, dict) else None
-        return None
+        return self._last_eval if isinstance(self._last_eval, dict) else None
 
     async def close(self) -> None:
         trial_name = (
@@ -755,10 +993,23 @@ class TerminalEnv:
         self._timeouts = None
         self._agent_safetybench_env = None
         self._agentharm_env = None
+        self._last_eval = None
 
         cleanup_completed = terminal is None
         cleanup_error = False
         fast_close = _env_bool("TERMINAL_ENV_FAST_CLOSE", False)
+        force_cleanup_started = False
+
+        async def _run_force_cleanup(reason: str) -> None:
+            nonlocal force_cleanup_started
+            force_cleanup_started = True
+            await _force_remove_docker_objects_async(
+                trial_name=trial_name,
+                client_container_name=client_container_name,
+                docker_image_name_prefix=docker_image_name_prefix,
+                reason=reason,
+            )
+
         try:
             if agent_safetybench_env is not None:
                 try:
@@ -776,11 +1027,22 @@ class TerminalEnv:
                         "Failed to cleanup AgentHarm env for %s", trial_name
                     )
 
+            if fast_close and terminal is not None:
+                try:
+                    await _run_force_cleanup("fast_close")
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    cleanup_error = True
+                    logger.exception(
+                        "Force Docker cleanup failed for TerminalEnv %s", trial_name
+                    )
+
             if toolkit is not None:
                 if fast_close:
                     logger.warning(
                         "Fast close enabled for %s; skipping TerminalToolkit.cleanup "
-                        "and relying on direct Docker cleanup.",
+                        "and session drain; relying on direct Docker cleanup.",
                         trial_name,
                     )
                 else:
@@ -791,13 +1053,13 @@ class TerminalEnv:
                         logger.exception(
                             "Failed to cleanup terminal toolkit for %s", trial_name
                         )
-                try:
-                    await asyncio.to_thread(_drain_toolkit_sessions, toolkit)
-                except Exception:
-                    cleanup_error = True
-                    logger.exception(
-                        "Failed to drain toolkit sessions for %s", trial_name
-                    )
+                    try:
+                        await asyncio.to_thread(_drain_toolkit_sessions, toolkit)
+                    except Exception:
+                        cleanup_error = True
+                        logger.exception(
+                            "Failed to drain toolkit sessions for %s", trial_name
+                        )
 
             if terminal is not None and timeouts is not None:
                 try:
@@ -820,7 +1082,7 @@ class TerminalEnv:
             force_needed = (
                 force_always or fast_close or cleanup_error or not cleanup_completed
             )
-            if terminal is not None and force_needed:
+            if terminal is not None and force_needed and not force_cleanup_started:
                 if fast_close:
                     reason = "fast_close"
                 elif force_always and cleanup_completed and not cleanup_error:
@@ -828,21 +1090,14 @@ class TerminalEnv:
                 else:
                     reason = "close_incomplete"
                 try:
-                    await asyncio.to_thread(
-                        _force_remove_docker_objects,
-                        trial_name=trial_name,
-                        client_container_name=client_container_name,
-                        docker_image_name_prefix=docker_image_name_prefix,
-                        reason=reason,
-                    )
+                    await _run_force_cleanup(reason)
                 except Exception:
                     logger.exception(
                         "Force Docker cleanup failed for TerminalEnv %s", trial_name
                     )
 
     async def force_cleanup(self, reason: str = "external") -> None:
-        await asyncio.to_thread(
-            _force_remove_docker_objects,
+        await _force_remove_docker_objects_async(
             trial_name=self._last_trial_name or "unknown",
             client_container_name=self._last_client_container_name,
             docker_image_name_prefix=self._last_docker_image_name_prefix,
