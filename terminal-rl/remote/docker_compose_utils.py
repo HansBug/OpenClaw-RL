@@ -41,10 +41,21 @@ _BUILD_LOCKS_GUARD = threading.Lock()
 _BUILD_LOCKS: dict[str, threading.Lock] = {}
 _BUILD_DONE: set[str] = set()
 _BUILD_FAILED: dict[str, tuple[float, str]] = {}
+_TASK_IMAGE_BLACKLISTED: dict[str, tuple[float, str]] = {}
+
+_DOCKERFILE_INSTRUCTION_RE = re.compile(
+    r"^\s*(?:ADD|ARG|CMD|COPY|ENTRYPOINT|ENV|EXPOSE|FROM|HEALTHCHECK|LABEL|"
+    r"MAINTAINER|ONBUILD|RUN|SHELL|STOPSIGNAL|USER|VOLUME|WORKDIR)\b",
+    re.IGNORECASE,
+)
 
 
 class DockerImageBuildError(RuntimeError):
     """Deterministic task image build failure cached per task image."""
+
+
+class TaskImageBlacklistedError(DockerImageBuildError):
+    """Task image is known-bad and should not hit Docker again until TTL expires."""
 
 
 def _safe_project_component(value: str, fallback: str = "task") -> str:
@@ -153,6 +164,15 @@ def _build_failed_ttl() -> float:
     return max(0.0, value)
 
 
+def _task_image_blacklist_ttl() -> float:
+    raw = os.getenv("WORKER_DOCKER_TASK_BLACKLIST_TTL", "86400")
+    try:
+        value = float(raw)
+    except ValueError:
+        return 86400.0
+    return max(0.0, value)
+
+
 def _cached_build_failure(build_key: str) -> str | None:
     ttl = _build_failed_ttl()
     if ttl <= 0:
@@ -164,6 +184,89 @@ def _cached_build_failure(build_key: str) -> str | None:
     if time.time() - ts <= ttl:
         return message
     _BUILD_FAILED.pop(build_key, None)
+    return None
+
+
+def _cached_task_image_blacklist(build_key: str) -> str | None:
+    ttl = _task_image_blacklist_ttl()
+    if ttl <= 0:
+        return None
+    cached = _TASK_IMAGE_BLACKLISTED.get(build_key)
+    if cached is None:
+        return None
+    ts, message = cached
+    if time.time() - ts <= ttl:
+        return message
+    _TASK_IMAGE_BLACKLISTED.pop(build_key, None)
+    return None
+
+
+def _blacklist_task_image(build_key: str, message: str) -> None:
+    if _task_image_blacklist_ttl() <= 0:
+        return
+    _TASK_IMAGE_BLACKLISTED[build_key] = (time.time(), message)
+
+
+def _is_deterministic_build_failure(message: str) -> bool:
+    lowered = message.lower()
+    deterministic_markers = (
+        "dockerfile parse error",
+        "unknown instruction:",
+        "failed to read dockerfile",
+        "cannot locate specified dockerfile",
+        "no such file or directory",
+        "yaml: line",
+        "services must be a mapping",
+    )
+    return any(marker in lowered for marker in deterministic_markers)
+
+
+def _dockerfile_precheck_error(task_path: Path) -> str | None:
+    if not _env_bool("WORKER_DOCKERFILE_PRECHECK", True):
+        return None
+    dockerfile = task_path / "Dockerfile"
+    try:
+        lines = dockerfile.read_text(encoding="utf-8", errors="replace").splitlines()
+    except FileNotFoundError:
+        return f"{dockerfile} is missing"
+    except OSError as exc:
+        return f"could not read {dockerfile}: {exc}"
+
+    current_instruction = ""
+    skip_heredoc_until: str | None = None
+    for idx, line in enumerate(lines, start=1):
+        stripped = line.strip()
+        if skip_heredoc_until is not None:
+            if stripped == skip_heredoc_until:
+                skip_heredoc_until = None
+            continue
+        match = _DOCKERFILE_INSTRUCTION_RE.match(line)
+        if match:
+            current_instruction = match.group(0).strip().split()[0].upper()
+        marker = re.search(r"<<\s*['\"]?([A-Za-z_][A-Za-z0-9_]*)['\"]?", line)
+        if marker is not None and current_instruction in {"ADD", "COPY"}:
+            skip_heredoc_until = marker.group(1)
+            continue
+        if "<<" not in line or current_instruction != "RUN":
+            if stripped and not line.rstrip().endswith("\\") and match:
+                current_instruction = ""
+            continue
+        run_body = re.sub(r"^\s*RUN\s+", "", line, flags=re.IGNORECASE).strip()
+        # Dockerfile heredoc syntax is `RUN <<EOF`; shell redirection heredocs
+        # such as `RUN cat > file <<EOF` are parsed as separate Dockerfile
+        # instructions on older/fronted-default builders and deterministically fail.
+        if run_body.startswith("<<"):
+            if marker is not None:
+                skip_heredoc_until = marker.group(1)
+            continue
+        if marker is None:
+            continue
+        return (
+            f"{dockerfile}:{idx} uses a shell heredoc inside RUN "
+            f"({marker.group(0)!r}). Use Dockerfile-native `RUN <<EOF` or "
+            "rewrite with printf/COPY heredoc; otherwise Docker parses the body "
+            "as Dockerfile instructions."
+        )
     return None
 
 
@@ -207,6 +310,11 @@ def build_docker_image(task: dict[str, Any], timeout: float = 1200.0) -> None:
     with build_lock:
         if build_key in _BUILD_DONE:
             return
+        blacklisted_failure = _cached_task_image_blacklist(build_key)
+        if blacklisted_failure is not None:
+            raise TaskImageBlacklistedError(
+                f"TASK_IMAGE_BLACKLISTED image={build_key}: {blacklisted_failure}"
+            )
         cached_failure = _cached_build_failure(build_key)
         if cached_failure is not None:
             raise DockerImageBuildError(
@@ -216,7 +324,18 @@ def build_docker_image(task: dict[str, Any], timeout: float = 1200.0) -> None:
             logger.debug("Docker image already exists locally; skip build: %s", build_key)
             _BUILD_DONE.add(build_key)
             _BUILD_FAILED.pop(build_key, None)
+            _TASK_IMAGE_BLACKLISTED.pop(build_key, None)
             return
+        precheck_error = _dockerfile_precheck_error(task_path)
+        if precheck_error is not None:
+            message = (
+                f"TASK_DOCKERFILE_PRECHECK_FAILED task={task_name}: {precheck_error}"
+            )
+            _BUILD_FAILED[build_key] = (time.time(), message)
+            _blacklist_task_image(build_key, message)
+            raise TaskImageBlacklistedError(
+                f"TASK_IMAGE_BLACKLISTED image={build_key}: {message}"
+            )
 
         with _BUILD_SEMAPHORE:
             import inspect
@@ -230,11 +349,14 @@ def build_docker_image(task: dict[str, Any], timeout: float = 1200.0) -> None:
             except Exception as exc:
                 message = _shorten_output(str(exc), max_chars=1200) or type(exc).__name__
                 _BUILD_FAILED[build_key] = (time.time(), message)
+                if _is_deterministic_build_failure(message):
+                    _blacklist_task_image(build_key, message)
                 raise DockerImageBuildError(
                     f"TASK_BUILD_FAILED image={build_key} task={task_name}: {message}"
                 ) from exc
             _BUILD_DONE.add(build_key)
             _BUILD_FAILED.pop(build_key, None)
+            _TASK_IMAGE_BLACKLISTED.pop(build_key, None)
 
 
 def _resolve_pull_image(task: dict[str, Any]) -> str:

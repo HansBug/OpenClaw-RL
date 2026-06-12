@@ -803,7 +803,16 @@ def force_remove_orphan_docker_objects(
         )
     except Exception as exc:
         logger.warning("Orphan Docker sweep could not list containers (%s): %s", reason, exc)
-        return 0
+        return -1
+    if listed.returncode != 0:
+        logger.warning(
+            "Orphan Docker sweep docker ps failed (%s): rc=%s stdout=%s stderr=%s",
+            reason,
+            listed.returncode,
+            (listed.stdout or "").strip()[:400],
+            (listed.stderr or "").strip()[:400],
+        )
+        return -1
 
     active = {name for name in active_container_names if name}
     active_projects = {name for name in (active_project_names or set()) if name}

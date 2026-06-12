@@ -24,9 +24,14 @@ from .terminal_env import (
     TerminalEnv,
     force_remove_orphan_docker_objects,
 )
+from .docker_compose_utils import DockerImageBuildError, TaskImageBlacklistedError
 
 logger = logging.getLogger("terminal.env.worker")
 app = FastAPI()
+
+_DOCKER_CLI_FAIL_STREAK = 0
+_DOCKER_DEGRADED_UNTIL = 0.0
+_DOCKER_DEGRADED_REASON = ""
 
 
 def _parse_timeout_overrides(
@@ -157,6 +162,42 @@ def _env_bool(name: str, default: bool) -> bool:
     if raw is None:
         return default
     return raw.strip().lower() not in {"0", "false", "no", "off"}
+
+
+def _mark_docker_degraded(reason: str) -> None:
+    global _DOCKER_DEGRADED_REASON, _DOCKER_DEGRADED_UNTIL
+    cooldown = max(0.0, _env_float("WORKER_DOCKER_DEGRADED_COOLDOWN", 120.0))
+    if cooldown <= 0:
+        return
+    _DOCKER_DEGRADED_REASON = reason
+    _DOCKER_DEGRADED_UNTIL = max(_DOCKER_DEGRADED_UNTIL, time.time() + cooldown)
+
+
+def _record_docker_cli_probe(ok: bool, *, timeout: float) -> None:
+    global _DOCKER_CLI_FAIL_STREAK, _DOCKER_DEGRADED_REASON, _DOCKER_DEGRADED_UNTIL
+    if ok:
+        _DOCKER_CLI_FAIL_STREAK = 0
+        if time.time() >= _DOCKER_DEGRADED_UNTIL:
+            _DOCKER_DEGRADED_REASON = ""
+        return
+    _DOCKER_CLI_FAIL_STREAK += 1
+    threshold = max(1, _env_int("WORKER_DOCKER_DEGRADED_FAIL_STREAK", 2))
+    if _DOCKER_CLI_FAIL_STREAK >= threshold:
+        _mark_docker_degraded(
+            f"docker CLI probe failed {_DOCKER_CLI_FAIL_STREAK} consecutive "
+            f"time(s), timeout={timeout:.1f}s"
+        )
+
+
+def _docker_degraded_details() -> dict[str, Any] | None:
+    remaining = _DOCKER_DEGRADED_UNTIL - time.time()
+    if remaining <= 0:
+        return None
+    return {
+        "docker_degraded_remaining_sec": round(remaining, 1),
+        "docker_degraded_reason": _DOCKER_DEGRADED_REASON,
+        "docker_cli_fail_streak": _DOCKER_CLI_FAIL_STREAK,
+    }
 
 
 def _split_env_csv(raw: str | None) -> list[str]:
@@ -420,14 +461,22 @@ def worker_pressure_stats(*, force: bool = False) -> dict[str, Any]:
 
     stats = _read_proc_pressure_stats()
     docker_timeout = _env_float("WORKER_DOCKER_CLI_TIMEOUT", 3.0)
-    stats["docker_cli_ok"] = _docker_cli_ok(docker_timeout)
+    docker_cli_ok = _docker_cli_ok(docker_timeout)
+    _record_docker_cli_probe(docker_cli_ok, timeout=docker_timeout)
+    stats["docker_cli_ok"] = docker_cli_ok
     stats["docker_cli_timeout_sec"] = docker_timeout
+    degraded = _docker_degraded_details()
+    if degraded is not None:
+        stats.update(degraded)
     _PRESSURE_CACHE = (now, dict(stats))
     return stats
 
 
 def assert_worker_has_capacity_for_docker(
-    *, phase: str = "health", pending_closes: int = 0
+    *,
+    phase: str = "health",
+    pending_closes: int = 0,
+    pool_status: dict[str, Any] | None = None,
 ) -> None:
     if os.getenv("WORKER_DISK_GUARD_ENABLED", "1") == "0":
         disk_guard_enabled = False
@@ -475,6 +524,15 @@ def assert_worker_has_capacity_for_docker(
     if os.getenv("WORKER_PRESSURE_GUARD_ENABLED", "1") == "0":
         return
 
+    degraded = _docker_degraded_details()
+    if degraded is not None and phase in {"allocate", "reset"}:
+        raise ResourcePressureError(
+            "WORKER_DOCKER_DEGRADED",
+            "Worker Docker API is in short cooldown after recent CLI failures; "
+            "refusing new Docker work.",
+            {"phase": phase, "pending_closes": pending_closes, **degraded},
+        )
+
     # CRITICAL FIX: Catch RuntimeError that blocks all reset operations
     # Issue: "cannot reuse already awaited coroutine" causes 100% reset failure
     # This is a defensive measure while investigating root cause
@@ -515,6 +573,54 @@ def assert_worker_has_capacity_for_docker(
         "pids_min_free_allocate": pids_min_free_allocate,
         "pids_min_free_reset": pids_min_free_reset,
     }
+    if pool_status is not None:
+        phase_counts = pool_status.get("phase_counts", {})
+        resetting = int((phase_counts or {}).get("resetting", 0) or 0)
+        active_runs = int(pool_status.get("total_active_runs", 0) or 0)
+        reset_age = pool_status.get("resetting_age_sec", {}) or {}
+        reset_max_age = float(reset_age.get("max", 0.0) or 0.0)
+        details.update(
+            {
+                "pool_total_active_runs": active_runs,
+                "pool_resetting_runs": resetting,
+                "pool_resetting_max_age_sec": reset_max_age,
+            }
+        )
+        if (
+            phase in {"allocate", "reset"}
+            and _env_bool("WORKER_RESET_STORM_GUARD", True)
+        ):
+            block_allocate = _env_bool("WORKER_RESET_STORM_BLOCK_ALLOCATE", True)
+            if phase == "reset" or block_allocate:
+                min_resetting = _env_int("WORKER_RESET_STORM_MIN_RESETTING", 32)
+                min_age = _env_float("WORKER_RESET_STORM_MIN_AGE", 180.0)
+                ratio_threshold = _env_float("WORKER_RESET_STORM_RATIO_PCT", 50.0)
+                ratio = (
+                    resetting * 100.0 / max(1, active_runs)
+                    if active_runs > 0
+                    else 0.0
+                )
+                details["pool_resetting_ratio_pct"] = round(ratio, 1)
+                if (
+                    resetting >= min_resetting
+                    and ratio >= ratio_threshold
+                    and reset_max_age >= min_age
+                ):
+                    _mark_docker_degraded(
+                        f"reset storm resetting={resetting}/{active_runs} "
+                        f"ratio={ratio:.1f}% max_age={reset_max_age:.1f}s"
+                    )
+                    raise ResourcePressureError(
+                        "WORKER_RESET_STORM",
+                        "Worker has a reset storm; refusing new reset/allocation "
+                        "until existing reset work drains.",
+                        {
+                            **details,
+                            "reset_storm_min_resetting": min_resetting,
+                            "reset_storm_min_age": min_age,
+                            "reset_storm_ratio_pct": ratio_threshold,
+                        },
+                    )
     if not bool(pressure.get("docker_cli_ok", False)):
         raise ResourcePressureError(
             "WORKER_DOCKER_CLI_UNHEALTHY",
@@ -670,6 +776,8 @@ class WorkerPool:
         self._reset_count: int = 0
         self._last_shim_cleanup_ts: float = time.time()
         self._last_orphan_sweep_ts: float = 0.0
+        self._orphan_sweep_fail_streak: int = 0
+        self._orphan_sweep_backoff_until: float = 0.0
         self._serial_task_ids = set(
             _split_env_csv(os.getenv("WORKER_SERIAL_TASK_IDS", "892,1133"))
         )
@@ -1635,6 +1743,7 @@ class WorkerPool:
             active_task_ids: set[str] = set()
             phase_counts: dict[str, int] = {}
             stale_runs: list[dict[str, Any]] = []
+            reset_ages = []
             total_runs = 0
             in_flight_runs = 0
             closing_requested_runs = 0
@@ -1676,6 +1785,8 @@ class WorkerPool:
                         if rslot.reset_started_ts is not None
                         else 0.0
                     )
+                    if rslot.phase == "resetting":
+                        reset_ages.append(reset_age_sec)
                     close_age_sec = (
                         now - rslot.close_requested_ts
                         if rslot.close_requested_ts is not None
@@ -1737,6 +1848,10 @@ class WorkerPool:
                 "close_task_timeout": self.close_task_timeout,
                 "pending_close_age_sec": pending_close_age_sec,
                 "pending_force_cleanup_age_sec": pending_force_cleanup_age_sec,
+                "resetting_age_sec": {
+                    "min": round(min(reset_ages), 1) if reset_ages else 0.0,
+                    "max": round(max(reset_ages), 1) if reset_ages else 0.0,
+                },
                 "phase_counts": phase_counts,
                 "stale_runs": stale_runs,
                 "active_container_ids": sorted(active_container_ids),
@@ -2113,6 +2228,8 @@ class WorkerPool:
         if os.getenv("WORKER_ORPHAN_DOCKER_SWEEP", "1") != "1":
             return
         now = time.time()
+        if now < self._orphan_sweep_backoff_until:
+            return
         interval = max(1.0, _env_float("WORKER_ORPHAN_DOCKER_SWEEP_INTERVAL", 60.0))
         if now - self._last_orphan_sweep_ts < interval:
             return
@@ -2141,6 +2258,11 @@ class WorkerPool:
                 ),
                 timeout=timeout,
             )
+            if removed < 0:
+                self._record_orphan_sweep_failure("docker_ps_failed")
+                return
+            self._orphan_sweep_fail_streak = 0
+            self._orphan_sweep_backoff_until = 0.0
             if removed:
                 logger.warning(
                     "Periodic orphan Docker sweep removed %d stale container(s) "
@@ -2160,8 +2282,23 @@ class WorkerPool:
                 len(active_project_names),
                 len(active_task_ids),
             )
+            self._record_orphan_sweep_failure(f"timeout_after_{timeout:.1f}s")
         except Exception:
+            self._record_orphan_sweep_failure("exception")
             logger.exception("Periodic orphan Docker sweep failed")
+
+    def _record_orphan_sweep_failure(self, reason: str) -> None:
+        self._orphan_sweep_fail_streak += 1
+        base = max(1.0, _env_float("WORKER_ORPHAN_DOCKER_SWEEP_BACKOFF_BASE", 120.0))
+        max_delay = max(base, _env_float("WORKER_ORPHAN_DOCKER_SWEEP_BACKOFF_MAX", 900.0))
+        delay = min(max_delay, base * (2 ** min(self._orphan_sweep_fail_streak - 1, 6)))
+        self._orphan_sweep_backoff_until = time.time() + delay
+        logger.warning(
+            "Periodic orphan Docker sweep failed (%s); backoff %.1fs streak=%d",
+            reason,
+            delay,
+            self._orphan_sweep_fail_streak,
+        )
 
     async def _maybe_cleanup_shims(self) -> None:
         """P0 fix: Proactively clean Docker shims to prevent resource exhaustion."""
@@ -2343,11 +2480,14 @@ POOL: WorkerPool | None = None
 async def healthz() -> JSONResponse:
     try:
         pending_closes = 0
+        pool_status: dict[str, Any] | None = None
         if POOL is not None:
             pool_status = await POOL.status()
             pending_closes = int(pool_status.get("pending_closes", 0))
         assert_worker_has_capacity_for_docker(
-            phase="health", pending_closes=pending_closes
+            phase="health",
+            pending_closes=pending_closes,
+            pool_status=pool_status if POOL is not None else None,
         )
         return JSONResponse({"ok": True})
     except ResourcePressureError as exc:
@@ -2379,6 +2519,7 @@ async def status() -> JSONResponse:
         assert_worker_has_capacity_for_docker(
             phase="health",
             pending_closes=int(pool_status.get("pending_closes", 0)),
+            pool_status=pool_status,
         )
     except ResourcePressureError as exc:
         disk_ok = False
@@ -2416,6 +2557,7 @@ async def readyz() -> JSONResponse:
         assert_worker_has_capacity_for_docker(
             phase="health",
             pending_closes=int(pool_status.get("pending_closes", 0)),
+            pool_status=pool_status,
         )
     except ResourcePressureError as exc:
         return JSONResponse(
@@ -2560,6 +2702,7 @@ async def probe_rollout(request: Request) -> JSONResponse:
         assert_worker_has_capacity_for_docker(
             phase="allocate",
             pending_closes=int(pool_status.get("pending_closes", 0)),
+            pool_status=pool_status,
         )
         allocated = await POOL.allocate(task_key=task_key, request_id=request_id)
         lease_id = str(allocated["lease_id"])
@@ -2600,6 +2743,44 @@ async def probe_rollout(request: Request) -> JSONResponse:
                 "duration_sec": round(time.time() - started_ts, 3),
             },
             status_code=503,
+        )
+    except TaskImageBlacklistedError as exc:
+        logger.warning(
+            "Rollout probe blocked by task image blacklist lease_id=%s task_key=%s: %s",
+            lease_id,
+            task_key,
+            exc,
+        )
+        return JSONResponse(
+            {
+                "ok": False,
+                "code": "TASK_IMAGE_BLACKLISTED",
+                "error": str(exc),
+                "task_name": task_meta.get("task_name"),
+                "task_path": task_meta.get("task_path"),
+                "duration_sec": round(time.time() - started_ts, 3),
+            },
+            status_code=503,
+            headers={"Retry-After": os.getenv("WORKER_TASK_IMAGE_RETRY_AFTER", "300")},
+        )
+    except DockerImageBuildError as exc:
+        logger.warning(
+            "Rollout probe failed on Docker image build lease_id=%s task_key=%s: %s",
+            lease_id,
+            task_key,
+            exc,
+        )
+        return JSONResponse(
+            {
+                "ok": False,
+                "code": "TASK_IMAGE_BUILD_FAILED",
+                "error": str(exc),
+                "task_name": task_meta.get("task_name"),
+                "task_path": task_meta.get("task_path"),
+                "duration_sec": round(time.time() - started_ts, 3),
+            },
+            status_code=503,
+            headers={"Retry-After": os.getenv("WORKER_TASK_IMAGE_RETRY_AFTER", "300")},
         )
     except Exception as exc:
         logger.exception(
@@ -2828,6 +3009,7 @@ async def allocate(request: Request) -> JSONResponse:
         assert_worker_has_capacity_for_docker(
             phase="allocate",
             pending_closes=int(pool_status.get("pending_closes", 0)),
+            pool_status=pool_status,
         )
         return await POOL.allocate(task_key=str(task_key), request_id=request_id)
 
@@ -2958,6 +3140,7 @@ async def reset(request: Request) -> JSONResponse:
         assert_worker_has_capacity_for_docker(
             phase="reset",
             pending_closes=int(pool_status.get("pending_closes", 0)),
+            pool_status=pool_status,
         )
         out = await POOL.reset(
             run_lease_id=str(lease_id),
@@ -2976,6 +3159,41 @@ async def reset(request: Request) -> JSONResponse:
                 "details": exc.details,
             },
             status_code=503,
+            headers={"Retry-After": os.getenv("WORKER_PRESSURE_RETRY_AFTER", "10")},
+        )
+    except TaskImageBlacklistedError as exc:
+        logger.warning("Reset blocked by task image blacklist lease_id=%s: %s", lease_id, exc)
+        try:
+            await POOL.close_run(str(lease_id), reason="task_image_blacklisted")
+        except Exception:
+            logger.exception("Failed to schedule cleanup after image blacklist for %s", lease_id)
+        return JSONResponse(
+            {
+                "ok": False,
+                "error": str(exc),
+                "code": "TASK_IMAGE_BLACKLISTED",
+                "task_name": task_meta.get("task_name"),
+                "task_path": task_meta.get("task_path"),
+            },
+            status_code=503,
+            headers={"Retry-After": os.getenv("WORKER_TASK_IMAGE_RETRY_AFTER", "300")},
+        )
+    except DockerImageBuildError as exc:
+        logger.warning("Reset failed on Docker image build lease_id=%s: %s", lease_id, exc)
+        try:
+            await POOL.close_run(str(lease_id), reason="task_image_build_failed")
+        except Exception:
+            logger.exception("Failed to schedule cleanup after image build failure for %s", lease_id)
+        return JSONResponse(
+            {
+                "ok": False,
+                "error": str(exc),
+                "code": "TASK_IMAGE_BUILD_FAILED",
+                "task_name": task_meta.get("task_name"),
+                "task_path": task_meta.get("task_path"),
+            },
+            status_code=503,
+            headers={"Retry-After": os.getenv("WORKER_TASK_IMAGE_RETRY_AFTER", "300")},
         )
     except ResetInProgressError as exc:
         return JSONResponse(
