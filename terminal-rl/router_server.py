@@ -459,7 +459,8 @@ async def allocate(request: Request) -> JSONResponse:
 
                 if _retryable_allocate_failure(result, code):
                     retry_code = str(result.get("code", "") or f"HTTP_{code}")
-                    ROUTER.mark_worker_unhealthy(worker_idx, retry_code)
+                    if retry_code != "RUN_SLOTS_EXHAUSTED":
+                        ROUTER.mark_worker_unhealthy(worker_idx, retry_code)
                     logger.warning(
                         "Worker pressure for /allocate task_key=%s worker_idx=%d url=%s status=%s code=%s; trying next worker",
                         task_key,

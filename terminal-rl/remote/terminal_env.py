@@ -31,6 +31,8 @@ logger = logging.getLogger("terminal.env.worker.terminal_env")
 logger.setLevel(logging.INFO)
 
 _TASK_CONTAINER_RE = re.compile(r"^[0-9]+-[A-Za-z0-9]{8}-slime-run$")
+_TASK_ID_PREFIX_RE = re.compile(r"^([0-9]+)(?:[-_.:]|$)")
+_FIXED_TASK_SERVICE_RE = re.compile(r"^tb__([0-9]+)__.*")
 _DOCKER_CLEANUP_EXECUTOR: ThreadPoolExecutor | None = None
 
 
@@ -120,6 +122,44 @@ def _docker_image_prefixes(*values: str | None) -> set[str]:
     return {prefix for prefix in prefixes if prefix.startswith("tb__")}
 
 
+def _task_id_from_ref(value: str | None) -> str | None:
+    raw = (value or "").strip()
+    if not raw:
+        return None
+    fixed = _FIXED_TASK_SERVICE_RE.match(raw)
+    if fixed:
+        return fixed.group(1)
+    prefixed = _TASK_ID_PREFIX_RE.match(raw)
+    if prefixed:
+        return prefixed.group(1)
+    return None
+
+
+def _fixed_task_service_id(name: str, image: str = "") -> str | None:
+    for value in (name, image):
+        match = _FIXED_TASK_SERVICE_RE.match(value or "")
+        if match:
+            return match.group(1)
+    return None
+
+
+def _compose_project_candidates(
+    trial_name: str | None, client_container_name: str | None
+) -> list[str]:
+    candidates: list[str] = []
+    seen: set[str] = set()
+    for value in (client_container_name, trial_name):
+        variants = sorted(_docker_name_variants(value))
+        raw = (value or "").strip()
+        if raw:
+            variants.insert(0, raw)
+        for variant in variants:
+            if variant and variant not in seen:
+                candidates.append(variant)
+                seen.add(variant)
+    return candidates[:6]
+
+
 def _docker_status_age_seconds(status: str) -> float | None:
     text = (status or "").strip().lower()
     if not text:
@@ -158,11 +198,309 @@ def _is_task_container(name: str, image: str) -> bool:
     return bool((name or "").endswith("-slime-run") and (image or "").startswith("tb__"))
 
 
+def _clean_docker_label(value: str | None) -> str:
+    raw = (value or "").strip()
+    return "" if raw == "<no value>" else raw
+
+
+def _docker_compose_down_projects(
+    *,
+    docker_compose_path: str | None,
+    trial_name: str,
+    client_container_name: str | None,
+    reason: str,
+    command_timeout: float,
+) -> None:
+    if not _env_bool("TERMINAL_ENV_COMPOSE_DOWN_CLEANUP", True):
+        return
+    if not docker_compose_path:
+        return
+    compose_path = Path(docker_compose_path)
+    if not compose_path.exists():
+        logger.warning(
+            "Skipping docker compose down for TerminalEnv %s (%s): compose file missing: %s",
+            trial_name,
+            reason,
+            compose_path,
+        )
+        return
+
+    service_timeout = str(max(1, _env_int("TERMINAL_ENV_COMPOSE_DOWN_SERVICE_TIMEOUT", 5)))
+    for project in _compose_project_candidates(trial_name, client_container_name):
+        cmd = [
+            "docker",
+            "compose",
+            "-p",
+            project,
+            "-f",
+            str(compose_path),
+            "down",
+            "--remove-orphans",
+            "-v",
+            "--timeout",
+            service_timeout,
+        ]
+        try:
+            completed = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                timeout=command_timeout,
+            )
+            logger.warning(
+                "Docker compose down finished for TerminalEnv %s project=%s "
+                "reason=%s rc=%s stdout=%s stderr=%s",
+                trial_name,
+                project,
+                reason,
+                completed.returncode,
+                completed.stdout.strip()[:300],
+                completed.stderr.strip()[:300],
+            )
+        except Exception as exc:
+            logger.warning(
+                "Docker compose down failed for TerminalEnv %s project=%s reason=%s: %s",
+                trial_name,
+                project,
+                reason,
+                exc,
+            )
+
+
+def _remove_fixed_task_services_without_running_clients(
+    *,
+    task_ids: set[str],
+    reason: str,
+    timeout: float,
+    max_remove: int = 64,
+) -> int:
+    if not task_ids:
+        return 0
+
+    try:
+        listed = subprocess.run(
+            [
+                "docker",
+                "ps",
+                "-a",
+                "--format",
+                "{{.ID}}\t{{.Names}}\t{{.Image}}\t{{.Status}}",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+        )
+    except Exception as exc:
+        logger.warning(
+            "Could not list Docker containers for fixed task service cleanup (%s): %s",
+            reason,
+            exc,
+        )
+        return 0
+
+    running_client_task_ids: set[str] = set()
+    rows: list[tuple[str, str, str, str]] = []
+    for line in listed.stdout.splitlines():
+        parts = line.split("\t")
+        if len(parts) < 2:
+            continue
+        container_id, name = parts[0], parts[1]
+        image = parts[2] if len(parts) > 2 else ""
+        status = parts[3] if len(parts) > 3 else ""
+        rows.append((container_id, name, image, status))
+        if status.lower().startswith("up") and _is_task_container(name, image):
+            task_id = _task_id_from_ref(name)
+            if task_id:
+                running_client_task_ids.add(task_id)
+
+    blocked = task_ids.intersection(running_client_task_ids)
+    removable_task_ids = task_ids.difference(blocked)
+    if blocked:
+        logger.warning(
+            "Skipping fixed task service cleanup for active task id(s) %s reason=%s",
+            ",".join(sorted(blocked)),
+            reason,
+        )
+    if not removable_task_ids:
+        return 0
+
+    candidates: list[tuple[str, str, str, str, str]] = []
+    for container_id, name, image, status in rows:
+        task_id = _fixed_task_service_id(name, image)
+        if task_id and task_id in removable_task_ids:
+            candidates.append((container_id, name, image, status, task_id))
+            if max_remove > 0 and len(candidates) >= max_remove:
+                break
+
+    if not candidates:
+        return 0
+
+    logger.warning(
+        "Removing %d fixed task service container(s) without running clients "
+        "reason=%s task_ids=%s samples=%s",
+        len(candidates),
+        reason,
+        ",".join(sorted(removable_task_ids)),
+        "; ".join(
+            f"{cid[:12]} name={name} image={image} status={status}"
+            for cid, name, image, status, _task_id in candidates[:8]
+        ),
+    )
+
+    removed_count = 0
+    for start in range(0, len(candidates), 20):
+        chunk = candidates[start : start + 20]
+        ids = [item[0] for item in chunk]
+        try:
+            removed = subprocess.run(
+                ["docker", "rm", "-f", *ids],
+                capture_output=True,
+                text=True,
+                timeout=timeout,
+            )
+            if removed.returncode == 0:
+                removed_count += len(ids)
+            logger.warning(
+                "Fixed task service docker rm finished ids=%s rc=%s stdout=%s stderr=%s",
+                ",".join(cid[:12] for cid in ids),
+                removed.returncode,
+                removed.stdout.strip()[:300],
+                removed.stderr.strip()[:300],
+            )
+        except Exception as exc:
+            logger.warning(
+                "Fixed task service docker rm failed ids=%s: %s",
+                ",".join(cid[:12] for cid in ids),
+                exc,
+            )
+    return removed_count
+
+
+def _remove_inactive_compose_resources(
+    *,
+    resource_kind: str,
+    active_project_names: set[str],
+    active_task_ids: set[str],
+    reason: str,
+    timeout: float,
+    max_remove: int,
+) -> int:
+    if resource_kind == "network":
+        list_cmd = [
+            "docker",
+            "network",
+            "ls",
+            "--format",
+            "{{.ID}}\t{{.Name}}\t{{.Label \"com.docker.compose.project\"}}",
+        ]
+        rm_cmd_prefix = ["docker", "network", "rm"]
+        use_id = True
+    elif resource_kind == "volume":
+        list_cmd = [
+            "docker",
+            "volume",
+            "ls",
+            "--format",
+            "{{.Name}}\t{{.Label \"com.docker.compose.project\"}}",
+        ]
+        rm_cmd_prefix = ["docker", "volume", "rm"]
+        use_id = False
+    else:
+        return 0
+
+    try:
+        listed = subprocess.run(
+            list_cmd,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+        )
+    except Exception as exc:
+        logger.warning("Could not list Docker %ss for orphan cleanup (%s): %s", resource_kind, reason, exc)
+        return 0
+
+    candidates: list[tuple[str, str, str]] = []
+    for line in listed.stdout.splitlines():
+        parts = line.split("\t")
+        if resource_kind == "network":
+            if len(parts) < 2:
+                continue
+            resource_id, name = parts[0], parts[1]
+            compose_project = _clean_docker_label(parts[2] if len(parts) > 2 else "")
+            ref = resource_id if use_id else name
+        else:
+            if not parts:
+                continue
+            name = parts[0]
+            compose_project = _clean_docker_label(parts[1] if len(parts) > 1 else "")
+            ref = name
+        if compose_project and _matches_project_name(
+            compose_project, active_project_names, broad=True
+        ):
+            continue
+        task_id = _task_id_from_ref(compose_project) or _task_id_from_ref(name)
+        looks_like_task_resource = (
+            "slime-run" in name
+            or "slime-run" in compose_project
+            or (task_id is not None and task_id not in active_task_ids)
+        )
+        if not looks_like_task_resource:
+            continue
+        if task_id is not None and task_id in active_task_ids:
+            continue
+        if not compose_project and "slime-run" not in name:
+            continue
+        candidates.append((ref, name, compose_project))
+        if max_remove > 0 and len(candidates) >= max_remove:
+            break
+
+    if not candidates:
+        return 0
+
+    removed_count = 0
+    logger.warning(
+        "Orphan Docker sweep removing %d stale compose %s(s) reason=%s samples=%s",
+        len(candidates),
+        resource_kind,
+        reason,
+        "; ".join(
+            f"name={name} project={project}" for _ref, name, project in candidates[:8]
+        ),
+    )
+    for ref, name, _project in candidates:
+        try:
+            removed = subprocess.run(
+                [*rm_cmd_prefix, ref],
+                capture_output=True,
+                text=True,
+                timeout=timeout,
+            )
+            if removed.returncode == 0:
+                removed_count += 1
+            logger.warning(
+                "Orphan Docker sweep %s rm finished name=%s rc=%s stdout=%s stderr=%s",
+                resource_kind,
+                name,
+                removed.returncode,
+                removed.stdout.strip()[:300],
+                removed.stderr.strip()[:300],
+            )
+        except Exception as exc:
+            logger.warning(
+                "Orphan Docker sweep %s rm failed name=%s: %s",
+                resource_kind,
+                name,
+                exc,
+            )
+    return removed_count
+
+
 def _force_remove_docker_objects(
     *,
     trial_name: str,
     client_container_name: str | None,
     docker_image_name_prefix: str | None = None,
+    docker_compose_path: str | None = None,
     reason: str,
 ) -> None:
     if not _env_bool("TERMINAL_ENV_FORCE_DOCKER_CLEANUP", True):
@@ -177,6 +515,19 @@ def _force_remove_docker_objects(
         trial_name,
         client_container_name,
     )
+    task_ids = {
+        task_id
+        for task_id in (
+            _task_id_from_ref(docker_image_name_prefix),
+            _task_id_from_ref(trial_name),
+            _task_id_from_ref(client_container_name),
+        )
+        if task_id
+    }
+    for prefix in image_prefixes:
+        task_id = _task_id_from_ref(prefix)
+        if task_id:
+            task_ids.add(task_id)
     if not project_names and not image_prefixes:
         return
 
@@ -188,6 +539,14 @@ def _force_remove_docker_objects(
             text=True,
             timeout=timeout,
         )
+
+    _docker_compose_down_projects(
+        docker_compose_path=docker_compose_path,
+        trial_name=trial_name,
+        client_container_name=client_container_name,
+        reason=reason,
+        command_timeout=timeout,
+    )
 
     direct_removed = False
     direct_name = (client_container_name or "").strip()
@@ -338,6 +697,22 @@ def _force_remove_docker_objects(
         except Exception:
             pass
 
+    removed_fixed = _remove_fixed_task_services_without_running_clients(
+        task_ids=task_ids,
+        reason=f"force_cleanup:{reason}",
+        timeout=timeout,
+        max_remove=_env_int("TERMINAL_ENV_FIXED_SERVICE_CLEANUP_MAX_REMOVE", 64),
+    )
+    if removed_fixed:
+        logger.warning(
+            "Force cleanup removed %d fixed task service container(s) for TerminalEnv %s "
+            "(%s) task_ids=%s",
+            removed_fixed,
+            trial_name,
+            reason,
+            ",".join(sorted(task_ids)),
+        )
+
 
 def _attach_detached_cleanup_logger(
     fut: asyncio.Future[Any], *, trial_name: str, reason: str
@@ -372,6 +747,7 @@ async def _force_remove_docker_objects_async(
     trial_name: str,
     client_container_name: str | None,
     docker_image_name_prefix: str | None = None,
+    docker_compose_path: str | None = None,
     reason: str,
 ) -> None:
     loop = asyncio.get_running_loop()
@@ -382,6 +758,7 @@ async def _force_remove_docker_objects_async(
             trial_name=trial_name,
             client_container_name=client_container_name,
             docker_image_name_prefix=docker_image_name_prefix,
+            docker_compose_path=docker_compose_path,
             reason=reason,
         ),
     )
@@ -401,6 +778,8 @@ async def _force_remove_docker_objects_async(
 def force_remove_orphan_docker_objects(
     *,
     active_container_names: set[str],
+    active_project_names: set[str] | None = None,
+    active_task_ids: set[str] | None = None,
     reason: str,
     min_age_sec: float,
     max_remove: int,
@@ -416,7 +795,7 @@ def force_remove_orphan_docker_objects(
                 "ps",
                 "-a",
                 "--format",
-                "{{.ID}}\t{{.Names}}\t{{.Image}}\t{{.Status}}",
+                "{{.ID}}\t{{.Names}}\t{{.Image}}\t{{.Status}}\t{{.Label \"com.docker.compose.project\"}}",
             ],
             capture_output=True,
             text=True,
@@ -427,7 +806,15 @@ def force_remove_orphan_docker_objects(
         return 0
 
     active = {name for name in active_container_names if name}
-    candidates: list[tuple[str, str, str, str, float]] = []
+    active_projects = {name for name in (active_project_names or set()) if name}
+    active_tasks = {task_id for task_id in (active_task_ids or set()) if task_id}
+    for name in active:
+        task_id = _task_id_from_ref(name)
+        if task_id:
+            active_tasks.add(task_id)
+
+    running_client_task_ids: set[str] = set()
+    rows: list[tuple[str, str, str, str, str]] = []
     for line in listed.stdout.splitlines():
         parts = line.split("\t")
         if len(parts) < 2:
@@ -435,56 +822,108 @@ def force_remove_orphan_docker_objects(
         container_id, name = parts[0], parts[1]
         image = parts[2] if len(parts) > 2 else ""
         status = parts[3] if len(parts) > 3 else ""
-        if name in active or not _is_task_container(name, image):
+        compose_project = _clean_docker_label(parts[4] if len(parts) > 4 else "")
+        rows.append((container_id, name, image, status, compose_project))
+        if status.lower().startswith("up") and _is_task_container(name, image):
+            task_id = _task_id_from_ref(name)
+            if task_id:
+                running_client_task_ids.add(task_id)
+
+    candidates: list[tuple[str, str, str, str, float, str]] = []
+    for container_id, name, image, status, compose_project in rows:
+        if name in active:
+            continue
+        if compose_project and _matches_project_name(
+            compose_project, active_projects, broad=True
+        ):
+            continue
+
+        fixed_task_id = _fixed_task_service_id(name, image)
+        fixed_service_orphan = bool(
+            fixed_task_id
+            and fixed_task_id not in active_tasks
+            and fixed_task_id not in running_client_task_ids
+        )
+        inactive_project_container = bool(
+            compose_project
+            and "slime-run" in compose_project
+            and not _matches_project_name(compose_project, active_projects, broad=True)
+            and ((image or "").startswith("tb__") or _task_id_from_ref(compose_project))
+        )
+        stale_client = _is_task_container(name, image)
+        if not (stale_client or fixed_service_orphan or inactive_project_container):
             continue
         age_sec = _docker_status_age_seconds(status)
         if age_sec is None or age_sec < min_age_sec:
             continue
-        candidates.append((container_id, name, image, status, age_sec))
+        if fixed_service_orphan:
+            match_reason = f"fixed_service_task={fixed_task_id}"
+        elif inactive_project_container:
+            match_reason = f"inactive_project={compose_project}"
+        else:
+            match_reason = "stale_client"
+        candidates.append((container_id, name, image, status, age_sec, match_reason))
         if max_remove > 0 and len(candidates) >= max_remove:
             break
 
-    if not candidates:
-        return 0
-
-    logger.warning(
-        "Orphan Docker sweep removing %d stale task container(s) reason=%s "
-        "min_age=%.1fs active=%d samples=%s",
-        len(candidates),
-        reason,
-        min_age_sec,
-        len(active),
-        "; ".join(
-            f"{cid[:12]} name={name} image={image} status={status}"
-            for cid, name, image, status, _age in candidates[:8]
-        ),
-    )
-
     removed_count = 0
-    for start in range(0, len(candidates), 20):
-        chunk = candidates[start : start + 20]
-        ids = [item[0] for item in chunk]
-        try:
-            removed = subprocess.run(
-                ["docker", "rm", "-f", *ids],
-                capture_output=True,
-                text=True,
+    if candidates:
+        logger.warning(
+            "Orphan Docker sweep removing %d stale task container(s) reason=%s "
+            "min_age=%.1fs active=%d samples=%s",
+            len(candidates),
+            reason,
+            min_age_sec,
+            len(active),
+            "; ".join(
+                f"{cid[:12]} name={name} image={image} status={status} reason={why}"
+                for cid, name, image, status, _age, why in candidates[:8]
+            ),
+        )
+
+        for start in range(0, len(candidates), 20):
+            chunk = candidates[start : start + 20]
+            ids = [item[0] for item in chunk]
+            try:
+                removed = subprocess.run(
+                    ["docker", "rm", "-f", *ids],
+                    capture_output=True,
+                    text=True,
+                    timeout=timeout,
+                )
+                if removed.returncode == 0:
+                    removed_count += len(ids)
+                logger.warning(
+                    "Orphan Docker sweep rm finished ids=%s rc=%s stdout=%s stderr=%s",
+                    ",".join(cid[:12] for cid in ids),
+                    removed.returncode,
+                    removed.stdout.strip()[:300],
+                    removed.stderr.strip()[:300],
+                )
+            except Exception as exc:
+                logger.warning(
+                    "Orphan Docker sweep rm failed ids=%s: %s",
+                    ",".join(cid[:12] for cid in ids),
+                    exc,
+                )
+    if _env_bool("WORKER_ORPHAN_DOCKER_SWEEP_RESOURCES", True):
+        resource_max_remove = max(0, _env_int("WORKER_ORPHAN_DOCKER_SWEEP_RESOURCE_MAX_REMOVE", 128))
+        if resource_max_remove:
+            _remove_inactive_compose_resources(
+                resource_kind="network",
+                active_project_names=active_projects,
+                active_task_ids=active_tasks,
+                reason=reason,
                 timeout=timeout,
+                max_remove=resource_max_remove,
             )
-            if removed.returncode == 0:
-                removed_count += len(ids)
-            logger.warning(
-                "Orphan Docker sweep rm finished ids=%s rc=%s stdout=%s stderr=%s",
-                ",".join(cid[:12] for cid in ids),
-                removed.returncode,
-                removed.stdout.strip()[:300],
-                removed.stderr.strip()[:300],
-            )
-        except Exception as exc:
-            logger.warning(
-                "Orphan Docker sweep rm failed ids=%s: %s",
-                ",".join(cid[:12] for cid in ids),
-                exc,
+            _remove_inactive_compose_resources(
+                resource_kind="volume",
+                active_project_names=active_projects,
+                active_task_ids=active_tasks,
+                reason=reason,
+                timeout=timeout,
+                max_remove=resource_max_remove,
             )
     return removed_count
 
@@ -575,6 +1014,7 @@ class TerminalEnv:
         self._last_trial_name: str | None = None
         self._last_client_container_name: str | None = None
         self._last_docker_image_name_prefix: str | None = None
+        self._last_docker_compose_path: str | None = None
 
     async def reset(
         self,
@@ -682,6 +1122,9 @@ class TerminalEnv:
             self._last_docker_image_name_prefix = (
                 self._trial_handler.docker_image_name_prefix
             )
+            self._last_docker_compose_path = str(
+                self._trial_handler.task_paths.docker_compose_path
+            )
             task_config = self._trial_handler.task
             self._parser = ParserFactory.get_parser(task_config.parser_name)
             client_image_name = (
@@ -743,6 +1186,15 @@ class TerminalEnv:
                     image_prep.mode,
                     time.monotonic() - docker_start_started,
                     time.monotonic() - reset_started,
+                )
+                _force_remove_docker_objects(
+                    trial_name=self._trial_handler.trial_name,
+                    client_container_name=self._trial_handler.client_container_name,
+                    docker_image_name_prefix=self._trial_handler.docker_image_name_prefix,
+                    docker_compose_path=str(
+                        self._trial_handler.task_paths.docker_compose_path
+                    ),
+                    reason="reset_start_failed",
                 )
                 raise
             logger.info(
@@ -972,6 +1424,11 @@ class TerminalEnv:
             if self._trial_handler is not None
             else self._last_docker_image_name_prefix
         )
+        docker_compose_path = (
+            str(self._trial_handler.task_paths.docker_compose_path)
+            if self._trial_handler is not None
+            else self._last_docker_compose_path
+        )
         if self._closed:
             logger.warning("TerminalEnv %s already closed", trial_name)
             return
@@ -1007,6 +1464,7 @@ class TerminalEnv:
                 trial_name=trial_name,
                 client_container_name=client_container_name,
                 docker_image_name_prefix=docker_image_name_prefix,
+                docker_compose_path=docker_compose_path,
                 reason=reason,
             )
 
@@ -1079,12 +1537,19 @@ class TerminalEnv:
                     logger.exception("Failed to stop terminal session during close")
         finally:
             force_always = _env_bool("TERMINAL_ENV_FORCE_DOCKER_CLEANUP_ALWAYS", False)
+            compose_down_on_close = _env_bool("TERMINAL_ENV_COMPOSE_DOWN_ON_CLOSE", True)
             force_needed = (
-                force_always or fast_close or cleanup_error or not cleanup_completed
+                compose_down_on_close
+                or force_always
+                or fast_close
+                or cleanup_error
+                or not cleanup_completed
             )
             if terminal is not None and force_needed and not force_cleanup_started:
                 if fast_close:
                     reason = "fast_close"
+                elif compose_down_on_close and cleanup_completed and not cleanup_error:
+                    reason = "close_compose_down"
                 elif force_always and cleanup_completed and not cleanup_error:
                     reason = "always"
                 else:
@@ -1101,5 +1566,6 @@ class TerminalEnv:
             trial_name=self._last_trial_name or "unknown",
             client_container_name=self._last_client_container_name,
             docker_image_name_prefix=self._last_docker_image_name_prefix,
+            docker_compose_path=self._last_docker_compose_path,
             reason=reason,
         )

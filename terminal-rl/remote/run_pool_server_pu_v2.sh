@@ -17,6 +17,7 @@
 # Key env vars:
 #   WORKER_MAX_TASKS            (default 16)   — pool_server --max-tasks
 #   WORKER_MAX_RUNS_PER_TASK    (default 8)    — pool_server --max-runs-per-task
+#   WORKER_SERIAL_TASK_IDS      (default 892,1133) — per-task serialization
 #   WORKER_MAX_CONCURRENT_CLOSES (default 16)  — pool_server --max-concurrent-closes
 #   ENV_SERVER_PORT             (default 18081)
 #   SKIP_PREFLIGHT_CLEANUP      (default 0)    — set 1 to skip orphan cleanup
@@ -46,11 +47,14 @@ REPO_ROOT="$(cd -- "${SCRIPT_DIR}/../.." &>/dev/null && pwd)"
 log() { echo "[$(date +'%F %T')] $*"; }
 
 # ── Configuration ─────────────────────────────────────────────────────────────
-# 坑1: capacity must cover rollout-batch-size × n-samples-per-prompt
-# Default 8B run: batch=16 × n=8 = 128 demand. Keep worker-side
-# Docker concurrency close to demand; raise explicitly after pids headroom is proven.
+# 坑1: capacity must balance rollout demand and Docker isolation limits.
+# Most tasks can run in parallel; known compose-unsafe tasks are serialized
+# through WORKER_SERIAL_TASK_IDS or explicit WORKER_TASK_MAX_RUNS_OVERRIDES.
 WORKER_MAX_TASKS="${WORKER_MAX_TASKS:-16}"
 WORKER_MAX_RUNS_PER_TASK="${WORKER_MAX_RUNS_PER_TASK:-8}"
+WORKER_SERIAL_TASK_IDS="${WORKER_SERIAL_TASK_IDS:-892,1133}"
+WORKER_TASK_MAX_RUNS_OVERRIDES="${WORKER_TASK_MAX_RUNS_OVERRIDES:-}"
+WORKER_AUTO_SERIALIZE_UNSAFE_COMPOSE="${WORKER_AUTO_SERIALIZE_UNSAFE_COMPOSE:-0}"
 # Close/build fan-out also consumes host PIDs under pressure.
 WORKER_MAX_CONCURRENT_CLOSES="${WORKER_MAX_CONCURRENT_CLOSES:-16}"
 ENV_SERVER_PORT="${ENV_SERVER_PORT:-18081}"
@@ -190,6 +194,7 @@ log "  log dir:   ${OPENCLAW_REMOTE_LOG_DIR}"
 log "  full log: ${CPU_POOL_LOG}"
 log "  err log:  ${CPU_ERR_LOG}"
 log "  max_tasks=${WORKER_MAX_TASKS}  max_runs_per_task=${WORKER_MAX_RUNS_PER_TASK}"
+log "  serial_task_ids=${WORKER_SERIAL_TASK_IDS} task_run_overrides=${WORKER_TASK_MAX_RUNS_OVERRIDES:-<none>} auto_serial_compose=${WORKER_AUTO_SERIALIZE_UNSAFE_COMPOSE}"
 log "  max_concurrent_closes=${WORKER_MAX_CONCURRENT_CLOSES}"
 log "  max_concurrent_builds=${WORKER_MAX_CONCURRENT_BUILDS}"
 log "  close_timeout queue=${WORKER_CLOSE_QUEUE_TIMEOUT}s session=${WORKER_CLOSE_SESSION_TIMEOUT}s legacy=${WORKER_CLOSE_TASK_TIMEOUT}s"
@@ -528,6 +533,9 @@ echo "========================================"
 echo "  Pool Server v2 Configuration"
 echo "  max_tasks:             ${WORKER_MAX_TASKS}"
 echo "  max_runs_per_task:     ${WORKER_MAX_RUNS_PER_TASK}"
+echo "  serial_task_ids:       ${WORKER_SERIAL_TASK_IDS}"
+echo "  task_run_overrides:    ${WORKER_TASK_MAX_RUNS_OVERRIDES:-<none>}"
+echo "  auto_serial_compose:   ${WORKER_AUTO_SERIALIZE_UNSAFE_COMPOSE}"
 echo "  total_capacity:        $((WORKER_MAX_TASKS * WORKER_MAX_RUNS_PER_TASK)) leases"
 echo "  max_concurrent_closes: ${WORKER_MAX_CONCURRENT_CLOSES}"
 echo "  max_concurrent_builds: ${WORKER_MAX_CONCURRENT_BUILDS}"
@@ -553,6 +561,9 @@ export WORKER_DISK_GUARD_ENABLED
 export WORKER_MIN_DOCKER_FREE_GB
 export WORKER_MAX_DOCKER_USED_PCT
 export WORKER_MAX_DOCKER_INODE_PCT
+export WORKER_SERIAL_TASK_IDS
+export WORKER_TASK_MAX_RUNS_OVERRIDES
+export WORKER_AUTO_SERIALIZE_UNSAFE_COMPOSE
 export WORKER_MAX_CONCURRENT_BUILDS
 export WORKER_PRESSURE_GUARD_ENABLED
 export WORKER_CLOSE_TASK_TIMEOUT

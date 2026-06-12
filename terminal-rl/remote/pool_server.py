@@ -4,6 +4,7 @@ import argparse
 import asyncio
 import logging
 import os
+import re
 import shutil
 import subprocess
 import time
@@ -19,7 +20,10 @@ from fastapi.responses import JSONResponse, Response
 
 from ..custom_types import RunContext, TaskSpec, TaskTimeouts
 from ..request_utils import json_payload
-from .terminal_env import TerminalEnv, force_remove_orphan_docker_objects
+from .terminal_env import (
+    TerminalEnv,
+    force_remove_orphan_docker_objects,
+)
 
 logger = logging.getLogger("terminal.env.worker")
 app = FastAPI()
@@ -146,6 +150,101 @@ def _env_int(name: str, default: int) -> int:
         logger.warning("Invalid %s=%r; using default %s", name, raw, default)
         return default
     return value
+
+
+def _env_bool(name: str, default: bool) -> bool:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() not in {"0", "false", "no", "off"}
+
+
+def _split_env_csv(raw: str | None) -> list[str]:
+    if raw is None:
+        return []
+    return [part.strip() for part in raw.split(",") if part.strip()]
+
+
+_TASK_ID_PREFIX_RE = re.compile(r"^([0-9]+)(?:[-_.:]|$)")
+_FIXED_TASK_SERVICE_RE = re.compile(r"^tb__([0-9]+)__.*")
+
+
+def _task_id_from_ref(value: str | None) -> str | None:
+    raw = (value or "").strip()
+    if not raw:
+        return None
+    fixed = _FIXED_TASK_SERVICE_RE.match(raw)
+    if fixed:
+        return fixed.group(1)
+    prefixed = _TASK_ID_PREFIX_RE.match(raw)
+    if prefixed:
+        return prefixed.group(1)
+    return None
+
+
+def _docker_name_variants(value: str | None) -> set[str]:
+    if not value:
+        return set()
+    raw = value.strip()
+    if not raw:
+        return set()
+    cleaned = re.sub(r"[^A-Za-z0-9_.-]+", "-", raw).strip("-_.")
+    variants = {
+        raw,
+        cleaned,
+        cleaned.replace(".", "-"),
+        cleaned.replace("_", "-"),
+        cleaned.replace(".", "_"),
+    }
+    return {v for v in variants if v and "slime-run" in v}
+
+
+def _task_key_tokens(task_key: str) -> set[str]:
+    raw = str(task_key or "").strip()
+    tokens = {raw} if raw else set()
+    if ":" in raw:
+        task_name, task_path = raw.split(":", 1)
+        if task_name:
+            tokens.add(task_name)
+        if task_path:
+            tokens.add(task_path)
+            tail = Path(task_path).name
+            if tail:
+                tokens.add(tail)
+    task_id = _task_id_from_ref(raw)
+    if task_id:
+        tokens.add(task_id)
+    return {token for token in tokens if token}
+
+
+def _parse_task_max_runs_overrides(raw: str | None) -> dict[str, int]:
+    overrides: dict[str, int] = {}
+    for item in _split_env_csv(raw):
+        if "=" not in item:
+            logger.warning(
+                "Ignoring malformed WORKER_TASK_MAX_RUNS_OVERRIDES entry %r; "
+                "expected task=limit",
+                item,
+            )
+            continue
+        key, value_raw = item.split("=", 1)
+        key = key.strip()
+        if not key:
+            continue
+        try:
+            value = int(value_raw.strip())
+        except ValueError:
+            logger.warning(
+                "Ignoring invalid WORKER_TASK_MAX_RUNS_OVERRIDES entry %r", item
+            )
+            continue
+        if value <= 0:
+            logger.warning(
+                "Ignoring non-positive WORKER_TASK_MAX_RUNS_OVERRIDES entry %r", item
+            )
+            continue
+        overrides[key] = value
+    return overrides
 
 
 def docker_data_root_stats() -> dict[str, Any]:
@@ -571,6 +670,16 @@ class WorkerPool:
         self._reset_count: int = 0
         self._last_shim_cleanup_ts: float = time.time()
         self._last_orphan_sweep_ts: float = 0.0
+        self._serial_task_ids = set(
+            _split_env_csv(os.getenv("WORKER_SERIAL_TASK_IDS", "892,1133"))
+        )
+        self._task_max_runs_overrides = _parse_task_max_runs_overrides(
+            os.getenv("WORKER_TASK_MAX_RUNS_OVERRIDES", "")
+        )
+        self._auto_serialize_unsafe_compose = _env_bool(
+            "WORKER_AUTO_SERIALIZE_UNSAFE_COMPOSE", False
+        )
+        self._unsafe_compose_cache: dict[str, bool] = {}
 
     def _new_env(self) -> TerminalEnv:
         return TerminalEnv()
@@ -615,6 +724,77 @@ class WorkerPool:
                 if isinstance(name, str) and name:
                     names.add(name)
         return names
+
+    def _task_uses_unsafe_compose(self, task_key: str) -> bool:
+        cached = self._unsafe_compose_cache.get(task_key)
+        if cached is not None:
+            return cached
+        unsafe = False
+        dataset_dir = os.getenv("DATASET_DIR", "").strip()
+        if dataset_dir and ":" in task_key:
+            _task_name, task_path = task_key.split(":", 1)
+            compose_path = Path(dataset_dir) / task_path / "docker-compose.yaml"
+            try:
+                text = compose_path.read_text(encoding="utf-8", errors="ignore")
+            except OSError:
+                text = ""
+            if text:
+                fixed_non_client_name = False
+                current_service = ""
+                for raw_line in text.splitlines():
+                    stripped = raw_line.strip()
+                    if not stripped or stripped.startswith("#"):
+                        continue
+                    indent = len(raw_line) - len(raw_line.lstrip(" "))
+                    if indent == 2 and stripped.endswith(":"):
+                        current_service = stripped[:-1]
+                    if stripped.startswith("container_name:") and current_service != "client":
+                        fixed_non_client_name = True
+                unsafe = fixed_non_client_name or "ipam:" in text or "subnet:" in text
+        self._unsafe_compose_cache[task_key] = unsafe
+        if unsafe:
+            logger.warning(
+                "Task %s detected as non-parallel-safe compose; "
+                "effective max_runs_per_task=1",
+                task_key,
+            )
+        return unsafe
+
+    def _effective_max_runs_per_task(self, task_key: str) -> int:
+        tokens = _task_key_tokens(task_key)
+        for token in tokens:
+            override = self._task_max_runs_overrides.get(token)
+            if override is not None:
+                return max(1, override)
+        if tokens.intersection(self._serial_task_ids):
+            return 1
+        if self._auto_serialize_unsafe_compose and self._task_uses_unsafe_compose(
+            task_key
+        ):
+            return 1
+        return max(1, self.max_runs_per_task)
+
+    def _active_docker_refs_locked(self) -> tuple[set[str], set[str], set[str]]:
+        container_names: set[str] = set()
+        project_names: set[str] = set()
+        task_ids: set[str] = set()
+        for task_key, task_slot in self._tasks.items():
+            task_id = _task_id_from_ref(task_key)
+            if task_id:
+                task_ids.add(task_id)
+            for run_slot in task_slot.runs.values():
+                info = self._run_slot_container_info(run_slot)
+                for key in ("name", "trial_name"):
+                    value = info.get(key)
+                    if not isinstance(value, str) or not value:
+                        continue
+                    if key == "name":
+                        container_names.add(value)
+                    project_names.update(_docker_name_variants(value))
+                    task_id = _task_id_from_ref(value)
+                    if task_id:
+                        task_ids.add(task_id)
+        return container_names, project_names, task_ids
 
     def _pop_run_slot_locked(
         self, run_lease_id: str
@@ -1096,10 +1276,11 @@ class WorkerPool:
                 task_slot = TaskSlot(task_key=task_key)
                 self._tasks[task_key] = task_slot
 
-            if len(task_slot.runs) >= self.max_runs_per_task:
+            effective_max_runs = self._effective_max_runs_per_task(task_key)
+            if len(task_slot.runs) >= effective_max_runs:
                 raise CapacityError(
                     "RUN_SLOTS_EXHAUSTED",
-                    f"Task {task_key} at run capacity: {len(task_slot.runs)}/{self.max_runs_per_task}",
+                    f"Task {task_key} at run capacity: {len(task_slot.runs)}/{effective_max_runs}",
                 )
 
             env = self._new_env()
@@ -1450,12 +1631,17 @@ class WorkerPool:
             active_container_ids: set[str] = set()
             active_container_names: set[str] = set()
             active_trial_names: set[str] = set()
+            active_project_names: set[str] = set()
+            active_task_ids: set[str] = set()
             phase_counts: dict[str, int] = {}
             stale_runs: list[dict[str, Any]] = []
             total_runs = 0
             in_flight_runs = 0
             closing_requested_runs = 0
             for tk, ts in self._tasks.items():
+                task_id = _task_id_from_ref(tk)
+                if task_id:
+                    active_task_ids.add(task_id)
                 run_details = {}
                 for rid, rslot in ts.runs.items():
                     phase_counts[rslot.phase] = phase_counts.get(rslot.phase, 0) + 1
@@ -1471,9 +1657,19 @@ class WorkerPool:
                     container_name = container_info.get("name")
                     if isinstance(container_name, str) and container_name:
                         active_container_names.add(container_name)
+                        active_project_names.update(
+                            _docker_name_variants(container_name)
+                        )
+                        task_id = _task_id_from_ref(container_name)
+                        if task_id:
+                            active_task_ids.add(task_id)
                     trial_name = container_info.get("trial_name")
                     if isinstance(trial_name, str) and trial_name:
                         active_trial_names.add(trial_name)
+                        active_project_names.update(_docker_name_variants(trial_name))
+                        task_id = _task_id_from_ref(trial_name)
+                        if task_id:
+                            active_task_ids.add(task_id)
                     created_age_sec = now - rslot.created_ts
                     reset_age_sec = (
                         now - rslot.reset_started_ts
@@ -1515,13 +1711,22 @@ class WorkerPool:
                         "evaluate_done": rslot.evaluate_completed_ts is not None,
                         "container": container_info,
                     }
-                tasks_info[tk] = {"active_runs": len(ts.runs), "runs": run_details}
+                tasks_info[tk] = {
+                    "active_runs": len(ts.runs),
+                    "max_runs": self._effective_max_runs_per_task(tk),
+                    "runs": run_details,
+                }
                 total_runs += len(ts.runs)
 
             return {
                 "max_tasks": self.max_tasks,
                 "active_tasks": len(self._tasks),
                 "max_runs_per_task": self.max_runs_per_task,
+                "serial_task_ids": sorted(self._serial_task_ids),
+                "task_max_runs_overrides": dict(
+                    sorted(self._task_max_runs_overrides.items())
+                ),
+                "auto_serialize_unsafe_compose": self._auto_serialize_unsafe_compose,
                 "total_active_runs": total_runs,
                 "in_flight_runs": in_flight_runs,
                 "closing_requested_runs": closing_requested_runs,
@@ -1537,6 +1742,8 @@ class WorkerPool:
                 "active_container_ids": sorted(active_container_ids),
                 "active_container_names": sorted(active_container_names),
                 "active_trial_names": sorted(active_trial_names),
+                "active_project_names": sorted(active_project_names),
+                "active_task_ids": sorted(active_task_ids),
                 "tasks": tasks_info,
             }
 
@@ -1912,7 +2119,11 @@ class WorkerPool:
         self._last_orphan_sweep_ts = now
 
         async with self._lock:
-            active_container_names = self._active_container_names_locked()
+            (
+                active_container_names,
+                active_project_names,
+                active_task_ids,
+            ) = self._active_docker_refs_locked()
 
         min_age_sec = max(0.0, _env_float("WORKER_ORPHAN_DOCKER_SWEEP_MIN_AGE", 600.0))
         max_remove = _env_int("WORKER_ORPHAN_DOCKER_SWEEP_MAX_REMOVE", 128)
@@ -1922,6 +2133,8 @@ class WorkerPool:
                 asyncio.to_thread(
                     force_remove_orphan_docker_objects,
                     active_container_names=active_container_names,
+                    active_project_names=active_project_names,
+                    active_task_ids=active_task_ids,
                     reason="periodic_reap",
                     min_age_sec=min_age_sec,
                     max_remove=max_remove,
@@ -1931,16 +2144,21 @@ class WorkerPool:
             if removed:
                 logger.warning(
                     "Periodic orphan Docker sweep removed %d stale container(s) "
-                    "active=%d min_age=%.1fs",
+                    "active_containers=%d active_projects=%d active_tasks=%d min_age=%.1fs",
                     removed,
                     len(active_container_names),
+                    len(active_project_names),
+                    len(active_task_ids),
                     min_age_sec,
                 )
         except asyncio.TimeoutError:
             logger.warning(
-                "Periodic orphan Docker sweep timed out after %.1fs active=%d",
+                "Periodic orphan Docker sweep timed out after %.1fs "
+                "active_containers=%d active_projects=%d active_tasks=%d",
                 timeout,
                 len(active_container_names),
+                len(active_project_names),
+                len(active_task_ids),
             )
         except Exception:
             logger.exception("Periodic orphan Docker sweep failed")

@@ -33,11 +33,13 @@ if [ -f "${REPO_ROOT}/.venv/bin/activate" ]; then
     source "${REPO_ROOT}/.venv/bin/activate"
 fi
 
-# Capacity. Keep default Docker concurrency near one 8B GRPO demand
-# (rollout-batch-size 16 x n-samples 8 = 128). Raise explicitly only after
-# pids headroom is proven on the worker.
+# Capacity. Keep the default high for most parallel-safe tasks, then serialize
+# known compose-unsafe task ids through WORKER_SERIAL_TASK_IDS.
 export WORKER_MAX_TASKS="${WORKER_MAX_TASKS:-16}"
 export WORKER_MAX_RUNS_PER_TASK="${WORKER_MAX_RUNS_PER_TASK:-8}"
+export WORKER_SERIAL_TASK_IDS="${WORKER_SERIAL_TASK_IDS:-892,1133}"
+export WORKER_TASK_MAX_RUNS_OVERRIDES="${WORKER_TASK_MAX_RUNS_OVERRIDES:-}"
+export WORKER_AUTO_SERIALIZE_UNSAFE_COMPOSE="${WORKER_AUTO_SERIALIZE_UNSAFE_COMPOSE:-0}"
 export WORKER_MAX_CONCURRENT_CLOSES="${WORKER_MAX_CONCURRENT_CLOSES:-16}"
 export WORKER_MAX_CONCURRENT_BUILDS="${WORKER_MAX_CONCURRENT_BUILDS:-2}"
 export WORKER_RUN_IDLE_TTL="${WORKER_RUN_IDLE_TTL:-180}"
@@ -132,6 +134,9 @@ echo "  server_log:           ${CPU_POOL_LOG}"
 echo "  err_log:              ${CPU_ERR_LOG}"
 echo "  max_tasks:            ${WORKER_MAX_TASKS}"
 echo "  max_runs_per_task:    ${WORKER_MAX_RUNS_PER_TASK}"
+echo "  serial_task_ids:      ${WORKER_SERIAL_TASK_IDS}"
+echo "  task_run_overrides:   ${WORKER_TASK_MAX_RUNS_OVERRIDES:-<none>}"
+echo "  auto_serial_compose:  ${WORKER_AUTO_SERIALIZE_UNSAFE_COMPOSE}"
 echo "  concurrent_closes:    ${WORKER_MAX_CONCURRENT_CLOSES}"
 echo "  concurrent_builds:    ${WORKER_MAX_CONCURRENT_BUILDS}"
 echo "  idle_ttl:             ${WORKER_RUN_IDLE_TTL}s"

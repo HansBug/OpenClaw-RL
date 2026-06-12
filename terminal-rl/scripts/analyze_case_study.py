@@ -180,13 +180,47 @@ def infer_dataset_from_meta(meta: dict[str, Any], dirname: str) -> str:
     return "seta"
 
 
+def index_records_by_dir(traj_dir: Path) -> dict[Path, dict[str, Any]]:
+    index_path = traj_dir / "index.jsonl"
+    if not index_path.exists():
+        return {}
+    active: dict[str, dict[str, Any]] = {}
+    for line in index_path.read_text().splitlines():
+        if not line.strip():
+            continue
+        try:
+            record = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        rel_path = str(record.get("rel_path") or "")
+        if not rel_path:
+            continue
+        event = str(record.get("event") or "save")
+        if event == "delete":
+            active.pop(rel_path, None)
+        elif event == "save":
+            active[rel_path] = record
+
+    out: dict[Path, dict[str, Any]] = {}
+    for rel_path, record in active.items():
+        sub_dir = traj_dir / rel_path
+        if sub_dir.is_dir() and (sub_dir / "traj.json").exists():
+            out[sub_dir] = record
+    return out
+
+
 def scan_trajectories(traj_dir: Path) -> list[dict[str, Any]]:
     if not traj_dir.exists():
         raise FileNotFoundError(f"trajectory directory not found: {traj_dir}")
     records: list[dict[str, Any]] = []
+    indexed = index_records_by_dir(traj_dir)
+    candidate_dirs = list(indexed)
+    seen_dirs = set(candidate_dirs)
     for sub_dir in sorted(traj_dir.iterdir()):
-        if not sub_dir.is_dir():
-            continue
+        if sub_dir.is_dir() and sub_dir not in seen_dirs:
+            candidate_dirs.append(sub_dir)
+
+    for sub_dir in candidate_dirs:
         meta_path = sub_dir / "meta.json"
         traj_path = sub_dir / "traj.json"
         meta: dict[str, Any] = {}
@@ -212,6 +246,7 @@ def scan_trajectories(traj_dir: Path) -> list[dict[str, Any]]:
                 "meta_path": meta_path if meta_path.exists() else None,
                 "traj_path": traj_path if traj_path.exists() else None,
                 "meta": meta,
+                "index": indexed.get(sub_dir),
                 "dataset": dataset,
                 "match_values": trajectory_match_values(meta),
             }
