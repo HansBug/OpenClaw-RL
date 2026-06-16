@@ -4,8 +4,10 @@ import argparse
 import asyncio
 import logging
 import os
+import re
 import time
 from hashlib import sha1
+from pathlib import Path
 from typing import Any
 
 import aiohttp
@@ -61,6 +63,21 @@ def _retryable_allocate_failure(payload: dict[str, Any], status: int) -> bool:
     return status in {429, 502, 503, 504}
 
 
+def _parse_worker_urls_text(text: str) -> list[str]:
+    chunks: list[str] = []
+    for raw_line in text.splitlines():
+        line = raw_line.split("#", 1)[0].strip()
+        if not line:
+            continue
+        if line.startswith("export "):
+            line = line[len("export ") :].strip()
+        if line.startswith("WORKER_URLS="):
+            line = line.split("=", 1)[1].strip()
+        line = line.strip().strip('"').strip("'")
+        chunks.extend(part for part in re.split(r"[,\s]+", line) if part)
+    return [part.rstrip("/") for part in chunks]
+
+
 class Router:
     def __init__(
         self,
@@ -69,6 +86,8 @@ class Router:
         forward_retries: int = 1,
         forward_retry_backoff: float = 0.2,
         pressure_cooldown: float = 60.0,
+        workers_file: str | None = None,
+        workers_reload_interval: float = 0.0,
     ):
         if not worker_urls:
             raise ValueError("At least one worker URL is required")
@@ -77,6 +96,11 @@ class Router:
         self.forward_retries = max(0, int(forward_retries))
         self.forward_retry_backoff = max(0.0, float(forward_retry_backoff))
         self.pressure_cooldown = max(0.0, float(pressure_cooldown))
+        self.workers_file = str(workers_file or "").strip()
+        self.workers_reload_interval = max(0.0, float(workers_reload_interval))
+        self._last_workers_reload = 0.0
+        self._workers_reload_lock = asyncio.Lock()
+        self._lease_worker_urls: dict[str, str] = {}
         self._unhealthy_until: dict[int, float] = {}
         self._status_cache: dict[int, tuple[float, dict[str, Any], int]] = {}
         self._session: aiohttp.ClientSession | None = None
@@ -96,6 +120,60 @@ class Router:
             await self._session.close()
         self._session = None
 
+    async def maybe_reload_workers(self, *, force: bool = False) -> None:
+        if not self.workers_file:
+            return
+        if self.workers_reload_interval <= 0 and not force:
+            return
+        now = time.monotonic()
+        if not force and now - self._last_workers_reload < self.workers_reload_interval:
+            return
+
+        async with self._workers_reload_lock:
+            now = time.monotonic()
+            if not force and now - self._last_workers_reload < self.workers_reload_interval:
+                return
+            self._last_workers_reload = now
+            try:
+                text = Path(self.workers_file).read_text(encoding="utf-8")
+            except FileNotFoundError:
+                logger.warning(
+                    "Worker URL file %s is missing; keeping existing workers=%s",
+                    self.workers_file,
+                    self.workers,
+                )
+                return
+            except OSError as exc:
+                logger.warning(
+                    "Failed reading worker URL file %s: %s; keeping existing workers=%s",
+                    self.workers_file,
+                    _format_error(exc),
+                    self.workers,
+                )
+                return
+
+            new_workers = _parse_worker_urls_text(text)
+            if not new_workers:
+                logger.warning(
+                    "Worker URL file %s has no usable URLs; keeping existing workers=%s",
+                    self.workers_file,
+                    self.workers,
+                )
+                return
+            if new_workers == self.workers:
+                return
+
+            old_workers = self.workers
+            self.workers = new_workers
+            self._unhealthy_until.clear()
+            self._status_cache.clear()
+            logger.warning(
+                "Reloaded worker URLs from %s: old=%s new=%s",
+                self.workers_file,
+                old_workers,
+                new_workers,
+            )
+
     def select_worker(self, task_key: str) -> tuple[int, str]:
         digest = sha1(task_key.encode("utf-8")).digest()
         idx = (
@@ -114,6 +192,15 @@ class Router:
 
     def worker_url(self, worker_idx: int) -> str:
         return self.workers[worker_idx]
+
+    def remember_lease(self, global_lease: str, worker_url: str) -> None:
+        self._lease_worker_urls[str(global_lease)] = worker_url.rstrip("/")
+
+    def forget_lease(self, global_lease: str) -> None:
+        self._lease_worker_urls.pop(str(global_lease), None)
+
+    def worker_url_for_lease(self, global_lease: str, worker_idx: int) -> str:
+        return self._lease_worker_urls.get(str(global_lease)) or self.worker_url(worker_idx)
 
     def iter_worker_candidates(self, start_idx: int) -> list[tuple[int, str]]:
         candidates = [
@@ -280,7 +367,7 @@ class Router:
         timeout: float | None = None,
     ) -> tuple[dict[str, Any], int]:
         worker_idx, worker_lease = self.decode_lease(global_lease)
-        url = self.worker_url(worker_idx)
+        url = self.worker_url_for_lease(global_lease, worker_idx)
         forwarded_payload = dict(payload)
         forwarded_payload["lease_id"] = worker_lease
         return await self.forward(url, path, forwarded_payload, timeout)
@@ -347,6 +434,7 @@ async def readyz() -> JSONResponse:
             status_code=503,
         )
 
+    await ROUTER.maybe_reload_workers()
     timeout = _env_float("ROUTER_READYZ_WORKER_TIMEOUT", 5.0)
 
     async def _fetch(idx: int, url: str) -> dict[str, Any]:
@@ -397,6 +485,8 @@ async def status() -> JSONResponse:
             {"ok": False, "error": "Router is not initialized"}, status_code=500
         )
 
+    await ROUTER.maybe_reload_workers()
+
     async def _fetch(idx: int, url: str) -> dict[str, Any]:
         try:
             data, _ = await ROUTER.worker_status(url, timeout=10)
@@ -424,6 +514,7 @@ async def allocate(request: Request) -> JSONResponse:
             {"ok": False, "error": "Router is not initialized"}, status_code=500
         )
 
+    await ROUTER.maybe_reload_workers()
     data = await json_payload(request)
     task_key = data.get("task_key", "")
     request_id = data.get("request_id")
@@ -452,6 +543,7 @@ async def allocate(request: Request) -> JSONResponse:
                     result["lease_id"] = Router.encode_lease(
                         worker_idx, str(result["lease_id"])
                     )
+                    ROUTER.remember_lease(str(result["lease_id"]), worker_url)
                     result["worker_idx"] = worker_idx
                     return JSONResponse(
                         result, status_code=_status_from_payload(result, code)
@@ -529,7 +621,7 @@ async def _lease_proxy(path: str, request: Request) -> JSONResponse:
 
     try:
         worker_idx, worker_lease = ROUTER.decode_lease(str(global_lease))
-        worker_url = ROUTER.worker_url(worker_idx)
+        worker_url = ROUTER.worker_url_for_lease(str(global_lease), worker_idx)
     except (ValueError, IndexError) as exc:
         return JSONResponse(
             {"ok": False, "error": f"Invalid lease_id format: {exc}"}, status_code=400
@@ -540,6 +632,8 @@ async def _lease_proxy(path: str, request: Request) -> JSONResponse:
 
     try:
         result, code = await ROUTER.forward(worker_url, path, payload)
+        if path == "/close":
+            ROUTER.forget_lease(str(global_lease))
         return JSONResponse(result, status_code=_status_from_payload(result, code))
     except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
         return _worker_unreachable(
@@ -603,6 +697,18 @@ def parse_args() -> argparse.Namespace:
         help="Comma-separated worker URLs, e.g. http://w0:18081,http://w1:18081",
     )
     parser.add_argument(
+        "--workers-file",
+        type=str,
+        default=os.getenv("WORKER_URLS_FILE", ""),
+        help="Optional file containing worker URLs. The router hot-reloads it periodically.",
+    )
+    parser.add_argument(
+        "--workers-reload-interval",
+        type=float,
+        default=float(os.getenv("WORKER_URLS_RELOAD_INTERVAL", "0")),
+        help="Seconds between worker URL file reload checks. Set 0 to disable.",
+    )
+    parser.add_argument(
         "--forward-timeout",
         type=float,
         default=float(os.getenv("ROUTER_FORWARD_TIMEOUT", "1800.0")),  # P0 fix: 600→1800s for reset endpoint
@@ -637,10 +743,19 @@ def main() -> None:
         level=logging.INFO, format="[%(asctime)s %(levelname)s %(name)s] %(message)s"
     )
 
-    worker_urls = [u.strip() for u in args.workers.split(",") if u.strip()]
+    worker_urls = [u.strip().rstrip("/") for u in args.workers.split(",") if u.strip()]
+    if not worker_urls and args.workers_file:
+        try:
+            worker_urls = _parse_worker_urls_text(
+                Path(args.workers_file).read_text(encoding="utf-8")
+            )
+        except OSError as exc:
+            raise SystemExit(
+                f"ERROR: failed to read --workers-file {args.workers_file}: {_format_error(exc)}"
+            ) from exc
     if not worker_urls:
         raise SystemExit(
-            "ERROR: --workers (or WORKER_URLS env) must list at least one worker URL"
+            "ERROR: --workers, WORKER_URLS env, or --workers-file must list at least one worker URL"
         )
 
     ROUTER = Router(
@@ -649,12 +764,16 @@ def main() -> None:
         forward_retries=args.forward_retries,
         forward_retry_backoff=args.forward_retry_backoff,
         pressure_cooldown=args.pressure_cooldown,
+        workers_file=args.workers_file,
+        workers_reload_interval=args.workers_reload_interval,
     )
     logger.info(
-        "Starting router on %s:%s  workers=%s  forward_timeout=%s  forward_retries=%s  forward_retry_backoff=%s  pressure_cooldown=%s",
+        "Starting router on %s:%s  workers=%s  workers_file=%s  workers_reload_interval=%s  forward_timeout=%s  forward_retries=%s  forward_retry_backoff=%s  pressure_cooldown=%s",
         args.host,
         args.port,
         worker_urls,
+        args.workers_file,
+        args.workers_reload_interval,
         args.forward_timeout,
         args.forward_retries,
         args.forward_retry_backoff,

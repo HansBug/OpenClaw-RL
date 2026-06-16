@@ -1764,6 +1764,8 @@ def record_arm_event(
     parse_error_count: int,
     bonus: float,
     dataset: str | None = None,
+    normalized_base_score: float | None = None,
+    success_score: float | None = None,
 ) -> None:
     if not config.active:
         return
@@ -1773,8 +1775,21 @@ def record_arm_event(
     final = _finite_float(final_score, base)
     shaped_bonus = _finite_float(bonus)
     dataset_name = _normalize_dataset(dataset)
-    normalized_base = _normalized_base_score(base, dataset_name)
-    success = 1 if base > config.success_threshold else 0
+    if normalized_base_score is None:
+        normalized_base = _normalized_base_score(base, dataset_name)
+    else:
+        normalized_base = min(
+            1.0,
+            max(
+                0.0,
+                _finite_float(
+                    normalized_base_score,
+                    _normalized_base_score(base, dataset_name),
+                ),
+            ),
+        )
+    success_value = base if success_score is None else _finite_float(success_score, base)
+    success = 1 if success_value > config.success_threshold else 0
     event = {
         "arm_id": float(int(arm_id) % max(1, config.k)),
         "base_score": base,

@@ -1860,6 +1860,8 @@ def _exploration_audit_from_reward(reward: Dict[str, Any]) -> Dict[str, Any]:
         "explore_cde_actor_log_ppl",
         "explore_cde_actor_reward_gate",
         "explore_cde_actor_eligible",
+        "exploration_reward_save_stage",
+        "explore_post_norm_bonus_available_at_save",
     )
     return {key: reward[key] for key in keys if key in reward}
 
@@ -2040,6 +2042,14 @@ def _save_rollout_artifacts(
             )
             if reward_details:
                 reward_breakdown["details"] = reward_details
+            if (
+                reward_breakdown.get("explore_agent57_enabled")
+                and "explore_post_norm_bonus" not in reward_breakdown
+            ):
+                reward_breakdown["exploration_reward_save_stage"] = (
+                    "generate_pre_reward_postprocess"
+                )
+                reward_breakdown["explore_post_norm_bonus_available_at_save"] = False
             reward_breakdown["per_turn_scores"] = [
                 {
                     "turn_idx": s.metadata.get("turn_idx"),
@@ -3650,6 +3660,26 @@ async def generate(
                 if _base_score_values
                 else 0.0
             )
+            _agent57_dataset_name = str(data_source or "").strip().lower()
+            _agent57_normalized_score_values = []
+            if _agent57_dataset_name == "seta":
+                for _sample in samples:
+                    if not isinstance(_sample.reward, dict):
+                        continue
+                    _raw_score = _sample.reward.get(
+                        "raw_score",
+                        _sample.reward.get("accuracy"),
+                    )
+                    try:
+                        _agent57_normalized_score_values.append(float(_raw_score))
+                    except (TypeError, ValueError):
+                        pass
+            _agent57_normalized_score_mean = (
+                sum(_agent57_normalized_score_values)
+                / len(_agent57_normalized_score_values)
+                if _agent57_normalized_score_values
+                else None
+            )
             _cde_actor = _explore_cde_actor_metrics(
                 interactions,
                 _base_score_mean,
@@ -3700,6 +3730,8 @@ async def generate(
                 parse_error_count=agent_runner.parse_error_count,
                 bonus=_agent57_bonus,
                 dataset=data_source,
+                normalized_base_score=_agent57_normalized_score_mean,
+                success_score=_agent57_normalized_score_mean,
             )
             for s in samples:
                 if isinstance(s.reward, dict) and "score" in s.reward:

@@ -239,7 +239,13 @@ def analyze(log_path: Path, tail_lines: int, run_dir: Path | None = None) -> dic
         "run_config_dapo_dynamic_sampling": _truthy(run_config_flags.get("dapo_dynamic_sampling")),
         "run_config_dapo_dynamic_filter_path": bool(run_config_flags.get("dapo_dynamic_filter_path")),
     }
-    dynamic_sampling_enabled = any(dynamic_sampling_sources.values())
+    dynamic_sampling_enabled = (
+        _truthy(run_config_flags.get("dapo_dynamic_sampling"))
+        or (
+            "dapo_dynamic_sampling" not in run_config_flags
+            and "dynamic-sampling-filter-path" in flags
+        )
+    )
     post_started = post_counts["start_terminal_rollout"] > 0
     no_next_batch = bool(last_rollout and (counts["data_rollout"] == len(rollouts)))
     similar_reasons: list[str] = []

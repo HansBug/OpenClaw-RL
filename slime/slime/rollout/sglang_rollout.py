@@ -251,16 +251,41 @@ def _agent57_int_list(name: str) -> list[int]:
     return values
 
 
+def _agent57_int_env(name: str, default: int = 0) -> int:
+    raw = os.getenv(name)
+    if raw is None or raw == "":
+        return default
+    try:
+        return int(raw)
+    except ValueError:
+        return default
+
+
 def _agent57_value_for_arm(values: list[Any], arm_id: int) -> Any | None:
     if not values:
         return None
     return values[int(arm_id) % len(values)]
 
 
+def _agent57_sampling_warmup_active(metadata: dict[str, Any]) -> bool:
+    warmup_rollouts = _agent57_int_env("EXPLORE_AGENT57_ARM_TEMPERATURE_WARMUP_ROLLOUTS", 0)
+    if warmup_rollouts <= 0:
+        return False
+    try:
+        rollout_id = int(metadata.get("rollout_id", warmup_rollouts))
+    except (TypeError, ValueError):
+        rollout_id = warmup_rollouts
+    return rollout_id < warmup_rollouts
+
+
 def _apply_agent57_sampling_params(sample: Sample, sampling_params: dict[str, Any]) -> None:
     metadata = sample.metadata if isinstance(sample.metadata, dict) else {}
     if not metadata.get("agent57_lite_enabled"):
         return
+    if _agent57_sampling_warmup_active(metadata):
+        metadata["agent57_sampling_warmup_active"] = 1
+        return
+    metadata["agent57_sampling_warmup_active"] = 0
     try:
         arm_id = int(metadata.get("agent57_arm_id", 0))
     except (TypeError, ValueError):

@@ -68,6 +68,52 @@ def _sync_reward_aliases(
     reward["total_reward"] = total
 
 
+def _status_name(sample: Any) -> str:
+    status = getattr(sample, "status", "")
+    value = getattr(status, "value", status)
+    return str(value).lower()
+
+
+def _configured_truncation_penalty() -> float:
+    return _env_float(
+        "EXPLORE_TRUNCATION_PENALTY",
+        _env_float("EXPLORE_ADVANTAGE_TRUNCATION_PENALTY", 0.0),
+    )
+
+
+def _apply_truncation_penalties(
+    samples: list[Any],
+    adjusted: list[float],
+    *,
+    exploration_extra: list[float] | None = None,
+) -> list[float]:
+    penalty_value = _configured_truncation_penalty()
+    should_sync_aliases = exploration_extra is not None
+    if penalty_value == 0.0 and not should_sync_aliases:
+        return adjusted
+
+    result = list(adjusted)
+    extra = exploration_extra or [0.0 for _ in samples]
+    for i, sample in enumerate(samples):
+        is_truncated = "truncated" in _status_name(sample)
+        penalty = float(penalty_value if is_truncated else 0.0)
+        result[i] += penalty
+        reward = getattr(sample, "reward", None)
+        if isinstance(reward, dict):
+            if penalty_value != 0.0:
+                reward["explore_truncation_penalty"] = penalty
+                reward["explore_truncation_penalty_coef"] = penalty_value
+                reward["explore_truncation_penalty_applied"] = bool(is_truncated)
+            reward["explore_post_norm_adjusted_reward"] = result[i]
+            reward["postprocess_total_reward"] = result[i]
+            _sync_reward_aliases(
+                reward,
+                total_reward=result[i],
+                extra_exploration_reward=float(extra[i]) + penalty,
+            )
+    return result
+
+
 def _normalize_values(values: list[float], use_std: bool) -> list[float]:
     if not values:
         return []
@@ -169,6 +215,7 @@ def _dual_stream_post_process(
     betas = [_component_value(sample, "explore_agent57_beta") for sample in samples]
     max_beta = max([abs(beta) for beta in betas if beta > 0.0] or [1.0])
     adjusted = list(base_rewards)
+    exploration_extra = [0.0 for _ in samples]
     for i, sample in enumerate(samples):
         if arm_weight_mode in {"none", "off", "0"}:
             arm_weight = 1.0
@@ -184,6 +231,7 @@ def _dual_stream_post_process(
         raw_bonus = float(lambda_coef * arm_weight * trust * intrinsic_adv[i])
         bonus = max(-clip, min(clip, raw_bonus)) if clip > 0 else raw_bonus
         adjusted[i] += bonus
+        exploration_extra[i] = bonus
         if isinstance(reward, dict):
             reward["explore_post_norm_base_reward"] = base_rewards[i]
             reward["explore_post_norm_intrinsic_value"] = intrinsic_values[i]
@@ -198,18 +246,17 @@ def _dual_stream_post_process(
             reward["explore_post_norm_trust"] = trust
             reward["explore_post_norm_adjusted_reward"] = adjusted[i]
             reward["postprocess_total_reward"] = adjusted[i]
-            _sync_reward_aliases(
-                reward,
-                total_reward=adjusted[i],
-                extra_exploration_reward=bonus,
-            )
-    return adjusted
+    return _apply_truncation_penalties(
+        samples,
+        adjusted,
+        exploration_extra=exploration_extra,
+    )
 
 
 def post_process_rewards(args: Any, samples: list[Any]) -> tuple[list[float], list[float]]:
     raw_rewards, rewards = _default_post_process(args, samples)
     if not _env_flag("EXPLORE_ADVANTAGE_BONUS_ENABLED", os.getenv("EXPLORE_ADVANTAGE_BONUS", "0")):
-        return raw_rewards, rewards
+        return raw_rewards, _apply_truncation_penalties(samples, rewards)
     mode = _env_str("EXPLORE_ADVANTAGE_BONUS_MODE", "component").lower()
     if mode in {"dual", "dual_stream", "intrinsic_advantage"}:
         return raw_rewards, _dual_stream_post_process(args, samples, rewards)
@@ -223,11 +270,13 @@ def post_process_rewards(args: Any, samples: list[Any]) -> tuple[list[float], li
     clip = _env_float("EXPLORE_ADVANTAGE_BONUS_CLIP", 0.25)
 
     adjusted = list(rewards)
+    exploration_extra = [0.0 for _ in samples]
     for i, sample in enumerate(samples):
         raw_bonus = sum(_component_value(sample, key) for key in component_names)
         clipped_bonus = max(-clip, min(clip, raw_bonus)) if clip > 0 else raw_bonus
         bonus = coef * clipped_bonus
         adjusted[i] += bonus
+        exploration_extra[i] = bonus
         reward = getattr(sample, "reward", None)
         if isinstance(reward, dict):
             reward["explore_post_norm_base_reward"] = rewards[i]
@@ -239,9 +288,8 @@ def post_process_rewards(args: Any, samples: list[Any]) -> tuple[list[float], li
             reward["explore_post_norm_bonus_components"] = ",".join(component_names)
             reward["explore_post_norm_adjusted_reward"] = adjusted[i]
             reward["postprocess_total_reward"] = adjusted[i]
-            _sync_reward_aliases(
-                reward,
-                total_reward=adjusted[i],
-                extra_exploration_reward=bonus,
-            )
-    return raw_rewards, adjusted
+    return raw_rewards, _apply_truncation_penalties(
+        samples,
+        adjusted,
+        exploration_extra=exploration_extra,
+    )

@@ -150,7 +150,7 @@ def test_ngu_lite_bonus_soft_trust_scales_product(monkeypatch):
         trust_gate=0.1,
     )
 
-    assert metrics["explore_agent57_ngu_bonus_unclipped"] == 0.02
+    assert math.isclose(metrics["explore_agent57_ngu_bonus_unclipped"], 0.02)
     assert metrics["explore_agent57_trust"] == 0.1
 
 
@@ -213,6 +213,46 @@ def test_ucb_dataset_aware_uses_normalized_base_reward(monkeypatch):
 
     assert a57.assign_group_arms(1, dataset="seta") == [1]
     assert a57.assign_group_arms(1, dataset="agentharm") == [2]
+
+
+def test_ucb_seta_can_use_raw_accuracy_for_normalized_base(monkeypatch):
+    _reset_local_agent57_state()
+    monkeypatch.setenv("EXPLORE_AGENT57_LITE", "1")
+    monkeypatch.setenv("EXPLORE_AGENT57_CONTROLLER", "ucb")
+    monkeypatch.setenv("EXPLORE_AGENT57_K", "2")
+    monkeypatch.setenv("EXPLORE_AGENT57_LIFELONG_BACKEND", "local")
+    monkeypatch.setenv("EXPLORE_AGENT57_UCB_C", "0")
+    monkeypatch.setenv("EXPLORE_AGENT57_UCB_VALUE", "normalized_base")
+    monkeypatch.setenv("EXPLORE_AGENT57_UCB_DATASET_AWARE", "1")
+    monkeypatch.setenv("EXPLORE_AGENT57_KEEP_BASELINE", "0")
+    config = a57.config_from_env()
+
+    a57.record_arm_event(
+        config=config,
+        arm_id=0,
+        base_score=-0.5,
+        final_score=-0.5,
+        status="completed",
+        parse_error_count=0,
+        bonus=0.0,
+        dataset="seta",
+        normalized_base_score=0.25,
+        success_score=0.25,
+    )
+    a57.record_arm_event(
+        config=config,
+        arm_id=1,
+        base_score=-0.9,
+        final_score=-0.9,
+        status="completed",
+        parse_error_count=0,
+        bonus=0.0,
+        dataset="seta",
+        normalized_base_score=0.05,
+        success_score=0.05,
+    )
+
+    assert a57.assign_group_arms(1, dataset="seta") == [0]
 
 
 def test_ucb_random_seed_reproduces_tie_break_and_epsilon(monkeypatch):

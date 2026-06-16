@@ -22,9 +22,11 @@ class DummySample:
         intrinsic: float,
         beta: float,
         trust: float = 1.0,
+        status: str | None = None,
     ) -> None:
         self.group_index = group_index
         self.index = index
+        self.status = status or "completed"
         self.reward = {
             "score": score,
             "raw_score": score,
@@ -89,3 +91,33 @@ def test_component_postnorm_mode_remains_backward_compatible(monkeypatch):
     assert sample.reward["explore_post_norm_bonus_mode"] == "component"
     assert sample.reward["explore_post_norm_base_reward"] == 0.0
     assert sample.reward["explore_post_norm_adjusted_reward"] == 0.25
+
+
+def test_truncated_penalty_applies_without_advantage_bonus(monkeypatch):
+    monkeypatch.setenv("EXPLORE_ADVANTAGE_BONUS", "0")
+    monkeypatch.setenv("EXPLORE_ADVANTAGE_BONUS_ENABLED", "0")
+    monkeypatch.setenv("EXPLORE_TRUNCATION_PENALTY", "-0.03")
+    args = SimpleNamespace(
+        reward_key="score",
+        advantage_estimator="grpo",
+        rewards_normalization=False,
+        grpo_std_normalization=False,
+        dynamic_history=False,
+    )
+    sample = DummySample(
+        group_index=0,
+        index=0,
+        score=1.0,
+        intrinsic=0.0,
+        beta=0.0,
+        status="truncated",
+    )
+
+    raw, adjusted = reward_postprocess.post_process_rewards(args, [sample])
+
+    assert raw == [1.0]
+    assert adjusted == [0.97]
+    assert sample.reward["explore_truncation_penalty"] == -0.03
+    assert sample.reward["explore_truncation_penalty_applied"] is True
+    assert sample.reward["exploration_reward"] == -0.03
+    assert sample.reward["total_reward"] == 0.97
