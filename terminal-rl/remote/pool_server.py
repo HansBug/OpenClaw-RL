@@ -378,6 +378,16 @@ class WorkerPool:
             run_slot.last_used_ts = time.time()
             return str(observation)
 
+    async def handle_agent_reply(
+        self, run_lease_id: str, assistant_text: str
+    ) -> dict[str, Any]:
+        async with self._lock:
+            run_slot = self._get_run_slot(run_lease_id)
+        async with run_slot.lock:
+            result = await run_slot.env.handle_agent_reply(assistant_text)
+            run_slot.last_used_ts = time.time()
+            return dict(result)
+
     async def evaluate(
         self, run_lease_id: str, trajectory: dict[str, Any] | None = None
     ) -> tuple[float, dict[str, Any] | None]:
@@ -662,6 +672,33 @@ async def exec_tool(request: Request) -> JSONResponse:
             str(lease_id), tool_name, arguments=arguments
         )
         return JSONResponse({"ok": True, "observation": observation})
+    except Exception as exc:
+        return JSONResponse({"ok": False, "error": str(exc)}, status_code=500)
+
+
+@app.post("/agent_reply")
+async def agent_reply(request: Request) -> JSONResponse:
+    if POOL is None:
+        return JSONResponse(
+            {"ok": False, "error": "Pool is not initialized"}, status_code=500
+        )
+
+    data = await json_payload(request)
+    lease_id = data.get("lease_id")
+    assistant_text = data.get("assistant_text")
+
+    if not lease_id:
+        return JSONResponse(
+            {"ok": False, "error": "lease_id is required"}, status_code=400
+        )
+    if not isinstance(assistant_text, str):
+        return JSONResponse(
+            {"ok": False, "error": "assistant_text is required"}, status_code=400
+        )
+
+    try:
+        result = await POOL.handle_agent_reply(str(lease_id), assistant_text)
+        return JSONResponse({"ok": True, **result})
     except Exception as exc:
         return JSONResponse({"ok": False, "error": str(exc)}, status_code=500)
 

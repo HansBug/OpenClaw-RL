@@ -36,6 +36,7 @@ from safety_reward import (
     per_turn_score as _safety_per_turn_score,
     trajectory_score as _safety_trajectory_score,
 )
+from tau2_debug import forced_text_first_message
 
 logger = logging.getLogger(__name__)
 
@@ -1127,6 +1128,13 @@ def _normalize_tool_schemas(raw_tools: List[Any]) -> List[Dict[str, Any]]:
     return schemas
 
 
+def _normalize_tau2_conversation_mode(raw_mode: Any) -> str:
+    mode = str(raw_mode or "solo").strip().lower()
+    if mode in {"non_solo", "nonsolo", "non-solo"}:
+        return "non_solo"
+    return "solo"
+
+
 class _LocalAgentSafetyBenchClient:
     def __init__(self) -> None:
         from remote.agent_safetybench_env import AgentSafetyBenchEnv
@@ -1253,7 +1261,13 @@ class _LocalTau2Client:
             task_spec=_make_task_spec(task_meta),
             run_ctx=local_run_ctx,
         )
-        return {"user_msg": user_msg, "tool_schemas": tool_schemas}
+        return {
+            "user_msg": user_msg,
+            "tool_schemas": tool_schemas,
+            "conversation_mode": _normalize_tau2_conversation_mode(
+                task_meta.get("tau2_mode")
+            ),
+        }
 
     async def heartbeat(self, lease_id: str) -> None:
         _ = lease_id
@@ -1263,6 +1277,10 @@ class _LocalTau2Client:
     ) -> str:
         _ = lease_id
         return await self._env.exec_tool(tool_name, arguments)
+
+    async def agent_reply(self, lease_id: str, assistant_text: str) -> dict[str, Any]:
+        _ = lease_id
+        return await self._env.handle_agent_reply(assistant_text)
 
     async def evaluate(
         self, lease_id: str, trajectory: dict[str, Any] | None = None
@@ -1380,13 +1398,6 @@ def _create_sglang_client(
         if parsed_cap > 0:
             effective_context_limit = min(effective_context_limit, parsed_cap)
     max_input_tokens = max(1, effective_context_limit - completion_budget)
-    logger.info(
-        "SGLang client: url=%s context_limit=%d, completion_budget=%d, max_input_tokens=%d",
-        sglang_url,
-        effective_context_limit,
-        completion_budget,
-        max_input_tokens,
-    )
     raw_request_timeout = getattr(args, "sglang_request_timeout", None)
     if raw_request_timeout in (None, "", 0, 0.0):
         raw_request_timeout = os.getenv("SGLANG_REQUEST_TIMEOUT")
@@ -1398,6 +1409,14 @@ def _create_sglang_client(
         request_timeout = None
     if request_timeout is not None and request_timeout <= 0:
         request_timeout = None
+    logger.info(
+        "SGLang client: url=%s context_limit=%d, completion_budget=%d, max_input_tokens=%d, request_timeout=%s",
+        sglang_url,
+        effective_context_limit,
+        completion_budget,
+        max_input_tokens,
+        request_timeout,
+    )
 
     return SGLangTurnClient(
         model_type=None,
@@ -1511,6 +1530,9 @@ async def generate(
         logger.info("%s Start terminal rollout", _log_tag)
 
         tool_schemas = _normalize_tool_schemas(raw_tools)
+        tau2_conversation_mode = _normalize_tau2_conversation_mode(
+            task_meta.get("tau2_mode") or os.getenv("TAU2_MODE", "solo")
+        )
         agent_type = str(getattr(args, "terminal_agent_type", "camel_agent"))
         model_type = str(getattr(args, "model_type", "slime-sglang"))
         non_think_mode = bool(getattr(args, "non_think_mode", True))
@@ -1628,6 +1650,53 @@ async def generate(
                 logger.warning("%s Rollout context is empty; aborting loop.", _log_tag)
                 break
 
+            debug_forced_text = forced_text_first_message(
+                data_source=task_meta.get("data_source"),
+                conversation_mode=tau2_conversation_mode,
+                turn_idx=len(turn_records),
+            )
+            if (
+                debug_forced_text
+                and env_client is not None
+                and lease_id is not None
+            ):
+                follow_up = await env_client.agent_reply(
+                    lease_id,
+                    debug_forced_text,
+                )
+                follow_up_message = str(follow_up.get("user_message", "") or "").strip()
+                current_turn_record: dict[str, Any] = {
+                    "turn_idx": len(turn_records),
+                    "context_messages": context_result.context_messages,
+                    "assistant_output": debug_forced_text,
+                    "forced_assistant_text": debug_forced_text,
+                    "finish_reason": "forced_debug_follow_up",
+                    "latency_ms": 0.0,
+                    "n_input_tokens": 0,
+                    "n_output_tokens": 0,
+                    "parse_error_recorded": False,
+                    "tool_calls": [],
+                }
+                if follow_up.get("continue") and follow_up_message:
+                    logger.info(
+                        "%s Turn %d: forced tau2 non-solo pre-turn debug path.",
+                        _log_tag,
+                        len(turn_records),
+                    )
+                    current_turn_record["env_user_message"] = follow_up_message
+                    turn_records.append(current_turn_record)
+                    agent_runner.record_user_message(follow_up_message)
+                    if agent_runner.reached_iteration_limit():
+                        logger.warning(
+                            "%s Max iterations (%d) reached after forced non-solo follow-up.",
+                            _log_tag,
+                            agent_runner.max_iterations,
+                        )
+                        reached_iteration_limit = True
+                        break
+                    continue
+
+            next_turn_idx = len(turn_records)
             turn_state: TurnResult = await agent_runner.run_model_turn(
                 context_result.context_messages
             )
@@ -1760,6 +1829,31 @@ async def generate(
                     final_model_response = turn_state.model_response
                     break
                 continue
+
+            if (
+                task_meta.get("data_source") == "tau2"
+                and tau2_conversation_mode == "non_solo"
+                and env_client is not None
+                and lease_id is not None
+            ):
+                follow_up = await env_client.agent_reply(
+                    lease_id,
+                    interaction.output_text or "",
+                )
+                follow_up_message = str(follow_up.get("user_message", "") or "").strip()
+                if follow_up.get("continue") and follow_up_message:
+                    agent_runner.record_user_message(follow_up_message)
+                    current_turn_record["env_user_message"] = follow_up_message
+                    if agent_runner.reached_iteration_limit():
+                        logger.warning(
+                            "%s Max iterations (%d) reached after non-solo follow-up.",
+                            _log_tag,
+                            agent_runner.max_iterations,
+                        )
+                        reached_iteration_limit = True
+                        final_model_response = turn_state.model_response
+                        break
+                    continue
 
             final_model_response = turn_state.model_response
             break

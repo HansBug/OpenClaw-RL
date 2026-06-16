@@ -185,8 +185,11 @@ class Tau2Env:
         self._task_meta: dict[str, Any] = {}
         self._task = None
         self._env = None
+        self._user = None
+        self._user_state = None
         self._run_ctx = None
         self._last_eval: dict[str, Any] | None = None
+        self._live_messages: list[Any] | None = None
 
     def _task_domain(self) -> str:
         return str(
@@ -218,6 +221,48 @@ class Tau2Env:
             return {"policy_type": self._telecom_policy_type()}
         return {}
 
+    def _mode(self) -> str:
+        mode = str(
+            self._task_meta.get("tau2_mode") or os.getenv("TAU2_MODE", "solo")
+        ).strip().lower()
+        if mode in {"non_solo", "nonsolo", "non-solo"}:
+            return "non_solo"
+        return "solo"
+
+    def _is_solo_mode(self) -> bool:
+        return self._mode() == "solo"
+
+    def _user_llm(self) -> str:
+        return str(
+            self._task_meta.get("tau2_user_llm")
+            or os.getenv("TAU2_USER_LLM", "openai/Qwen3.6-27B-FP8")
+        ).strip()
+
+    def _user_llm_args(self) -> dict[str, Any]:
+        raw = self._task_meta.get("tau2_user_llm_args")
+        if isinstance(raw, dict):
+            return deepcopy(raw)
+        raw_text = str(os.getenv("TAU2_USER_LLM_ARGS", "")).strip()
+        if not raw_text:
+            timeout_raw = str(os.getenv("TAU2_USER_LLM_TIMEOUT", "15")).strip()
+            try:
+                timeout = float(timeout_raw)
+            except ValueError:
+                timeout = 15.0
+            return {
+                "api_base": os.getenv(
+                    "TAU2_USER_LLM_API_BASE",
+                    "http://s-20260523131729-dtntr.ailab-pj.pjh-service.org.cn/v1",
+                ).strip(),
+                "api_key": os.getenv("VLLM_API_KEY", "dummy").strip() or "dummy",
+                "timeout": timeout,
+            }
+        try:
+            parsed = json.loads(raw_text)
+        except json.JSONDecodeError:
+            return {}
+        return deepcopy(parsed) if isinstance(parsed, dict) else {}
+
     def _load_task(self) -> Any:
         from tau2.runner.helpers import get_tasks
 
@@ -237,7 +282,19 @@ class Tau2Env:
         from tau2.registry import registry
 
         return registry.get_env_constructor(self._task_domain())(
-            solo_mode=True, **self._env_kwargs()
+            solo_mode=self._is_solo_mode(), **self._env_kwargs()
+        )
+
+    def _build_user(self, env: Any, task: Any) -> Any:
+        from tau2.runner.build import build_user
+
+        return build_user(
+            "user_simulator",
+            env,
+            task,
+            llm=self._user_llm(),
+            llm_args=self._user_llm_args(),
+            solo_mode=False,
         )
 
     @staticmethod
@@ -245,6 +302,18 @@ class Tau2Env:
         return [deepcopy(tool.openai_schema) for tool in env.get_tools()]
 
     def _user_message(self, env: Any, task: Any) -> str:
+        if not self._is_solo_mode():
+            return (
+                "<instructions>\n"
+                "You are solving a tau2-bench task in non-solo mode.\n"
+                "A simulated user may reply after your non-tool messages.\n"
+                "Solve the ticket by talking to the simulated user and calling the provided tools.\n"
+                "Only make one tool call at a time.\n"
+                "When the issue is resolved or escalation is necessary, give a brief final answer to the user.\n"
+                "</instructions>\n"
+                f"<policy>\n{env.get_policy()}\n</policy>\n"
+                f"<ticket>\n{task_instruction(task)}\n</ticket>"
+            )
         return (
             "<instructions>\n"
             "You are solving a tau2-bench task in solo mode.\n"
@@ -267,10 +336,17 @@ class Tau2Env:
         self._task_meta = deepcopy(task_meta)
         self._run_ctx = run_ctx
         self._last_eval = None
+        self._user = None
+        self._user_state = None
 
         task = self._load_task()
         env = self._load_env()
         initial_state = getattr(task, "initial_state", None)
+        message_history = (
+            deepcopy(getattr(initial_state, "message_history", None) or [])
+            if initial_state is not None
+            else []
+        )
         env.set_state(
             initialization_data=(
                 getattr(initial_state, "initialization_data", None)
@@ -282,22 +358,22 @@ class Tau2Env:
                 if initial_state is not None
                 else None
             ),
-            message_history=(
-                deepcopy(getattr(initial_state, "message_history", None) or [])
-                if initial_state is not None
-                else []
-            ),
+            message_history=message_history,
         )
 
         self._task = task
         self._env = env
+        self._live_messages = deepcopy(message_history)
+        if not self._is_solo_mode():
+            self._user = self._build_user(env, task)
+            self._user_state = self._user.get_init_state(message_history=message_history)
         return self._user_message(env, task), self._tool_schemas(env)
 
     async def exec_tool(self, name: str, arguments: dict[str, Any]) -> str:
         if self._env is None:
             raise RuntimeError("tau2 env is not initialized; call reset first")
 
-        from tau2.data_model.message import ToolCall
+        from tau2.data_model.message import AssistantMessage, ToolCall, ToolMessage
 
         tool_call = ToolCall(
             id=f"call_{uuid.uuid4().hex[:12]}",
@@ -305,7 +381,85 @@ class Tau2Env:
             arguments=deepcopy(arguments or {}),
             requestor="assistant",
         )
-        return str(self._env.get_response(tool_call).content)
+        tool_result = self._env.get_response(tool_call)
+        if self._live_messages is not None and not self._is_solo_mode():
+            self._live_messages.append(
+                AssistantMessage(role="assistant", tool_calls=[tool_call])
+            )
+            self._live_messages.append(
+                ToolMessage(
+                    role="tool",
+                    id=tool_call.id,
+                    requestor="assistant",
+                    content=str(tool_result.content),
+                    error=False,
+                )
+            )
+        return str(tool_result.content)
+
+    async def handle_agent_reply(self, assistant_text: str) -> dict[str, Any]:
+        if self._is_solo_mode() or self._env is None or self._user is None:
+            return {"continue": False, "user_message": ""}
+
+        from tau2.data_model.message import AssistantMessage, MultiToolMessage, ToolMessage
+
+        current_message: Any = AssistantMessage(role="assistant", content=assistant_text)
+        if self._live_messages is not None:
+            self._live_messages.append(current_message)
+
+        while True:
+            user_message, self._user_state = self._user.generate_next_message(
+                current_message, self._user_state
+            )
+            if self._live_messages is not None:
+                self._live_messages.append(user_message)
+
+            if self._is_stop_message(user_message):
+                return {"continue": False, "user_message": ""}
+
+            if not user_message.is_tool_call():
+                return {
+                    "continue": True,
+                    "user_message": str(getattr(user_message, "content", "") or ""),
+                }
+
+            tool_messages: list[ToolMessage] = []
+            for tool_call in list(getattr(user_message, "tool_calls", []) or []):
+                tool_response = self._env.get_response(tool_call)
+                tool_message = ToolMessage(
+                    role="tool",
+                    id=tool_call.id,
+                    requestor="user",
+                    content=str(tool_response.content),
+                    error=False,
+                )
+                tool_messages.append(tool_message)
+                if self._live_messages is not None:
+                    self._live_messages.append(tool_message)
+
+            current_message = (
+                tool_messages[0]
+                if len(tool_messages) == 1
+                else MultiToolMessage(tool_messages=tool_messages)
+            )
+
+    @staticmethod
+    def _is_stop_message(message: Any) -> bool:
+        if getattr(message, "is_tool_call", lambda: False)():
+            return False
+        content = getattr(message, "content", None)
+        if content is None:
+            return False
+        text = str(content).strip().upper()
+        stop_markers = (
+            "<STOP>",
+            "###STOP###",
+            "<TRANSFER>",
+            "###TRANSFER###",
+            "<OUT_OF_SCOPE>",
+            "###OUT_OF_SCOPE###",
+        )
+        return any(marker in text for marker in stop_markers)
 
     def _messages_from_payload(self, trajectory: dict[str, Any] | None) -> list[Any]:
         from tau2.data_model.message import AssistantMessage, ToolCall, ToolMessage
@@ -395,13 +549,17 @@ class Tau2Env:
             end_time=now,
             duration=0.0,
             termination_reason=termination_reason,
-            messages=self._messages_from_payload(payload),
+            messages=(
+                deepcopy(self._live_messages)
+                if (self._live_messages is not None and not self._is_solo_mode())
+                else self._messages_from_payload(payload)
+            ),
         )
         reward_info = evaluate_simulation(
             simulation=sim,
             task=self._task,
             evaluation_type=EvaluationType.ALL,
-            solo_mode=True,
+            solo_mode=self._is_solo_mode(),
             domain=self._task_domain(),
             env_kwargs=self._env_kwargs(),
         )
@@ -423,4 +581,7 @@ class Tau2Env:
         self._task_meta = {}
         self._task = None
         self._env = None
+        self._user = None
+        self._user_state = None
         self._run_ctx = None
+        self._live_messages = None

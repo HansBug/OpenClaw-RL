@@ -245,6 +245,11 @@ class TerminalEnv:
             return result
         return json.dumps(result, ensure_ascii=False)
 
+    async def handle_agent_reply(self, assistant_text: str) -> dict[str, Any]:
+        if self._tau2_env is not None:
+            return await self._tau2_env.handle_agent_reply(assistant_text)
+        return {"continue": False, "user_message": ""}
+
     async def evaluate(self, trajectory: dict[str, Any] | None = None) -> float:
         if self._agent_safetybench_env is not None:
             return await self._agent_safetybench_env.evaluate(trajectory)

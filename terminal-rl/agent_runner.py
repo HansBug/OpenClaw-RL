@@ -4,6 +4,10 @@ from typing import Any, Dict, List, Optional, Protocol
 
 from custom_types import TurnContext, TurnResult
 from inference_client import SGLangTurnClient
+import logging
+
+
+logger = logging.getLogger(__name__)
 
 
 class RolloutAgent(Protocol):
@@ -23,6 +27,7 @@ class RolloutAgent(Protocol):
     ) -> tuple[Optional[Any], List[Any], bool, Optional[Any]]: ...
 
     def record_tool_result(self, tool_call_request: Any, raw_result: Any) -> None: ...
+    def record_user_message(self, input_message: Any) -> None: ...
 
     def finalize_response(self, model_response: Any) -> Any: ...
 
@@ -102,6 +107,9 @@ class AgentRunner:
 
     def record_tool_result(self, tool_call_request: Any, raw_result: Any) -> None:
         self._rollout_agent.record_tool_result(tool_call_request, raw_result)
+
+    def record_user_message(self, input_message: Any) -> None:
+        self._rollout_agent.record_user_message(input_message)
 
     def finalize_response(self, model_response: Any) -> Any:
         return self._rollout_agent.finalize_response(model_response)

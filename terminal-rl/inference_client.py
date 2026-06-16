@@ -204,18 +204,22 @@ class SGLangTurnClient:
 
         t0 = time.monotonic()
         supports_headers = "headers" in inspect.signature(async_post).parameters
+        supports_timeout = "timeout" in inspect.signature(async_post).parameters
 
         async def _do_post():
+            post_kwargs: Dict[str, Any] = {"max_retries": self.max_retries}
+            if self.request_timeout and supports_timeout:
+                post_kwargs["timeout"] = self.request_timeout
             if headers and supports_headers:
                 return await async_post(
-                    self.url, payload, max_retries=self.max_retries, headers=headers
+                    self.url, payload, headers=headers, **post_kwargs
                 )
             else:
                 if headers and not supports_headers:
                     logger.warning(
                         "async_post() does not accept headers; routing key will be ignored for this request."
                     )
-                return await async_post(self.url, payload, max_retries=self.max_retries)
+                return await async_post(self.url, payload, **post_kwargs)
 
         if self.request_timeout:
             try:
@@ -230,7 +234,6 @@ class SGLangTurnClient:
                 )
         else:
             output = await _do_post()
-        latency_ms = (time.monotonic() - t0) * 1000.0
 
         output_text: str = output["text"]
         raw_output_text = output_text

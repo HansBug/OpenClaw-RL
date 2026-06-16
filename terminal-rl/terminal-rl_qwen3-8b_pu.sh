@@ -41,6 +41,30 @@ require_cmd() { command -v "$1" >/dev/null 2>&1 || { echo "[ERROR] missing cmd: 
 # had this dir on PATH; we make that explicit here so the script is self-contained.
 LIGHTRFT_PY312_BIN="${LIGHTRFT_PY312_BIN:-/mnt/shared-storage-user/puyuan/conda_envs/lightrft_py312/bin}"
 export PATH="${LIGHTRFT_PY312_BIN}:${PATH}"
+CUDA_RUNTIME_DIRS=(
+  "/usr/local/nvidia/lib64"
+  "/usr/local/cuda/lib64"
+  "/usr/local/cuda/targets/x86_64-linux/lib"
+  "/usr/lib/x86_64-linux-gnu"
+)
+CUDA_RUNTIME_LD_PATH=""
+for cuda_dir in "${CUDA_RUNTIME_DIRS[@]}"; do
+  if [[ -d "${cuda_dir}" ]]; then
+    if [[ -n "${CUDA_RUNTIME_LD_PATH}" ]]; then
+      CUDA_RUNTIME_LD_PATH="${CUDA_RUNTIME_LD_PATH}:"
+    fi
+    CUDA_RUNTIME_LD_PATH="${CUDA_RUNTIME_LD_PATH}${cuda_dir}"
+  fi
+done
+if [[ -n "${LD_LIBRARY_PATH:-}" ]]; then
+  if [[ -n "${CUDA_RUNTIME_LD_PATH}" ]]; then
+    export LD_LIBRARY_PATH="${CUDA_RUNTIME_LD_PATH}:${LD_LIBRARY_PATH}"
+  else
+    export LD_LIBRARY_PATH="${LD_LIBRARY_PATH}"
+  fi
+elif [[ -n "${CUDA_RUNTIME_LD_PATH}" ]]; then
+  export LD_LIBRARY_PATH="${CUDA_RUNTIME_LD_PATH}"
+fi
 DRY_RUN="${DRY_RUN:-0}"
 
 # ── Cleanup previous processes ───────────────────────────────────────
@@ -430,6 +454,11 @@ TAU2_TASK_SPLIT="${TAU2_TASK_SPLIT:-}"
 TAU2_POLICY_TYPE="${TAU2_POLICY_TYPE:-manual}"
 TAU2_REMOTE_ENV="${TAU2_REMOTE_ENV:-0}"
 TAU2_NUM_TASKS="${TAU2_NUM_TASKS:-}"
+TAU2_USER_LLM="${TAU2_USER_LLM:-openai/Qwen3.6-27B-FP8}"
+TAU2_USER_LLM_API_BASE="${TAU2_USER_LLM_API_BASE:-http://s-20260523131729-dtntr.ailab-pj.pjh-service.org.cn/v1}"
+TAU2_USER_LLM_TIMEOUT="${TAU2_USER_LLM_TIMEOUT:-15}"
+VLLM_API_KEY="${VLLM_API_KEY:-dummy}"
+SGLANG_REQUEST_TIMEOUT="${SGLANG_REQUEST_TIMEOUT:-30}"
 TAU2_BENCH_ROOT_DEFAULT="$(cd "${REPO_ROOT}/.." && pwd)/tau2-bench"
 TAU2_BENCH_ROOT="${TAU2_BENCH_ROOT:-${TAU2_BENCH_ROOT_DEFAULT}}"
 if [[ -z "${TAU2_TASK_SPLIT}" ]]; then
@@ -672,6 +701,11 @@ export TAU2_BENCH_ROOT
 export TAU2_DOMAIN
 export TAU2_TASK_SPLIT
 export TAU2_POLICY_TYPE
+export TAU2_USER_LLM
+export TAU2_USER_LLM_API_BASE
+export TAU2_USER_LLM_TIMEOUT
+export VLLM_API_KEY
+export SGLANG_REQUEST_TIMEOUT
 
 ROUTER_HOST="${ROUTER_HOST:-0.0.0.0}"
 ROUTER_PORT="${ROUTER_PORT:-${ENV_SERVER_PORT}}"
@@ -732,7 +766,12 @@ if [[ -n "${WORKER_URLS}" ]]; then
   ALL_WORKER_HOSTS="$(echo "${WORKER_URLS}" | tr ',' '\n' \
     | sed -E 's#https?://([^:/]+).*#\1#' | tr '\n' ',' | sed 's/,$//')"
 fi
-export NO_PROXY="${NO_PROXY:-localhost,127.0.0.1,${MASTER_ADDR}${ALL_WORKER_HOSTS:+,${ALL_WORKER_HOSTS}}}"
+TAU2_USER_LLM_HOST="$(printf '%s\n' "${TAU2_USER_LLM_API_BASE}" | sed -E 's#https?://([^/:]+).*#\1#')"
+DEFAULT_NO_PROXY="localhost,127.0.0.1,${MASTER_ADDR}${ALL_WORKER_HOSTS:+,${ALL_WORKER_HOSTS}}"
+if [[ -n "${TAU2_USER_LLM_HOST}" && "${TAU2_USER_LLM_HOST}" != "${TAU2_USER_LLM_API_BASE}" ]]; then
+  DEFAULT_NO_PROXY="${DEFAULT_NO_PROXY},${TAU2_USER_LLM_HOST}"
+fi
+export NO_PROXY="${NO_PROXY:-${DEFAULT_NO_PROXY}}"
 export no_proxy="${NO_PROXY}"
 
 # Router uses `python3` which, after the PATH export above, resolves to
@@ -1203,6 +1242,7 @@ RUNTIME_ENV_JSON="{
     \"NCCL_NVLS_ENABLE\": \"${HAS_NVLINK}\",
     \"MASTER_ADDR\": \"${MASTER_ADDR}\",
     \"PYTORCH_CUDA_ALLOC_CONF\": \"${PYTORCH_CUDA_ALLOC_CONF}\",
+    \"LD_LIBRARY_PATH\": \"${LD_LIBRARY_PATH:-}\",
     \"USE_REMOTE_ENV\": \"${USE_REMOTE_ENV}\",
     \"ENV_SERVER_URL\": \"${ENV_SERVER_URL}\",
     \"AGENT_SAFETYBENCH_REMOTE_ENV\": \"${AGENT_SAFETYBENCH_REMOTE_ENV}\",
@@ -1229,6 +1269,10 @@ RUNTIME_ENV_JSON="{
     \"TERMINAL_STRUCTURED_METRICS\": \"${TERMINAL_STRUCTURED_METRICS}\",
     \"TERMINAL_METRICS_JSONL\": \"${TERMINAL_METRICS_JSONL}\",
     \"DATASET\": \"${DATASET}\",
+    \"TAU2_USER_LLM\": \"${TAU2_USER_LLM}\",
+    \"TAU2_USER_LLM_API_BASE\": \"${TAU2_USER_LLM_API_BASE}\",
+    \"VLLM_API_KEY\": \"${VLLM_API_KEY}\",
+    \"SGLANG_REQUEST_TIMEOUT\": \"${SGLANG_REQUEST_TIMEOUT}\",
     \"ALGO\": \"${ALGO}\",
     \"DAPO_OVERLONG_BUFFER_ENABLE\": \"${DAPO_OVERLONG_BUFFER_ENABLE}\",
     \"DAPO_OVERLONG_BUFFER_LEN\": \"${DAPO_OVERLONG_BUFFER_LEN}\",
