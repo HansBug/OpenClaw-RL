@@ -54,8 +54,19 @@ class DockerImageBuildError(RuntimeError):
     """Deterministic task image build failure cached per task image."""
 
 
+class DockerImagePreparationBacklogError(RuntimeError):
+    """Transient image preparation backlog/cancellation before a build starts."""
+
+
 class TaskImageBlacklistedError(DockerImageBuildError):
     """Task image is known-bad and should not hit Docker again until TTL expires."""
+
+
+_BUILD_STATE_GUARD = threading.Lock()
+_BUILD_ACTIVE = 0
+_BUILD_WAITING = 0
+_BUILD_BACKLOG_REJECTED = 0
+_BUILD_CANCELLED = 0
 
 
 def _safe_project_component(value: str, fallback: str = "task") -> str:
@@ -153,6 +164,102 @@ def _env_bool(name: str, default: bool) -> bool:
     if raw is None:
         return default
     return raw.strip().lower() not in {"0", "false", "no", "off"}
+
+
+def _env_float(name: str, default: float) -> float:
+    raw = os.getenv(name)
+    if raw is None or raw == "":
+        return default
+    try:
+        value = float(raw)
+    except ValueError:
+        return default
+    return value if value >= 0 else default
+
+
+def docker_image_build_status() -> dict[str, int]:
+    with _BUILD_STATE_GUARD:
+        return {
+            "max_concurrent_builds": _MAX_CONCURRENT_BUILDS,
+            "active": _BUILD_ACTIVE,
+            "waiting": _BUILD_WAITING,
+            "backlog_rejected": _BUILD_BACKLOG_REJECTED,
+            "cancelled_before_build": _BUILD_CANCELLED,
+            "cached_done": len(_BUILD_DONE),
+            "cached_failed": len(_BUILD_FAILED),
+            "blacklisted": len(_TASK_IMAGE_BLACKLISTED),
+        }
+
+
+def _record_build_waiting(delta: int) -> None:
+    global _BUILD_WAITING
+    with _BUILD_STATE_GUARD:
+        _BUILD_WAITING = max(0, _BUILD_WAITING + delta)
+
+
+def _record_build_active(delta: int) -> None:
+    global _BUILD_ACTIVE
+    with _BUILD_STATE_GUARD:
+        _BUILD_ACTIVE = max(0, _BUILD_ACTIVE + delta)
+
+
+def _record_build_backlog_rejected() -> None:
+    global _BUILD_BACKLOG_REJECTED
+    with _BUILD_STATE_GUARD:
+        _BUILD_BACKLOG_REJECTED += 1
+
+
+def _record_build_cancelled() -> None:
+    global _BUILD_CANCELLED
+    with _BUILD_STATE_GUARD:
+        _BUILD_CANCELLED += 1
+
+
+def _cancel_event_is_set(cancel_event: threading.Event | None) -> bool:
+    return cancel_event is not None and cancel_event.is_set()
+
+
+def _raise_if_cancelled(
+    cancel_event: threading.Event | None, *, build_key: str, stage: str
+) -> None:
+    if _cancel_event_is_set(cancel_event):
+        _record_build_cancelled()
+        raise DockerImagePreparationBacklogError(
+            f"DOCKER_IMAGE_PREP_CANCELLED image={build_key} stage={stage}"
+        )
+
+
+def _acquire_build_gate(
+    gate: threading.Lock | threading.BoundedSemaphore,
+    *,
+    build_key: str,
+    label: str,
+    deadline: float | None,
+    cancel_event: threading.Event | None,
+) -> None:
+    poll = max(0.05, min(1.0, _env_float("WORKER_DOCKER_BUILD_QUEUE_POLL", 0.5)))
+    _record_build_waiting(1)
+    try:
+        while True:
+            _raise_if_cancelled(cancel_event, build_key=build_key, stage=f"wait_{label}")
+            timeout = poll
+            if deadline is not None:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    _record_build_backlog_rejected()
+                    raise DockerImagePreparationBacklogError(
+                        f"DOCKER_IMAGE_PREP_BACKLOG image={build_key} "
+                        f"waiting_for={label} timeout={_build_queue_timeout():.1f}s"
+                    )
+                timeout = min(timeout, remaining)
+            if gate.acquire(timeout=timeout):
+                return
+    finally:
+        _record_build_waiting(-1)
+
+
+def _build_queue_timeout() -> float:
+    return _env_float("WORKER_DOCKER_BUILD_QUEUE_TIMEOUT", 90.0)
 
 
 def _build_failed_ttl() -> float:
@@ -279,7 +386,12 @@ def _lock_for_build_key(key: str) -> threading.Lock:
         return lock
 
 
-def build_docker_image(task: dict[str, Any], timeout: float = 1200.0) -> None:
+def build_docker_image(
+    task: dict[str, Any],
+    timeout: float = 1200.0,
+    *,
+    cancel_event: threading.Event | None = None,
+) -> None:
     dataset_dir = str(os.getenv("DATASET_DIR", "")).strip()
     if not dataset_dir:
         raise ValueError("DATASET_DIR is required")
@@ -306,8 +418,22 @@ def build_docker_image(task: dict[str, Any], timeout: float = 1200.0) -> None:
     build_dedup = _env_bool("WORKER_DOCKER_BUILD_DEDUP", True)
     skip_existing = _env_bool("WORKER_DOCKER_BUILD_SKIP_EXISTING", True)
     build_lock = _lock_for_build_key(build_key) if build_dedup else threading.Lock()
+    queue_timeout = _build_queue_timeout()
+    deadline = time.monotonic() + queue_timeout if queue_timeout > 0 else None
+    build_lock_acquired = False
+    build_semaphore_acquired = False
 
-    with build_lock:
+    _raise_if_cancelled(cancel_event, build_key=build_key, stage="before_lock")
+    _acquire_build_gate(
+        build_lock,
+        build_key=build_key,
+        label="image_lock",
+        deadline=deadline,
+        cancel_event=cancel_event,
+    )
+    build_lock_acquired = True
+    try:
+        _raise_if_cancelled(cancel_event, build_key=build_key, stage="after_lock")
         if build_key in _BUILD_DONE:
             return
         blacklisted_failure = _cached_task_image_blacklist(build_key)
@@ -337,7 +463,17 @@ def build_docker_image(task: dict[str, Any], timeout: float = 1200.0) -> None:
                 f"TASK_IMAGE_BLACKLISTED image={build_key}: {message}"
             )
 
-        with _BUILD_SEMAPHORE:
+        _acquire_build_gate(
+            _BUILD_SEMAPHORE,
+            build_key=build_key,
+            label="global_build_semaphore",
+            deadline=deadline,
+            cancel_event=cancel_event,
+        )
+        build_semaphore_acquired = True
+        _record_build_active(1)
+        try:
+            _raise_if_cancelled(cancel_event, build_key=build_key, stage="before_build")
             import inspect
 
             logger.info("Building Docker image for task=%s image=%s", task_name, build_key)
@@ -357,6 +493,13 @@ def build_docker_image(task: dict[str, Any], timeout: float = 1200.0) -> None:
             _BUILD_DONE.add(build_key)
             _BUILD_FAILED.pop(build_key, None)
             _TASK_IMAGE_BLACKLISTED.pop(build_key, None)
+        finally:
+            _record_build_active(-1)
+            if build_semaphore_acquired:
+                _BUILD_SEMAPHORE.release()
+    finally:
+        if build_lock_acquired:
+            build_lock.release()
 
 
 def _resolve_pull_image(task: dict[str, Any]) -> str:
@@ -426,18 +569,23 @@ def pull_docker_image(image: str, timeout: float = 1200.0) -> None:
 def prepare_task_docker_image(
     task: dict[str, Any],
     timeout: float = 1200.0,
+    *,
+    cancel_event: threading.Event | None = None,
 ) -> ImagePreparationResult:
     raw_mode = str(os.getenv("TBENCH_DOCKER_IMAGE_SOURCE", "")).strip().lower()
     if not raw_mode:
         raise ValueError("TBENCH_DOCKER_IMAGE_SOURCE is required")
 
     if raw_mode in {"build", "docker_build"}:
-        build_docker_image(task=task, timeout=timeout)
+        build_docker_image(task=task, timeout=timeout, cancel_event=cancel_event)
         return ImagePreparationResult(mode="build", client_image_name=None)
 
     if raw_mode in {"pull", "docker_pull"}:
+        task_name = str(task.get("task_name") or task.get("task_path") or "unknown")
+        _raise_if_cancelled(cancel_event, build_key=task_name, stage="before_pull")
         image = _resolve_pull_image(task=task)
         pull_docker_image(image=image, timeout=timeout)
+        _raise_if_cancelled(cancel_event, build_key=image, stage="after_pull")
         return ImagePreparationResult(mode="pull", client_image_name=image)
 
     raise ValueError(

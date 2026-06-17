@@ -24,7 +24,12 @@ from .terminal_env import (
     TerminalEnv,
     force_remove_orphan_docker_objects,
 )
-from .docker_compose_utils import DockerImageBuildError, TaskImageBlacklistedError
+from .docker_compose_utils import (
+    DockerImageBuildError,
+    DockerImagePreparationBacklogError,
+    TaskImageBlacklistedError,
+    docker_image_build_status,
+)
 
 logger = logging.getLogger("terminal.env.worker")
 app = FastAPI()
@@ -131,6 +136,17 @@ class ResetInProgressError(Exception):
         self.request_id = request_id
         super().__init__(
             f"Run {run_lease_id} already has a different reset in progress"
+        )
+
+
+class ResetAdmissionBacklogError(Exception):
+    def __init__(self, run_lease_id: str, timeout: float, max_concurrent: int):
+        self.run_lease_id = run_lease_id
+        self.timeout = timeout
+        self.max_concurrent = max_concurrent
+        super().__init__(
+            f"WORKER_RESET_ADMISSION_BACKLOG lease_id={run_lease_id} "
+            f"timeout={timeout:.1f}s max_concurrent_resets={max_concurrent}"
         )
 
 
@@ -764,6 +780,13 @@ class WorkerPool:
         self._lock = asyncio.Lock()
 
         self._close_sem = asyncio.Semaphore(max_concurrent_closes)
+        self.max_concurrent_resets = _env_int("WORKER_MAX_CONCURRENT_RESETS", 16)
+        self.reset_admission_timeout = _env_float("WORKER_RESET_ADMISSION_TIMEOUT", 30.0)
+        self._reset_admission_sem = asyncio.BoundedSemaphore(
+            max(1, self.max_concurrent_resets)
+        )
+        self._reset_admission_waiting = 0
+        self._reset_admission_rejected = 0
         self._closing_tasks: set[asyncio.Task] = set()
         self._closing_task_started: dict[asyncio.Task, float] = {}
         self._closing_task_labels: dict[asyncio.Task, str] = {}
@@ -1466,6 +1489,32 @@ class WorkerPool:
                 reason=f"reset_timeout:{timeout:.1f}s",
             )
 
+    async def _acquire_reset_admission(self, run_lease_id: str) -> None:
+        timeout = max(0.0, self.reset_admission_timeout)
+        async with self._lock:
+            self._reset_admission_waiting += 1
+        try:
+            try:
+                if timeout > 0:
+                    await asyncio.wait_for(
+                        self._reset_admission_sem.acquire(), timeout=timeout
+                    )
+                else:
+                    await self._reset_admission_sem.acquire()
+            except asyncio.TimeoutError as exc:
+                async with self._lock:
+                    self._reset_admission_rejected += 1
+                raise ResetAdmissionBacklogError(
+                    run_lease_id,
+                    timeout,
+                    self.max_concurrent_resets,
+                ) from exc
+        finally:
+            async with self._lock:
+                self._reset_admission_waiting = max(
+                    0, self._reset_admission_waiting - 1
+                )
+
     async def _run_reset_once(
         self,
         run_lease_id: str,
@@ -1473,8 +1522,6 @@ class WorkerPool:
         run_ctx_payload: dict[str, Any] | None,
         task_timeouts: dict[str, Any] | None,
     ) -> dict[str, Any]:
-        run_slot = await self._begin_run_op(run_lease_id, "reset")
-
         run_ctx = _build_run_ctx(
             run_ctx_payload, default_log_dir=self.output_root / "AgentRunner_Output"
         )
@@ -1490,6 +1537,8 @@ class WorkerPool:
         is_timeout_drop = False
         success = False
         reset_task: asyncio.Task[tuple[str, list[dict[str, Any]]]] | None = None
+        run_slot: RunSlot | None = None
+        reset_admission_acquired = False
 
         def _consume_cancelled_reset_task(task: asyncio.Task[Any]) -> None:
             try:
@@ -1500,6 +1549,9 @@ class WorkerPool:
                 pass
 
         try:
+            await self._acquire_reset_admission(run_lease_id)
+            reset_admission_acquired = True
+            run_slot = await self._begin_run_op(run_lease_id, "reset")
             async with run_slot.lock:
                 reset_task = asyncio.create_task(
                     run_slot.env.reset(
@@ -1544,12 +1596,15 @@ class WorkerPool:
             if not success and reset_task is not None and not reset_task.done():
                 reset_task.cancel()
                 reset_task.add_done_callback(_consume_cancelled_reset_task)
-            await self._finish_run_op(
-                run_slot,
-                "reset",
-                success=success,
-                is_timeout_drop=is_timeout_drop,
-            )
+            if run_slot is not None:
+                await self._finish_run_op(
+                    run_slot,
+                    "reset",
+                    success=success,
+                    is_timeout_drop=is_timeout_drop,
+                )
+            if reset_admission_acquired:
+                self._reset_admission_sem.release()
 
     async def reset(
         self,
@@ -1564,6 +1619,15 @@ class WorkerPool:
 
         request_id = str(request_id or "")
         future: asyncio.Task
+
+        def _consume_reset_future_exception(task: asyncio.Task[Any]) -> None:
+            try:
+                task.exception()
+            except asyncio.CancelledError:
+                pass
+            except Exception:
+                pass
+
         async with self._lock:
             run_slot = self._get_run_slot(run_lease_id)
             existing = run_slot.reset_future
@@ -1602,6 +1666,18 @@ class WorkerPool:
         try:
             result = await asyncio.shield(future)
         except asyncio.CancelledError as exc:
+            if not future.done():
+                future.cancel()
+                future.add_done_callback(_consume_reset_future_exception)
+            async with self._lock:
+                try:
+                    run_slot = self._get_run_slot(run_lease_id)
+                except KeyError:
+                    pass
+                else:
+                    if run_slot.reset_future is future:
+                        run_slot.reset_future = None
+                        run_slot.reset_result = None
             raise TimeoutError(
                 f"WORKER_RESET_CANCELLED lease_id={run_lease_id} request_id={request_id}"
             ) from exc
@@ -1843,6 +1919,14 @@ class WorkerPool:
                 "closing_requested_runs": closing_requested_runs,
                 "pending_closes": len(self._closing_tasks),
                 "pending_force_cleanups": len(self._force_cleanup_tasks),
+                "reset_admission": {
+                    "max_concurrent": self.max_concurrent_resets,
+                    "available": int(getattr(self._reset_admission_sem, "_value", 0)),
+                    "waiting": self._reset_admission_waiting,
+                    "rejected": self._reset_admission_rejected,
+                    "timeout": self.reset_admission_timeout,
+                },
+                "docker_image_build": docker_image_build_status(),
                 "close_queue_timeout": self.close_queue_timeout,
                 "close_session_timeout": self.close_session_timeout,
                 "close_task_timeout": self.close_task_timeout,
@@ -2744,6 +2828,48 @@ async def probe_rollout(request: Request) -> JSONResponse:
             },
             status_code=503,
         )
+    except ResetAdmissionBacklogError as exc:
+        logger.warning(
+            "Rollout probe deferred by reset admission backlog lease_id=%s "
+            "task_key=%s: %s",
+            lease_id,
+            task_key,
+            exc,
+        )
+        return JSONResponse(
+            {
+                "ok": False,
+                "code": "WORKER_RESET_ADMISSION_BACKLOG",
+                "error": str(exc),
+                "task_name": task_meta.get("task_name"),
+                "task_path": task_meta.get("task_path"),
+                "duration_sec": round(time.time() - started_ts, 3),
+            },
+            status_code=503,
+            headers={"Retry-After": os.getenv("WORKER_RESET_BACKLOG_RETRY_AFTER", "10")},
+        )
+    except DockerImagePreparationBacklogError as exc:
+        logger.warning(
+            "Rollout probe deferred by Docker image preparation backlog lease_id=%s "
+            "task_key=%s: %s",
+            lease_id,
+            task_key,
+            exc,
+        )
+        return JSONResponse(
+            {
+                "ok": False,
+                "code": "DOCKER_IMAGE_PREP_BACKLOG",
+                "error": str(exc),
+                "task_name": task_meta.get("task_name"),
+                "task_path": task_meta.get("task_path"),
+                "duration_sec": round(time.time() - started_ts, 3),
+            },
+            status_code=503,
+            headers={
+                "Retry-After": os.getenv("WORKER_DOCKER_BUILD_BACKLOG_RETRY_AFTER", "15")
+            },
+        )
     except TaskImageBlacklistedError as exc:
         logger.warning(
             "Rollout probe blocked by task image blacklist lease_id=%s task_key=%s: %s",
@@ -2781,6 +2907,30 @@ async def probe_rollout(request: Request) -> JSONResponse:
             },
             status_code=503,
             headers={"Retry-After": os.getenv("WORKER_TASK_IMAGE_RETRY_AFTER", "300")},
+        )
+    except TimeoutError as exc:
+        message = str(exc)
+        code = "WORKER_RESET_TIMEOUT"
+        if "WORKER_RESET_CANCELLED" in message:
+            code = "WORKER_RESET_CANCELLED"
+        logger.warning(
+            "Rollout probe ended with transient worker timeout lease_id=%s "
+            "task_key=%s: %s",
+            lease_id,
+            task_key,
+            exc,
+        )
+        return JSONResponse(
+            {
+                "ok": False,
+                "code": code,
+                "error": message,
+                "task_name": task_meta.get("task_name"),
+                "task_path": task_meta.get("task_path"),
+                "duration_sec": round(time.time() - started_ts, 3),
+            },
+            status_code=503,
+            headers={"Retry-After": os.getenv("WORKER_RESET_TIMEOUT_RETRY_AFTER", "15")},
         )
     except Exception as exc:
         logger.exception(
@@ -3161,6 +3311,46 @@ async def reset(request: Request) -> JSONResponse:
             status_code=503,
             headers={"Retry-After": os.getenv("WORKER_PRESSURE_RETRY_AFTER", "10")},
         )
+    except ResetAdmissionBacklogError as exc:
+        logger.warning("Reset deferred by reset admission backlog lease_id=%s: %s", lease_id, exc)
+        try:
+            await POOL.close_run(str(lease_id), reason="reset_admission_backlog")
+        except Exception:
+            logger.exception("Failed to schedule cleanup after reset backlog for %s", lease_id)
+        return JSONResponse(
+            {
+                "ok": False,
+                "error": str(exc),
+                "code": "WORKER_RESET_ADMISSION_BACKLOG",
+                "task_name": task_meta.get("task_name"),
+                "task_path": task_meta.get("task_path"),
+            },
+            status_code=503,
+            headers={"Retry-After": os.getenv("WORKER_RESET_BACKLOG_RETRY_AFTER", "10")},
+        )
+    except DockerImagePreparationBacklogError as exc:
+        logger.warning(
+            "Reset deferred by Docker image preparation backlog lease_id=%s: %s",
+            lease_id,
+            exc,
+        )
+        try:
+            await POOL.close_run(str(lease_id), reason="docker_image_prep_backlog")
+        except Exception:
+            logger.exception("Failed to schedule cleanup after image prep backlog for %s", lease_id)
+        return JSONResponse(
+            {
+                "ok": False,
+                "error": str(exc),
+                "code": "DOCKER_IMAGE_PREP_BACKLOG",
+                "task_name": task_meta.get("task_name"),
+                "task_path": task_meta.get("task_path"),
+            },
+            status_code=503,
+            headers={
+                "Retry-After": os.getenv("WORKER_DOCKER_BUILD_BACKLOG_RETRY_AFTER", "15")
+            },
+        )
     except TaskImageBlacklistedError as exc:
         logger.warning("Reset blocked by task image blacklist lease_id=%s: %s", lease_id, exc)
         try:
@@ -3221,6 +3411,27 @@ async def reset(request: Request) -> JSONResponse:
                 "code": "LEASE_EXPIRED",
             },
             status_code=410,
+        )
+    except TimeoutError as exc:
+        message = str(exc)
+        code = "WORKER_RESET_TIMEOUT"
+        if "WORKER_RESET_CANCELLED" in message:
+            code = "WORKER_RESET_CANCELLED"
+        logger.warning("Reset ended with transient worker timeout lease_id=%s: %s", lease_id, exc)
+        try:
+            await POOL.close_run(str(lease_id), reason=code.lower())
+        except Exception:
+            logger.exception("Failed to schedule cleanup after reset timeout for %s", lease_id)
+        return JSONResponse(
+            {
+                "ok": False,
+                "error": message,
+                "code": code,
+                "task_name": task_meta.get("task_name"),
+                "task_path": task_meta.get("task_path"),
+            },
+            status_code=503,
+            headers={"Retry-After": os.getenv("WORKER_RESET_TIMEOUT_RETRY_AFTER", "15")},
         )
     except Exception as exc:
         logger.exception("Reset failed for lease_id=%s", lease_id)
