@@ -12,7 +12,7 @@
 #   * Structured logs at logs/<run_name>/{train.log,router.log,run_config.json}
 #
 # Prerequisites:
-#   1. Pool server running on worker 100.100.66.51:18081:
+#   1. Pool server running on worker 100.100.66.216:18081:
 #        bash terminal-rl/remote/run_pool_server_pu_v2.sh
 #
 # Usage:
@@ -75,7 +75,7 @@ SAVE_CKPT="${SAVE_CKPT:-}"
 RESUME_LOAD="${RESUME_LOAD:-}"
 # Keep full rollout artifacts for smoke-run inspection.
 TRAJECTORY_SAVE_INTERVAL="${TRAJECTORY_SAVE_INTERVAL:-1}"
-WORKER_URLS="${WORKER_URLS:-http://100.100.66.51:18081}"
+WORKER_URLS="${WORKER_URLS:-http://100.100.66.216:18081}"
 NO_PROXY="${NO_PROXY:-}"
 no_proxy="${no_proxy:-}"
 WANDB_KEY="${WANDB_KEY:-}"
