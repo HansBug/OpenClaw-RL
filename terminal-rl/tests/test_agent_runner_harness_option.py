@@ -22,6 +22,8 @@ def test_normalize_harness_option_aliases():
     assert normalize_harness_option("camel_agent") == "camel-agent"
     assert normalize_harness_option("a3s-code") == "a3s-code"
     assert normalize_harness_option("a3s_code") == "a3s-code"
+    assert normalize_harness_option("claude_code") == "claude-code"
+    assert normalize_harness_option("claude-code") == "claude-code"
 
 
 def test_create_agent_runner_keeps_camel_agent_env_optional(monkeypatch):
@@ -64,6 +66,50 @@ def test_create_agent_runner_keeps_camel_agent_env_optional(monkeypatch):
         lease_id=None,
     )
     assert isinstance(runner, AgentRunner)
+
+
+def test_create_agent_runner_routes_claude_code(monkeypatch):
+    class FakeClaudeCodeAgent:
+        parse_error_count = 0
+
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+
+        def set_max_parse_errors(self, max_parse_errors):
+            self.max_parse_errors = max_parse_errors
+
+        def start_turn_loop(self, input_message):
+            self.input_message = input_message
+
+        async def get_turn_context(self):
+            return [], None
+
+        async def consume_completion(self, chat_completion):
+            return chat_completion, [], False, None
+
+        def record_tool_result(self, tool_call_request, raw_result):
+            pass
+
+        def finalize_response(self, model_response):
+            return model_response
+
+    fake_module = types.ModuleType("agent.claude_code_agent")
+    fake_module.ClaudeCodeAgent = FakeClaudeCodeAgent
+    monkeypatch.setitem(sys.modules, "agent.claude_code_agent", fake_module)
+
+    runner = create_agent_runner(
+        agent_type="claude_code",
+        sglang_client=object(),
+        model_type="Qwen3",
+        tool_schemas=[],
+        non_think_mode=True,
+        max_total_tokens=1024,
+        env_client=object(),
+        lease_id="lease-1",
+        task_meta={"task_name": "task"},
+    )
+    assert isinstance(runner, AgentRunner)
+    assert runner._rollout_agent.kwargs["lease_id"] == "lease-1"
 
 
 def test_agent_runner_prefers_custom_run_model_turn():

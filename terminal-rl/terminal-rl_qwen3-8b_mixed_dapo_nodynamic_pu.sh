@@ -125,8 +125,11 @@ case "${HARNESS_OPTION}" in
   a3s-code|a3s_code)
     HARNESS_OPTION="a3s-code"
     ;;
+  claude-code|claude_code)
+    HARNESS_OPTION="claude-code"
+    ;;
   *)
-    echo "[ERROR] Unknown HARNESS_OPTION=${HARNESS_OPTION}. Use: camel-agent|a3s-code"
+    echo "[ERROR] Unknown HARNESS_OPTION=${HARNESS_OPTION}. Use: camel-agent|a3s-code|claude_code"
     exit 1
     ;;
 esac
@@ -379,6 +382,54 @@ A3S_CODE_THINKING_BUDGET="${A3S_CODE_THINKING_BUDGET:-}"
 A3S_CODE_EXTERNAL_TOOL_ERRORS_AS_RESULTS="${A3S_CODE_EXTERNAL_TOOL_ERRORS_AS_RESULTS:-1}"
 A3S_CODE_LOCAL_WORKSPACE_GUARD="${A3S_CODE_LOCAL_WORKSPACE_GUARD:-1}"
 A3S_CODE_PIP_PACKAGE="${A3S_CODE_PIP_PACKAGE:-a3s-code==3.3.0}"
+CLAUDE_CODE_XTRACE_WAS_ON=0
+if [[ "${HARNESS_OPTION}" == "claude-code" && "$-" == *x* ]]; then
+  CLAUDE_CODE_XTRACE_WAS_ON=1
+  set +x
+fi
+CLAUDE_CODE_CLI="${CLAUDE_CODE_CLI:-claude}"
+CLAUDE_CODE_LLM_BACKEND="${CLAUDE_CODE_LLM_BACKEND:-sglang}"
+case "${CLAUDE_CODE_LLM_BACKEND}" in
+  sglang|qwen|qwen-sglang|local|local-sglang)
+    CLAUDE_CODE_LLM_BACKEND="sglang"
+    ;;
+  anthropic|claude|claude-api|external)
+    CLAUDE_CODE_LLM_BACKEND="anthropic"
+    ;;
+  *)
+    echo "[ERROR] Unknown CLAUDE_CODE_LLM_BACKEND=${CLAUDE_CODE_LLM_BACKEND}. Use: sglang|anthropic" >&2
+    exit 1
+    ;;
+esac
+CLAUDE_CODE_MODEL="${CLAUDE_CODE_MODEL:-}"
+CLAUDE_CODE_QWEN_GATEWAY_MODEL="${CLAUDE_CODE_QWEN_GATEWAY_MODEL:-qwen-8b-sglang}"
+CLAUDE_CODE_WORKSPACE_ROOT="${CLAUDE_CODE_WORKSPACE_ROOT:-${RUN_DIR}/claude_code_workspaces}"
+CLAUDE_CODE_TURN_TIMEOUT_SEC="${CLAUDE_CODE_TURN_TIMEOUT_SEC:-900}"
+CLAUDE_CODE_TOOL_TIMEOUT_MS="${CLAUDE_CODE_TOOL_TIMEOUT_MS:-300000}"
+CLAUDE_CODE_MAX_TOOL_ROUNDS="${CLAUDE_CODE_MAX_TOOL_ROUNDS:-10}"
+CLAUDE_CODE_OUTPUT_FORMAT="${CLAUDE_CODE_OUTPUT_FORMAT:-json}"
+CLAUDE_CODE_PERMISSION_MODE="${CLAUDE_CODE_PERMISSION_MODE:-bypassPermissions}"
+CLAUDE_CODE_ALLOWED_TOOLS="${CLAUDE_CODE_ALLOWED_TOOLS:-mcp__terminal_rl__shell_exec,mcp__terminal_rl__shell_view,mcp__terminal_rl__shell_write_to_process,mcp__terminal_rl__shell_write_content_to_file}"
+CLAUDE_CODE_DISALLOWED_TOOLS="${CLAUDE_CODE_DISALLOWED_TOOLS:-}"
+CLAUDE_CODE_EXTRA_ARGS="${CLAUDE_CODE_EXTRA_ARGS:-}"
+CLAUDE_CODE_SYSTEM_PROMPT="${CLAUDE_CODE_SYSTEM_PROMPT:-}"
+CLAUDE_CODE_MCP_PYTHON="${CLAUDE_CODE_MCP_PYTHON:-${TRAIN_PYTHON}}"
+CLAUDE_CODE_HTTP_MAX_RETRIES="${CLAUDE_CODE_HTTP_MAX_RETRIES:-3}"
+CLAUDE_CODE_HTTP_RETRY_DELAY="${CLAUDE_CODE_HTTP_RETRY_DELAY:-1.0}"
+if [[ -z "${CLAUDE_CODE_MARK_NON_TRAINABLE+x}" ]]; then
+  if [[ "${CLAUDE_CODE_LLM_BACKEND}" == "sglang" ]]; then
+    CLAUDE_CODE_MARK_NON_TRAINABLE="0"
+  else
+    CLAUDE_CODE_MARK_NON_TRAINABLE="1"
+  fi
+fi
+ANTHROPIC_API_KEY="${ANTHROPIC_API_KEY:-}"
+ANTHROPIC_AUTH_TOKEN="${ANTHROPIC_AUTH_TOKEN:-}"
+ANTHROPIC_BASE_URL="${ANTHROPIC_BASE_URL:-}"
+ANTHROPIC_API_URL="${ANTHROPIC_API_URL:-}"
+if [[ "${CLAUDE_CODE_XTRACE_WAS_ON}" == "1" ]]; then
+  set -x
+fi
 ENV_HTTP_MAX_RETRIES="${ENV_HTTP_MAX_RETRIES:-10}"
 ENV_ALLOCATE_MAX_RETRIES="${ENV_ALLOCATE_MAX_RETRIES:-20}"
 ENV_ALLOCATE_RETRY_BASE_DELAY="${ENV_ALLOCATE_RETRY_BASE_DELAY:-2.0}"
@@ -417,6 +468,24 @@ a3s_code_print_cache_hint() {
   echo "[ERROR] Then retry on the GPU worker with the same A3S_CODE_CACHE_DIR."
   echo "[ERROR] Expected native cache under: ${A3S_CODE_CACHE_DIR}/3.3.0/_native.*"
   echo "[ERROR] Import log: ${RUN_LOG_DIR}/a3s_code_import_check.log"
+}
+
+claude_code_preflight() {
+  mkdir -p "${RUN_LOG_DIR}"
+  if ! command -v "${CLAUDE_CODE_CLI}" >/dev/null 2>&1; then
+    echo "[ERROR] HARNESS_OPTION=claude-code but CLAUDE_CODE_CLI=${CLAUDE_CODE_CLI} is not on PATH."
+    echo "[ERROR] Install Claude Code CLI or set CLAUDE_CODE_CLI=/absolute/path/to/claude."
+    return 1
+  fi
+  if ! "${CLAUDE_CODE_MCP_PYTHON}" -c "import mcp.server.fastmcp" > "${RUN_LOG_DIR}/claude_code_mcp_import_check.log" 2>&1; then
+    echo "[ERROR] HARNESS_OPTION=claude-code but Python cannot import mcp.server.fastmcp."
+    echo "[ERROR] Set CLAUDE_CODE_MCP_PYTHON to a Python with the mcp package installed."
+    echo "[ERROR] Import log: ${RUN_LOG_DIR}/claude_code_mcp_import_check.log"
+    return 1
+  fi
+  if [[ "${CLAUDE_CODE_LLM_BACKEND}" != "sglang" && -z "${ANTHROPIC_API_KEY}${ANTHROPIC_AUTH_TOKEN}" ]]; then
+    echo "[WARN] claude-code auth env vars are empty. This is OK only if the Claude Code CLI is already authenticated via its own config."
+  fi
 }
 
 # ── Rollout knobs (env-configurable, baked into per-run yaml below) ──────
@@ -533,6 +602,10 @@ if [[ "${HARNESS_OPTION}" == "a3s-code" && "${DRY_RUN}" != "1" ]]; then
       exit 1
     fi
   fi
+fi
+
+if [[ "${HARNESS_OPTION}" == "claude-code" && "${DRY_RUN}" != "1" ]]; then
+  claude_code_preflight
 fi
 
 # Symlinks for backward compatibility. Dry-run avoids touching stable repo links.
@@ -1745,6 +1818,18 @@ cat > "${RUN_DIR}/config/run_config.json" <<CFGEOF
   "a3s_code_planning_mode": "${A3S_CODE_PLANNING_MODE}",
   "a3s_code_external_tool_errors_as_results": "${A3S_CODE_EXTERNAL_TOOL_ERRORS_AS_RESULTS}",
   "a3s_code_local_workspace_guard": "${A3S_CODE_LOCAL_WORKSPACE_GUARD}",
+  "claude_code_cli": "${CLAUDE_CODE_CLI}",
+  "claude_code_llm_backend": "${CLAUDE_CODE_LLM_BACKEND}",
+  "claude_code_model": "${CLAUDE_CODE_MODEL}",
+  "claude_code_qwen_gateway_model": "${CLAUDE_CODE_QWEN_GATEWAY_MODEL}",
+  "claude_code_workspace_root": "${CLAUDE_CODE_WORKSPACE_ROOT}",
+  "claude_code_max_tool_rounds": "${CLAUDE_CODE_MAX_TOOL_ROUNDS}",
+  "claude_code_tool_timeout_ms": "${CLAUDE_CODE_TOOL_TIMEOUT_MS}",
+  "claude_code_turn_timeout_sec": "${CLAUDE_CODE_TURN_TIMEOUT_SEC}",
+  "claude_code_output_format": "${CLAUDE_CODE_OUTPUT_FORMAT}",
+  "claude_code_permission_mode": "${CLAUDE_CODE_PERMISSION_MODE}",
+  "claude_code_allowed_tools": "${CLAUDE_CODE_ALLOWED_TOOLS}",
+  "claude_code_mark_non_trainable": "${CLAUDE_CODE_MARK_NON_TRAINABLE}",
   "slime_ray_placement_gpu_probe": "${SLIME_RAY_PLACEMENT_GPU_PROBE}",
   "log_dir": "${RUN_LOG_DIR}"
 }
@@ -1778,6 +1863,12 @@ if [[ "${HARNESS_OPTION}" == "a3s-code" ]]; then
   RUNTIME_PYTHONPATH="${RUNTIME_PYTHONPATH}:${REPO_ROOT}/a3s-code-adapter"
 fi
 
+RUNTIME_ENV_XTRACE_WAS_ON=0
+if [[ "${HARNESS_OPTION}" == "claude-code" && "$-" == *x* ]]; then
+  RUNTIME_ENV_XTRACE_WAS_ON=1
+  set +x
+fi
+
 A3S_RUNTIME_ENV_JSON=""
 if [[ "${HARNESS_OPTION}" == "a3s-code" ]]; then
   A3S_RUNTIME_ENV_JSON=",
@@ -1794,7 +1885,34 @@ if [[ "${HARNESS_OPTION}" == "a3s-code" ]]; then
     \"A3S_CODE_PLANNING_MODE\": \"${A3S_CODE_PLANNING_MODE}\",
     \"A3S_CODE_THINKING_BUDGET\": \"${A3S_CODE_THINKING_BUDGET}\",
     \"A3S_CODE_EXTERNAL_TOOL_ERRORS_AS_RESULTS\": \"${A3S_CODE_EXTERNAL_TOOL_ERRORS_AS_RESULTS}\",
-    \"A3S_CODE_LOCAL_WORKSPACE_GUARD\": \"${A3S_CODE_LOCAL_WORKSPACE_GUARD}\""
+	    \"A3S_CODE_LOCAL_WORKSPACE_GUARD\": \"${A3S_CODE_LOCAL_WORKSPACE_GUARD}\""
+fi
+
+CLAUDE_RUNTIME_ENV_JSON=""
+if [[ "${HARNESS_OPTION}" == "claude-code" ]]; then
+  CLAUDE_RUNTIME_ENV_JSON=",
+    \"CLAUDE_CODE_CLI\": \"${CLAUDE_CODE_CLI}\",
+    \"CLAUDE_CODE_LLM_BACKEND\": \"${CLAUDE_CODE_LLM_BACKEND}\",
+    \"CLAUDE_CODE_MODEL\": \"${CLAUDE_CODE_MODEL}\",
+    \"CLAUDE_CODE_QWEN_GATEWAY_MODEL\": \"${CLAUDE_CODE_QWEN_GATEWAY_MODEL}\",
+    \"CLAUDE_CODE_WORKSPACE_ROOT\": \"${CLAUDE_CODE_WORKSPACE_ROOT}\",
+    \"CLAUDE_CODE_TURN_TIMEOUT_SEC\": \"${CLAUDE_CODE_TURN_TIMEOUT_SEC}\",
+    \"CLAUDE_CODE_TOOL_TIMEOUT_MS\": \"${CLAUDE_CODE_TOOL_TIMEOUT_MS}\",
+    \"CLAUDE_CODE_MAX_TOOL_ROUNDS\": \"${CLAUDE_CODE_MAX_TOOL_ROUNDS}\",
+    \"CLAUDE_CODE_OUTPUT_FORMAT\": \"${CLAUDE_CODE_OUTPUT_FORMAT}\",
+    \"CLAUDE_CODE_PERMISSION_MODE\": \"${CLAUDE_CODE_PERMISSION_MODE}\",
+    \"CLAUDE_CODE_ALLOWED_TOOLS\": \"${CLAUDE_CODE_ALLOWED_TOOLS}\",
+    \"CLAUDE_CODE_DISALLOWED_TOOLS\": \"${CLAUDE_CODE_DISALLOWED_TOOLS}\",
+    \"CLAUDE_CODE_EXTRA_ARGS\": \"${CLAUDE_CODE_EXTRA_ARGS}\",
+    \"CLAUDE_CODE_SYSTEM_PROMPT\": \"${CLAUDE_CODE_SYSTEM_PROMPT}\",
+    \"CLAUDE_CODE_MCP_PYTHON\": \"${CLAUDE_CODE_MCP_PYTHON}\",
+    \"CLAUDE_CODE_HTTP_MAX_RETRIES\": \"${CLAUDE_CODE_HTTP_MAX_RETRIES}\",
+    \"CLAUDE_CODE_HTTP_RETRY_DELAY\": \"${CLAUDE_CODE_HTTP_RETRY_DELAY}\",
+    \"CLAUDE_CODE_MARK_NON_TRAINABLE\": \"${CLAUDE_CODE_MARK_NON_TRAINABLE}\",
+    \"ANTHROPIC_API_KEY\": \"${ANTHROPIC_API_KEY}\",
+    \"ANTHROPIC_AUTH_TOKEN\": \"${ANTHROPIC_AUTH_TOKEN}\",
+    \"ANTHROPIC_BASE_URL\": \"${ANTHROPIC_BASE_URL}\",
+    \"ANTHROPIC_API_URL\": \"${ANTHROPIC_API_URL}\""
 fi
 
 RUNTIME_ENV_JSON="{
@@ -1988,8 +2106,13 @@ RUNTIME_ENV_JSON="{
     \"EXPLORE_RETRY_TRAJ_GAMMA\": \"${EXPLORE_RETRY_TRAJ_GAMMA}\",
     \"WANDB_MODE\": \"${WANDB_MODE:-offline}\"
     ${A3S_RUNTIME_ENV_JSON}
+    ${CLAUDE_RUNTIME_ENV_JSON}
   }
 }"
+
+if [[ "${RUNTIME_ENV_XTRACE_WAS_ON}" == "1" ]]; then
+  set -x
+fi
 
 RAY_JOB_SUBMISSION_ID="${RAY_JOB_SUBMISSION_ID:-terminal_rl_8b_${NUM_GPUS}gpu_$(date +%Y%m%d_%H%M%S)}"
 CASE_STUDY_ON_EXIT="${CASE_STUDY_ON_EXIT:-0}"
@@ -2016,12 +2139,20 @@ run_case_study_if_requested() {
 }
 
 log "Submitting Ray job ${RAY_JOB_SUBMISSION_ID}"
+RAY_SUBMIT_XTRACE_WAS_ON=0
+if [[ "${HARNESS_OPTION}" == "claude-code" && "$-" == *x* ]]; then
+  RAY_SUBMIT_XTRACE_WAS_ON=1
+  set +x
+fi
 ray job submit --address="http://${MASTER_ADDR}:8265" \
   --submission-id "${RAY_JOB_SUBMISSION_ID}" \
   --no-wait \
   --runtime-env-json="${RUNTIME_ENV_JSON}" \
   -- "${TRAIN_PYTHON}" -u "${SLIME_DIR}/train_async.py" \
   "${TRAIN_ARGS[@]}"
+if [[ "${RAY_SUBMIT_XTRACE_WAS_ON}" == "1" ]]; then
+  set -x
+fi
 
 set +e
 ray job logs --address="http://${MASTER_ADDR}:8265" "${RAY_JOB_SUBMISSION_ID}" -f --log-style=record

@@ -39,13 +39,17 @@ def normalize_harness_option(value: str | None) -> str:
         "a3s-code": "a3s-code",
         "a3s-code-agent": "a3s-code",
         "a3s-code-harness": "a3s-code",
+        "claude": "claude-code",
+        "claude-code": "claude-code",
+        "claude-code-cli": "claude-code",
+        "claude-code-harness": "claude-code",
     }
     try:
         return aliases[text]
     except KeyError as exc:
         raise ValueError(
             f"Unsupported harness option: {value!r}. "
-            "Expected one of: camel-agent, camel_agent, a3s-code."
+            "Expected one of: camel-agent, camel_agent, a3s-code, claude_code."
         ) from exc
 
 
@@ -201,6 +205,19 @@ def create_agent_runner(
         from agent.a3s_code_agent import A3SCodeAgent
 
         rollout_agent = A3SCodeAgent(
+            model_type=model_type,
+            sglang_client=sglang_client,
+            env_client=env_client,
+            lease_id=lease_id,
+            run_context=run_context,
+            task_meta=task_meta or {},
+            non_think_mode=non_think_mode,
+            max_total_tokens=max_total_tokens,
+        )
+    elif harness == "claude-code":
+        from agent.claude_code_agent import ClaudeCodeAgent
+
+        rollout_agent = ClaudeCodeAgent(
             model_type=model_type,
             sglang_client=sglang_client,
             env_client=env_client,

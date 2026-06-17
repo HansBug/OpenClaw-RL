@@ -3814,6 +3814,24 @@ async def generate(
             s.metadata["parse_error_count"] = agent_runner.parse_error_count
             s.metadata["data_source"] = data_source or s.metadata.get("data_source")
             s.metadata["safety_split"] = _safety_split_from_meta(task_meta)
+            claude_backend = str(os.getenv("CLAUDE_CODE_LLM_BACKEND", "sglang")).strip().lower()
+            claude_sglang_backend = claude_backend.replace("_", "-") in {
+                "sglang",
+                "qwen",
+                "qwen-sglang",
+                "local",
+                "local-sglang",
+            }
+            if agent_type == "claude-code" and _env_flag(
+                "CLAUDE_CODE_MARK_NON_TRAINABLE",
+                not claude_sglang_backend,
+            ):
+                s.remove_sample = True
+                s.metadata["non_trainable"] = True
+                s.metadata["non_trainable_reason"] = (
+                    "claude-code CLI uses an external model path without "
+                    "terminal-rl policy logprobs"
+                )
             if trajectory_uncertainty:
                 s.metadata["trajectory_uncertainty"] = trajectory_uncertainty
             turn_uncertainty = turn_uncertainty_by_idx.get(

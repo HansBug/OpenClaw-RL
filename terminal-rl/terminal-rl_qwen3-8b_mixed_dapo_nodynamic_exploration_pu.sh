@@ -136,8 +136,11 @@ case "${HARNESS_OPTION}" in
   a3s-code|a3s_code)
     HARNESS_OPTION="a3s-code"
     ;;
+  claude-code|claude_code)
+    HARNESS_OPTION="claude-code"
+    ;;
   *)
-    echo "[ERROR] Unknown HARNESS_OPTION=${HARNESS_OPTION}. Use: camel-agent|a3s-code" >&2
+    echo "[ERROR] Unknown HARNESS_OPTION=${HARNESS_OPTION}. Use: camel-agent|a3s-code|claude_code" >&2
     exit 1
     ;;
 esac
