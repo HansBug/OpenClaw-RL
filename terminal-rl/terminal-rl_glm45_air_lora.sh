@@ -534,11 +534,19 @@ GPU_TAIL_LOG="${TMP_DOC_ROOT}/gpu_tail.log"    # last ~300 lines (populated on f
 # Tee everything to both the run-specific file and tmp_doc copy. Keep dry-run
 # stdout direct so command validation remains visible even in minimal shells.
 if [[ "${DRY_RUN}" != "1" ]]; then
-  exec > >(tee -a "${RUN_LOG}" "${GPU_RUN_LOG}") 2>&1
+  TEE_LOGS=("${RUN_LOG}" "${GPU_RUN_LOG}")
+  if [[ -n "${RJOB_NODE_LOG_FILE:-}" ]]; then
+    mkdir -p "$(dirname "${RJOB_NODE_LOG_FILE}")"
+    TEE_LOGS+=("${RJOB_NODE_LOG_FILE}")
+  fi
+  exec > >(tee -a "${TEE_LOGS[@]}") 2>&1
 fi
 echo "========================================"
 echo "  Terminal-RL Run: ${RUN_NAME}"
 echo "  Log dir:  ${RUN_LOG_DIR}"
+if [[ -n "${RJOB_NODE_LOG_DIR:-}" ]]; then
+  echo "  Node logs: ${RJOB_NODE_LOG_DIR}"
+fi
 echo "  Metrics:  ${TERMINAL_METRICS_JSONL} (structured=${TERMINAL_STRUCTURED_METRICS})"
 echo "  Harness:  ${HARNESS_OPTION}"
 echo "  Ckpt:     ${SAVE_CKPT:-<disabled>}"
@@ -1001,6 +1009,7 @@ DAPO_DYNAMIC_SAMPLING="${DAPO_DYNAMIC_SAMPLING:-1}"
 DAPO_DYNAMIC_FILTER_PATH="${DAPO_DYNAMIC_FILTER_PATH:-slime.rollout.filter_hub.dynamic_sampling_filters.check_reward_nonzero_std}"
 DAPO_OVER_SAMPLING_BATCH_SIZE="${DAPO_OVER_SAMPLING_BATCH_SIZE:-${ROLLOUT_BATCH_SIZE}}"
 DAPO_GRPO_STD_NORMALIZATION="${DAPO_GRPO_STD_NORMALIZATION:-1}"
+DAPO_REWARDS_NORMALIZATION="${DAPO_REWARDS_NORMALIZATION:-0}"
 DAPO_OVERLONG_BUFFER_ENABLE="${DAPO_OVERLONG_BUFFER_ENABLE:-1}"
 DAPO_OVERLONG_BUFFER_LEN="${DAPO_OVERLONG_BUFFER_LEN:-4096}"
 DAPO_OVERLONG_PENALTY_FACTOR="${DAPO_OVERLONG_PENALTY_FACTOR:-1.0}"
@@ -1031,6 +1040,9 @@ fi
 if [[ "${DAPO_GRPO_STD_NORMALIZATION}" == "0" ]]; then
   DAPO_ARGS+=(--disable-grpo-std-normalization)
 fi
+if [[ "${DAPO_REWARDS_NORMALIZATION}" == "0" ]]; then
+  DAPO_ARGS+=(--disable-rewards-normalization)
+fi
 
 case "${ALGO}" in
   grpo)
@@ -1050,7 +1062,7 @@ fi
 log "Algorithm config: ALGO=${ALGO} args=${ALGO_ARGS[*]} extra=${ALGO_EXTRA_ARGS_ARRAY[*]:-<none>}"
 log "Exploration config: profile=${EXPLORATION_PROFILE} entropy=${EXPLORE_ENTROPY_COEF} intrinsic=${EXPLORE_INTRINSIC_ENABLED}/${EXPLORE_INTRINSIC} coef=${EXPLORE_INTRINSIC_COEF} schedule=${EXPLORE_INTRINSIC_SCHEDULE}/${EXPLORE_INTRINSIC_DECAY_STEPS} granularity=${EXPLORE_INTRINSIC_GRANULARITY} scope=${EXPLORE_INTRINSIC_SCOPE} safety_filter=${EXPLORE_SAFETY_FILTER_ENABLED}/${EXPLORE_SAFETY_FILTER} lprnd=${EXPLORE_LPRND_ENABLED}/${EXPLORE_LPRND} coef=${EXPLORE_LPRND_COEF} schedule=${EXPLORE_LPRND_SCHEDULE}/${EXPLORE_LPRND_DECAY_STEPS} cde_actor=${EXPLORE_CDE_ACTOR_ENABLED}/${EXPLORE_CDE_ACTOR} omega=${EXPLORE_CDE_ACTOR_OMEGA} alpha=${EXPLORE_CDE_ACTOR_ALPHA} kappa=${EXPLORE_CDE_ACTOR_KAPPA} gate=${EXPLORE_CDE_ACTOR_REWARD_GATE} decay_steps=${EXPLORE_CDE_ACTOR_DECAY_STEPS} post_norm_bonus=${EXPLORE_ADVANTAGE_BONUS_ENABLED}/${EXPLORE_ADVANTAGE_BONUS} components=${EXPLORE_ADVANTAGE_BONUS_COMPONENTS} coef=${EXPLORE_ADVANTAGE_BONUS_COEF} clip=${EXPLORE_ADVANTAGE_BONUS_CLIP}"
 if [[ "${ALGO}" == "dapo" ]]; then
-  log "DAPO knobs: clip_low=${DAPO_EPS_CLIP_LOW} clip_high=${DAPO_EPS_CLIP_HIGH} token_loss=${DAPO_CALCULATE_PER_TOKEN_LOSS} dynamic_sampling=${DAPO_DYNAMIC_SAMPLING} overlong=${DAPO_OVERLONG_BUFFER_ENABLE}/${DAPO_OVERLONG_BUFFER_LEN}/${DAPO_OVERLONG_PENALTY_FACTOR}"
+  log "DAPO knobs: clip_low=${DAPO_EPS_CLIP_LOW} clip_high=${DAPO_EPS_CLIP_HIGH} token_loss=${DAPO_CALCULATE_PER_TOKEN_LOSS} dynamic_sampling=${DAPO_DYNAMIC_SAMPLING} rewards_norm=${DAPO_REWARDS_NORMALIZATION} overlong=${DAPO_OVERLONG_BUFFER_ENABLE}/${DAPO_OVERLONG_BUFFER_LEN}/${DAPO_OVERLONG_PENALTY_FACTOR}"
 fi
 
 CLIP_GRAD="${CLIP_GRAD:-0}"
@@ -1294,6 +1306,7 @@ cat > "${RUN_DIR}/config/run_config.json" <<CFGEOF
   "dapo_dynamic_filter_path": "${DAPO_DYNAMIC_FILTER_PATH}",
   "dapo_over_sampling_batch_size": "${DAPO_OVER_SAMPLING_BATCH_SIZE}",
   "dapo_grpo_std_normalization": "${DAPO_GRPO_STD_NORMALIZATION}",
+  "dapo_rewards_normalization": "${DAPO_REWARDS_NORMALIZATION}",
   "dapo_use_kl_loss": "${DAPO_USE_KL_LOSS}",
   "dapo_kl_loss_coef": "${DAPO_KL_LOSS_COEF}",
   "dapo_overlong_buffer_enable": "${DAPO_OVERLONG_BUFFER_ENABLE}",
