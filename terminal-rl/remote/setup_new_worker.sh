@@ -13,18 +13,29 @@
 #
 # Environment variables (optional):
 #   PROXY_URL          - HTTP proxy for dockerd/pip/builds. Auto-detected on pjlab.
+#   AUTO_PJLAB_PROXY   - 1 to default to PJLab proxy when PROXY_URL is unset. Default: 1.
+#   DEFAULT_PROXY_URL  - Proxy used by AUTO_PJLAB_PROXY.
+#   PROXY_CHECK_URL    - URL used to verify auto/default proxy. Default: https://pypi.org/simple/pip/
+#   PROXY_CHECK_TIMEOUT - Proxy verification timeout. Default: 5.
 #   NO_PROXY_LIST      - no_proxy list for internal network bypass.
 #   DOCKER_DATA_ROOT   - Docker data root. DOCKER_ROOT is accepted as legacy alias.
 #   DOCKER_STORAGE_DRIVER - Docker storage driver. Default: auto.
-#   POOL_SERVER_VENV  - Python venv for pool_server. Default: <repo>/.venv.
+#   SHARED_CONDA_POOL_SERVER_VENV - Preferred ready-made pool_server env. Default: ../conda_envs/openclaw-worker-py312.
+#   POOL_SERVER_VENV  - Python env for pool_server. Default: SHARED_CONDA_POOL_SERVER_VENV if valid, else <repo>/.venv.
 #   POOL_SERVER_MIN_PYTHON - Minimum Python version for reusing a venv. Default: 3.12.
 #   POOL_SERVER_CREATE_PYTHON - Python version used when creating a venv. Default: 3.12.
+#   POOL_SERVER_VENV_BACKEND - auto|uv|python. Default: python.
+#   POOL_SERVER_INSTALL_BACKEND - auto|uv|pip. Default: pip.
 #   ASSUME_YES         - 1 to continue through low-disk warning non-interactively.
 #   RUN_PROXY_FIX      - 1 to run fix_dockerd_and_proxy.sh at the end. Default: 1.
 #   INSTALL_WATCHDOG   - 1 to install and start docker-watchdog.service. Default: 1.
 #   SKIP_VERIFY        - 1 to skip docker build verification. Default: 0.
 #   DOCKER_INFO_TIMEOUT - Timeout for docker info probes. Default: 10.
-#   DOCKER_PULL_TIMEOUT - Timeout for docker pulls. Default: 900.
+#   DOCKER_PULL_TIMEOUT - Timeout for docker pulls. Default: 1800.
+#   UV_HTTP_TIMEOUT    - Timeout for uv downloads. Default: 300.
+#   PIP_TIMEOUT        - Timeout for pip downloads. Default: 300.
+#   PIP_RETRIES        - Retry count for pip downloads. Default: 10.
+#   PIP_CACHE_DIR      - pip cache directory. Default: /tmp/pip-cache-openclaw.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &>/dev/null && pwd)"
@@ -68,13 +79,43 @@ echo "============================================================"
 echo ""
 
 # ── 0. Detect proxy ─────────────────────────────────────────────────
+AUTO_PJLAB_PROXY="${AUTO_PJLAB_PROXY:-1}"
+DEFAULT_PROXY_URL="${DEFAULT_PROXY_URL:-http://httpproxy-headless.kubebrain.svc.pjlab.local:3128}"
+PROXY_CHECK_URL="${PROXY_CHECK_URL:-https://pypi.org/simple/pip/}"
+PROXY_CHECK_TIMEOUT="${PROXY_CHECK_TIMEOUT:-5}"
 PROXY_URL="${PROXY_URL:-${HTTPS_PROXY:-${https_proxy:-${HTTP_PROXY:-${http_proxy:-}}}}}"
+PROXY_SOURCE=""
+[ -n "$PROXY_URL" ] && PROXY_SOURCE="env"
 NO_PROXY_LIST="${NO_PROXY_LIST:-${NO_PROXY:-${no_proxy:-localhost,127.0.0.1,10.0.0.0/8,100.96.0.0/12,.pjlab.org.cn,.pjlab.local,.svc}}}"
-if [ -z "$PROXY_URL" ]; then
-  # Try the pjlab proxy setup script
-  if curl -fsS --max-time 3 "http://deploy.i.h.pjlab.org.cn/infra/scripts/setup_proxy.sh" >/dev/null 2>&1; then
-    PROXY_URL="http://httpproxy-headless.kubebrain.svc.pjlab.local:3128"
+
+proxy_url_ok() {
+  local proxy="$1"
+  [ -n "$proxy" ] || return 1
+  command -v curl >/dev/null 2>&1 || return 1
+  curl -fsS --max-time "${PROXY_CHECK_TIMEOUT}" -x "$proxy" "${PROXY_CHECK_URL}" >/dev/null 2>&1
+}
+
+if [ -z "$PROXY_URL" ] && [ "${AUTO_PJLAB_PROXY}" = "1" ]; then
+  # Try the pjlab proxy setup script first; fall back to the known cluster proxy.
+  if command -v curl >/dev/null 2>&1 &&
+     curl -fsS --max-time 3 "http://deploy.i.h.pjlab.org.cn/infra/scripts/setup_proxy.sh" >/dev/null 2>&1; then
+    PROXY_URL="$DEFAULT_PROXY_URL"
+    PROXY_SOURCE="auto"
     echo "[auto] Detected pjlab proxy: $PROXY_URL"
+  else
+    PROXY_URL="$DEFAULT_PROXY_URL"
+    PROXY_SOURCE="default"
+    echo "[auto] Using default pjlab proxy: $PROXY_URL"
+  fi
+fi
+if [ -n "$PROXY_URL" ] && [ "$PROXY_SOURCE" != "env" ]; then
+  if proxy_url_ok "$PROXY_URL"; then
+    echo "  Proxy check OK: ${PROXY_CHECK_URL}"
+  else
+    echo "  [WARN] Auto/default proxy is not reachable: ${PROXY_URL}"
+    echo "         Falling back to bare network environment. Set PROXY_URL explicitly to force a proxy."
+    PROXY_URL=""
+    PROXY_SOURCE=""
   fi
 fi
 if [ -n "$PROXY_URL" ]; then
@@ -92,8 +133,15 @@ RUN_PROXY_FIX="${RUN_PROXY_FIX:-1}"
 INSTALL_WATCHDOG="${INSTALL_WATCHDOG:-1}"
 SKIP_VERIFY="${SKIP_VERIFY:-0}"
 DOCKER_INFO_TIMEOUT="${DOCKER_INFO_TIMEOUT:-10}"
-DOCKER_PULL_TIMEOUT="${DOCKER_PULL_TIMEOUT:-900}"
+DOCKER_PULL_TIMEOUT="${DOCKER_PULL_TIMEOUT:-1800}"
 DOCKER_STORAGE_DRIVER="${DOCKER_STORAGE_DRIVER:-}"
+UV_HTTP_TIMEOUT="${UV_HTTP_TIMEOUT:-300}"
+PIP_TIMEOUT="${PIP_TIMEOUT:-300}"
+PIP_RETRIES="${PIP_RETRIES:-10}"
+PIP_CACHE_DIR="${PIP_CACHE_DIR:-/tmp/pip-cache-openclaw}"
+export UV_HTTP_TIMEOUT
+export PIP_CACHE_DIR
+export PIP_DEFAULT_TIMEOUT="$PIP_TIMEOUT"
 
 # ── 1. Check disk space ─────────────────────────────────────────────
 echo "=== 1. Disk Space Check ==="
@@ -365,7 +413,10 @@ echo ""
 # ── 6. Python environment ───────────────────────────────────────────
 echo "=== 6. Python Environment ==="
 cd "$REPO_ROOT"
-POOL_SERVER_VENV="${POOL_SERVER_VENV:-${REPO_ROOT}/.venv}"
+DEFAULT_POOL_SERVER_VENV="${REPO_ROOT}/.venv"
+SHARED_CONDA_POOL_SERVER_VENV="${SHARED_CONDA_POOL_SERVER_VENV:-$(cd "${REPO_ROOT}/.." && pwd)/conda_envs/openclaw-worker-py312}"
+POOL_SERVER_VENV_EXPLICIT="${POOL_SERVER_VENV:-}"
+POOL_SERVER_VENV="${POOL_SERVER_VENV:-${DEFAULT_POOL_SERVER_VENV}}"
 POOL_SERVER_MIN_PYTHON="${POOL_SERVER_MIN_PYTHON:-3.12}"
 POOL_SERVER_CREATE_PYTHON="${POOL_SERVER_CREATE_PYTHON:-3.12}"
 VENV_PYTHON="${POOL_SERVER_VENV}/bin/python"
@@ -376,6 +427,11 @@ PIP_DEPENDENCIES=(
   "camel-ai"
   "git+https://github.com/laude-institute/terminal-bench.git"
 )
+
+set_pool_server_venv() {
+  POOL_SERVER_VENV="$1"
+  VENV_PYTHON="${POOL_SERVER_VENV}/bin/python"
+}
 
 venv_python_ok() {
   venv_python_entry_ok && venv_python_home_ok && "$VENV_PYTHON" - "$POOL_SERVER_MIN_PYTHON" <<'PY'
@@ -534,24 +590,71 @@ remove_venv_symlink_shims() {
 }
 
 create_pool_server_venv() {
-  local uv_venv_args
+  local uv_venv_args backend
   echo "  Creating venv: $POOL_SERVER_VENV"
-  if command -v uv &>/dev/null; then
+  backend="${POOL_SERVER_VENV_BACKEND:-python}"
+  if [ "$backend" != "auto" ] && [ "$backend" != "uv" ] && [ "$backend" != "python" ]; then
+    die "Unsupported POOL_SERVER_VENV_BACKEND=${backend}; expected auto|uv|python"
+  fi
+  if [ "$backend" != "python" ] && command -v uv &>/dev/null; then
     uv_venv_args=(venv --python "$POOL_SERVER_CREATE_PYTHON" --seed --link-mode copy)
     if uv venv --help 2>&1 | grep -q -- "--relocatable"; then
       uv_venv_args+=(--relocatable)
     fi
-    UV_CACHE_DIR="${UV_CACHE_DIR:-/tmp/uv-cache-openclaw}" UV_LINK_MODE=copy \
-      uv "${uv_venv_args[@]}" "$POOL_SERVER_VENV"
-  elif command -v "python${POOL_SERVER_CREATE_PYTHON}" &>/dev/null; then
-    "python${POOL_SERVER_CREATE_PYTHON}" -m venv --copies "$POOL_SERVER_VENV"
+    if UV_CACHE_DIR="${UV_CACHE_DIR:-/tmp/uv-cache-openclaw}" UV_LINK_MODE=copy \
+      uv "${uv_venv_args[@]}" "$POOL_SERVER_VENV"; then
+      :
+    elif [ "$backend" = "uv" ]; then
+      return 1
+    else
+      echo "  [WARN] uv venv failed; falling back to python -m venv"
+      if [ -d "$POOL_SERVER_VENV" ]; then
+        remove_existing_venv
+      fi
+      create_pool_server_python_venv
+    fi
   else
-    python3 -m venv --copies "$POOL_SERVER_VENV"
+    if [ "$backend" = "uv" ]; then
+      die "POOL_SERVER_VENV_BACKEND=uv requested but uv is not available"
+    fi
+    create_pool_server_python_venv
   fi
   vendor_venv_python_home
   copy_venv_python_binaries
   remove_venv_symlink_shims
 }
+
+create_pool_server_python_venv() {
+  if command -v "python${POOL_SERVER_CREATE_PYTHON}" &>/dev/null; then
+    "python${POOL_SERVER_CREATE_PYTHON}" -m venv --copies "$POOL_SERVER_VENV"
+  else
+    python3 -m venv --copies "$POOL_SERVER_VENV"
+  fi
+}
+
+select_pool_server_env() {
+  if [ -n "$POOL_SERVER_VENV_EXPLICIT" ]; then
+    set_pool_server_venv "$POOL_SERVER_VENV_EXPLICIT"
+    echo "  Pool server env explicitly set: ${POOL_SERVER_VENV}"
+    return 0
+  fi
+
+  if [ -x "${SHARED_CONDA_POOL_SERVER_VENV}/bin/python" ]; then
+    set_pool_server_venv "$SHARED_CONDA_POOL_SERVER_VENV"
+    echo "  Checking shared conda env: ${SHARED_CONDA_POOL_SERVER_VENV}"
+    if venv_python_ok && venv_deps_ok "${REQUIRED_PY_MODULES[@]}" >/dev/null 2>&1; then
+      echo "  [OK] Using shared conda pool_server env: ${POOL_SERVER_VENV}"
+      return 0
+    fi
+    echo "  [WARN] Shared conda env is present but incomplete or incompatible; falling back to install env."
+  else
+    echo "  Shared conda env not found: ${SHARED_CONDA_POOL_SERVER_VENV}"
+  fi
+
+  set_pool_server_venv "$DEFAULT_POOL_SERVER_VENV"
+}
+
+select_pool_server_env
 
 if [ -d "$POOL_SERVER_VENV" ] && venv_python_ok; then
   echo "  [OK] Reusing existing venv: $POOL_SERVER_VENV"
@@ -572,30 +675,44 @@ if ! ensure_venv_pip; then
   activate_python_env
   ensure_venv_pip || die "pip is missing in ${POOL_SERVER_VENV}; install python3-venv/ensurepip or use a Python build with pip support."
 fi
-PIP_INSTALL_ARGS=(--timeout "${PIP_TIMEOUT:-120}" --progress-bar off)
+PIP_INSTALL_ARGS=(--timeout "$PIP_TIMEOUT" --retries "$PIP_RETRIES" --progress-bar off)
 if [ -n "${PROXY_URL:-}" ]; then
   PIP_INSTALL_ARGS+=(--proxy "$PROXY_URL")
+  export PIP_PROXY="$PROXY_URL"
   echo "  Python deps install proxy: $PROXY_URL"
 else
+  unset PIP_PROXY
   echo "  Python deps install proxy: none"
 fi
 
 install_python_deps() {
-  local no_deps="${1:-0}"
-  if command -v uv &>/dev/null; then
+  local no_deps="${1:-0}" backend
+  backend="${POOL_SERVER_INSTALL_BACKEND:-pip}"
+  if [ "$backend" != "auto" ] && [ "$backend" != "uv" ] && [ "$backend" != "pip" ]; then
+    die "Unsupported POOL_SERVER_INSTALL_BACKEND=${backend}; expected auto|uv|pip"
+  fi
+  if [ "$backend" != "pip" ] && command -v uv &>/dev/null; then
     local uv_args=(pip install --python "$VENV_PYTHON" --link-mode copy --index-strategy unsafe-best-match)
     if [ "$no_deps" = "1" ]; then
       uv_args+=(--no-deps)
     fi
-    UV_CACHE_DIR="${UV_CACHE_DIR:-/tmp/uv-cache-openclaw}" UV_LINK_MODE=copy \
-      uv "${uv_args[@]}" "${PIP_DEPENDENCIES[@]}"
-  else
-    local pip_args=("${PIP_INSTALL_ARGS[@]}")
-    if [ "$no_deps" = "1" ]; then
-      pip_args+=(--no-deps)
+    if UV_CACHE_DIR="${UV_CACHE_DIR:-/tmp/uv-cache-openclaw}" UV_LINK_MODE=copy \
+      uv "${uv_args[@]}" "${PIP_DEPENDENCIES[@]}"; then
+      return 0
     fi
-    "$VENV_PYTHON" -m pip install "${pip_args[@]}" "${PIP_DEPENDENCIES[@]}"
+    if [ "$backend" = "uv" ]; then
+      return 1
+    fi
+    echo "  [WARN] uv pip install failed; falling back to python -m pip" >&2
+  elif [ "$backend" = "uv" ]; then
+    die "POOL_SERVER_INSTALL_BACKEND=uv requested but uv is not available"
   fi
+
+  local pip_args=("${PIP_INSTALL_ARGS[@]}")
+  if [ "$no_deps" = "1" ]; then
+    pip_args+=(--no-deps)
+  fi
+  "$VENV_PYTHON" -m pip install "${pip_args[@]}" "${PIP_DEPENDENCIES[@]}"
 }
 
 # Install pool_server dependencies

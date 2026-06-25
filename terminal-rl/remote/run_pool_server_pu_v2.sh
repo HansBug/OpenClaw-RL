@@ -680,10 +680,30 @@ export WORKER_TASK_IMAGE_RETRY_AFTER
 export CONTAINER_PIDS_LIMIT
 export CONTAINER_MEMORY_LIMIT
 
+pool_server_env_ok() {
+    local env_dir="$1"
+    [[ -x "${env_dir}/bin/python" ]] || return 1
+    "${env_dir}/bin/python" - <<'PY' >/dev/null 2>&1
+import importlib.util
+import sys
+
+if sys.version_info < (3, 12):
+    raise SystemExit(1)
+missing = [
+    name for name in ("terminal_bench", "fastapi", "uvicorn", "camel")
+    if importlib.util.find_spec(name) is None
+]
+raise SystemExit(1 if missing else 0)
+PY
+}
+
 SHARED_CONDA_POOL_SERVER_VENV="${SHARED_CONDA_POOL_SERVER_VENV:-$(cd "${REPO_ROOT}/.." && pwd)/conda_envs/openclaw-worker-py312}"
-if [[ -z "${POOL_SERVER_VENV:-}" && -x "${SHARED_CONDA_POOL_SERVER_VENV}/bin/python" ]]; then
+if [[ -z "${POOL_SERVER_VENV:-}" ]] && pool_server_env_ok "${SHARED_CONDA_POOL_SERVER_VENV}"; then
     POOL_SERVER_VENV="${SHARED_CONDA_POOL_SERVER_VENV}"
 else
+    if [[ -z "${POOL_SERVER_VENV:-}" && -x "${SHARED_CONDA_POOL_SERVER_VENV}/bin/python" ]]; then
+        log "  shared conda env is present but missing pool_server deps: ${SHARED_CONDA_POOL_SERVER_VENV}"
+    fi
     POOL_SERVER_VENV="${POOL_SERVER_VENV:-${REPO_ROOT}/.venv}"
 fi
 
