@@ -3,9 +3,8 @@
 
 AgentHarm:
   The upstream inspect-evals scorer stores value={"score": ..., "refusal": ...}
-  and reports avg_refusals. Terminal-RL trajectories keep the same semantic
-  fields in reward_details. This summary reports harmful refusal rate and
-  benign full-score accuracy only.
+  and avg_full_score is score == 1.0. Terminal-RL trajectories keep the same
+  semantic fields in reward_details for official-style eval runs.
 
 AgentSafetyBench:
   The official repo scores model behavior with ShieldAgent and writes pred_label
@@ -158,13 +157,20 @@ def summarize_terminal_rl(part_files: Iterable[Path]) -> dict[tuple[str, str], S
     return out
 
 
-def shield_result_files(path: Path | None) -> list[Path]:
+def shield_result_files(path: Path | None, required: bool = False) -> list[Path]:
     if path is None:
         return []
     if path.is_file():
         return [path]
     if path.is_dir():
-        return sorted(path.glob("*outputs_results.json"))
+        files = sorted(path.glob("*outputs_results.json"))
+        if files:
+            return files
+        if required:
+            raise SystemExit(f"[ERROR] no ShieldAgent *outputs_results.json found in: {path}")
+        return []
+    if required:
+        raise SystemExit(f"[ERROR] ShieldAgent result path does not exist: {path}")
     return []
 
 
@@ -237,6 +243,11 @@ def main() -> int:
             "Can be repeated in the same order as run_dirs, or as RUN_NAME=PATH."
         ),
     )
+    parser.add_argument(
+        "--allow-partial-asb-shield",
+        action="store_true",
+        help="Allow missing/unparsed ShieldAgent rows. Do not use for official reporting.",
+    )
     args = parser.parse_args()
 
     positional_shield_results: list[Path] = []
@@ -261,11 +272,14 @@ def main() -> int:
 
     for run_index, run_dir in enumerate(args.run_dirs):
         shield_source: Path | None = None
-        if run_dir.name in named_shield_results:
-            shield_source = named_shield_results[run_dir.name]
-        elif positional_shield_results:
+        run_keys = [run_dir.name, str(run_dir), str(run_dir.resolve(strict=False))]
+        for key in run_keys:
+            if key in named_shield_results:
+                shield_source = named_shield_results[key]
+                break
+        if shield_source is None and positional_shield_results:
             shield_source = positional_shield_results[0 if len(positional_shield_results) == 1 else run_index]
-        shield_files = shield_result_files(shield_source)
+        shield_files = shield_result_files(shield_source, required=shield_source is not None)
 
         files = list(iter_meta_files(run_dir))
         for label, part_files in split_duplicate_full_runs(files, args.expected_prompts):
@@ -273,10 +287,26 @@ def main() -> int:
             stats = summarize_terminal_rl(part_files)
             ah_h = stats.get(("agentharm", "harmful_should_refuse"), Stats())
             ah_b = stats.get(("agentharm", "benign_should_comply"), Stats())
+            asb_h = stats.get(("agent_safetybench", "harmful_should_refuse"), Stats())
+            asb_b = stats.get(("agent_safetybench", "benign_should_comply"), Stats())
+            expected_asb = asb_h.n + asb_b.n
+            if expected_asb and not shield_files:
+                raise SystemExit(
+                    f"[ERROR] {name} contains {expected_asb} AgentSafetyBench trajectories, "
+                    "but no --asb-shield-result was provided."
+                )
             part_uids = meta_uids(part_files)
             asb_official = shield_split_stats(shield_files, allowed_uids=part_uids or None)
             official_harmful = asb_official.get("harmful_should_refuse", Counter())
             official_benign = asb_official.get("benign_should_comply", Counter())
+            actual_asb = official_harmful["n"] + official_benign["n"]
+            if expected_asb and actual_asb != expected_asb and not args.allow_partial_asb_shield:
+                raise SystemExit(
+                    f"[ERROR] {name} ShieldAgent rows are incomplete after uid alignment: "
+                    f"expected {expected_asb}, got {actual_asb}. "
+                    "Rerun ShieldAgent with a fresh target_name/result dir, or pass "
+                    "--allow-partial-asb-shield only for debugging."
+                )
 
             print(
                 f"| `{name}` | "

@@ -15,6 +15,7 @@
 #   ASB_SHIELD_DRY_RUN=1      export ASB inputs and model-load precheck only
 #   BATCH_SIZE=4              ShieldAgent batch size
 #   CUDA_VISIBLE_DEVICES=0    GPU used by ShieldAgent
+#   ALLOW_PARTIAL_ASB_SHIELD=0 fail if ASB ShieldAgent rows are incomplete
 #   SUMMARY_OUT=<path>        markdown output path
 
 set -euo pipefail
@@ -35,6 +36,7 @@ if [[ -z "${ASB_ROOT}" ]]; then
 fi
 ASB_ROOT="${ASB_ROOT:-${REPO_ROOT}/../Agent-SafetyBench}"
 RUN_ASB_SHIELD="${RUN_ASB_SHIELD:-1}"
+ALLOW_PARTIAL_ASB_SHIELD="${ALLOW_PARTIAL_ASB_SHIELD:-0}"
 SUMMARY_OUT="${SUMMARY_OUT:-${REPO_ROOT}/runs/official_safety_split_metrics/summary_$(date +%Y%m%d_%H%M%S).md}"
 
 usage() {
@@ -104,6 +106,15 @@ PY
   return "${probe_status}"
 }
 
+run_key() {
+  "${PYTHON_BIN}" - "$1" <<'PY'
+import sys
+from pathlib import Path
+
+print(Path(sys.argv[1]).resolve(strict=False))
+PY
+}
+
 cd "${REPO_ROOT}"
 
 RUN_DIRS=()
@@ -127,7 +138,7 @@ for spec in "$@"; do
 
   if has_asb_examples "${run_dir}"; then
     shield_result="${ASB_ROOT}/score/shield_results/${target_name}"
-    SHIELD_ARGS+=("--asb-shield-result" "$(basename "${run_dir}")=${shield_result}")
+    SHIELD_ARGS+=("--asb-shield-result" "$(run_key "${run_dir}")=${shield_result}")
 
     if [[ "${RUN_ASB_SHIELD}" == "1" ]]; then
       echo "========================================"
@@ -155,9 +166,14 @@ if [[ "${ASB_SHIELD_DRY_RUN:-0}" == "1" ]]; then
 fi
 
 mkdir -p "$(dirname "${SUMMARY_OUT}")"
+SUMMARY_ARGS=()
+if [[ "${ALLOW_PARTIAL_ASB_SHIELD}" == "1" ]]; then
+  SUMMARY_ARGS+=("--allow-partial-asb-shield")
+fi
 "${PYTHON_BIN}" terminal-rl/scripts/summarize_official_split_metrics.py \
-  "${RUN_DIRS[@]}" \
-  "${SHIELD_ARGS[@]}" | tee "${SUMMARY_OUT}"
+  "${SUMMARY_ARGS[@]}" \
+  "${SHIELD_ARGS[@]}" \
+  "${RUN_DIRS[@]}" | tee "${SUMMARY_OUT}"
 
 echo "Official safety split summary:"
 echo "${SUMMARY_OUT}"

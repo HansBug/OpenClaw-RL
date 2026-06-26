@@ -13,7 +13,7 @@
 | harmful | `terminal-rl/dataset/agentharm/harmful_validation.jsonl` | 32 | 拒绝或避免协助有害目标 |
 | benign | `terminal-rl/dataset/agentharm/harmless_benign_validation.jsonl` | 32 | 完成无害任务，不应拒答 |
 
-Terminal-RL eval 会在每条 trajectory 的 `reward_details` 中保留 AgentHarm scorer 语义字段，例如 `score` 与 `refused`。通用脚本直接读取这些字段。
+Terminal-RL eval 会在每条 trajectory 的 `reward_details` 中保留 AgentHarm scorer 语义字段，例如 `score` 与 `refused`。通用脚本直接读取这些字段；用于正式 AH 汇报的 eval run 应确保 `reward_details.score` 保留官方 scorer 语义，不能使用 shaped reward 替代。
 
 ### AgentSafetyBench
 
@@ -53,7 +53,7 @@ Terminal-RL eval 会在每条 trajectory 的 `reward_details` 中保留 AgentHar
 | 指标 | 计算方式 |
 | --- | --- |
 | `AH official harmful refusal rate` | harmful split 中 `reward_details.refused=True` 的比例 |
-| `AH official benign full-score accuracy` | benign split 中 `reward_details.score == 1.0` 的比例 |
+| `AH official benign full-score accuracy` | benign split 中 `reward_details.score == 1.0` 的比例，对应 inspect-evals `avg_full_score` |
 
 ### AgentSafetyBench
 
@@ -97,11 +97,13 @@ bash terminal-rl/scripts/run_asb_shield_score.sh runs/eval/<eval_run> <target_na
 
 ### Python 环境
 
-默认使用 `python3`。如果 `torch` / `transformers` 不在默认环境里，设置：
+默认使用 `python3`。如果 `torch` / `transformers` / `tqdm` / `tabulate` / `scikit-learn` 不在默认环境里，设置：
 
 ```bash
 PYTHON_BIN=/path/to/python
 ```
+
+部分 `ShieldAgent` 本地模型配置可能要求 `flash_attention_2`；如果当前环境不支持，请使用已经验证过的 Agent-SafetyBench scoring 环境或调整本地模型配置。
 
 ### ShieldAgent 模型
 
@@ -205,6 +207,21 @@ runs/official_asb_shield_inputs/<target_name>/gen_res.json
 runs/official_asb_shield_logs/<target_name>/run_YYYYMMDD_HHMMSS.log
 ```
 
+正式评分默认行为：
+
+- `FORCE_ASB_EXPORT=1`：每次重新导出 `gen_res.json`，避免复用旧输入。
+- `REUSE_ASB_SHIELD_RESULTS=0`：每次清理同名 `<Agent-SafetyBench>/score/shield_results/<target_name>`，避免官方 scorer 按旧 `id` 缓存跳过新样本。
+- summary 默认校验 ASB 分母完整；如果 ShieldAgent 输出条数与 run 中 ASB trajectory 条数不一致，会直接报错。
+
+只有调试 partial 结果时才建议显式放宽：
+
+```bash
+REUSE_ASB_SHIELD_RESULTS=1 \
+ALLOW_PARTIAL_ASB_SHIELD=1 \
+bash terminal-rl/scripts/run_official_safety_split_metrics.sh \
+  my_model=runs/eval/<eval_run_dir>
+```
+
 之后可单独汇总：
 
 ```bash
@@ -212,6 +229,16 @@ python3 terminal-rl/scripts/summarize_official_split_metrics.py \
   runs/eval/<eval_run_dir> \
   --asb-shield-result <Agent-SafetyBench>/score/shield_results/<target_name>
 ```
+
+如果只想对已有 `ShieldAgent` 输出按官方 `fulfillable` split 独立统计，不读取 Terminal-RL trajectories：
+
+```bash
+python3 terminal-rl/scripts/agent_safetybench_official_split_metrics.py \
+  --official-data terminal-rl/dataset/agent_safetybench_convert/train.jsonl \
+  --shield-results <Agent-SafetyBench>/score/shield_results/<target_name>/<target_name>_outputs_results.json
+```
+
+该脚本默认要求 `shield-results` 与 `official-data` 分母一致；调试 partial 结果时才使用 `--allow-partial`。
 
 ## 8. 复用已有 ShieldAgent 结果
 
@@ -228,6 +255,8 @@ bash terminal-rl/scripts/run_official_safety_split_metrics.sh \
 ```bash
 <Agent-SafetyBench>/score/shield_results/my_model
 ```
+
+复用时仍会校验分母完整；如果结果不完整会报错。正式汇报不要使用 partial 结果。
 
 ## 9. Dry Run
 
@@ -253,7 +282,9 @@ bash terminal-rl/scripts/run_official_safety_split_metrics.sh \
 ## 11. 常见问题
 
 - `AgentSafetyBench` 官方真实得分必须实际运行 `ShieldAgent`；本地 rule reward 不能替代官方 `pred_label`。
+- `AgentHarm` 官方 full-score 指标对应 inspect-evals `avg_full_score`，即 `score == 1.0`；如果 eval run 写入的是 shaped reward，应重新用官方语义 scorer 跑评测。
 - 如果 `torch/transformers` 缺失，设置 `PYTHON_BIN` 到正确环境。
+- 如果 `tqdm/tabulate/scikit-learn` 缺失，也需要切换到完整 Agent-SafetyBench scoring 环境。
 - 如果模型路径是 HuggingFace cache 的 `models--...` 目录，脚本会尝试进入 `snapshots/<hash>`；也可以直接设置 `SHIELD_MODEL=/path/to/snapshot`。
 - 如果 `model-00001-of-00004.safetensors` 等 shard 缺失，先运行 `prepare_repo_local_shieldagent.sh`，必要时设置 `COPY_WEIGHTS=1`。
-- 如果只想重新导出 ASB 输入，设置 `FORCE_ASB_EXPORT=1`。
+- 如果只想复用已导出的 ASB 输入，设置 `FORCE_ASB_EXPORT=0`；正式评分默认重新导出。

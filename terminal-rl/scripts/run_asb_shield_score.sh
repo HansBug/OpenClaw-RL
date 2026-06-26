@@ -53,7 +53,8 @@ BATCH_SIZE="${BATCH_SIZE:-4}"
 CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0}"
 SHIELD_PRECHECK_TIMEOUT="${SHIELD_PRECHECK_TIMEOUT:-600}"
 SHIELD_PRECHECK="${SHIELD_PRECHECK:-0}"
-FORCE_ASB_EXPORT="${FORCE_ASB_EXPORT:-0}"
+FORCE_ASB_EXPORT="${FORCE_ASB_EXPORT:-1}"
+REUSE_ASB_SHIELD_RESULTS="${REUSE_ASB_SHIELD_RESULTS:-0}"
 
 OUT_DIR="${OUT_DIR:-${REPO_ROOT}/runs/official_asb_shield_inputs/${TARGET_NAME}}"
 LOG_DIR="${ASB_SHIELD_LOG_DIR:-${REPO_ROOT}/runs/official_asb_shield_logs/${TARGET_NAME}}"
@@ -87,9 +88,19 @@ run_maybe_timeout() {
 import importlib.util
 import sys
 
-missing = [name for name in ("torch", "transformers") if importlib.util.find_spec(name) is None]
+required = {
+    "torch": "torch",
+    "transformers": "transformers",
+    "tqdm": "tqdm",
+    "tabulate": "tabulate",
+    "sklearn": "scikit-learn",
+}
+missing = [pkg for module, pkg in required.items() if importlib.util.find_spec(module) is None]
 if missing:
-    raise SystemExit(f"[ERROR] PYTHON_BIN is missing packages {missing}. Set PYTHON_BIN to an env with torch/transformers.")
+    raise SystemExit(
+        f"[ERROR] PYTHON_BIN is missing packages {missing}. "
+        "Set PYTHON_BIN to the Agent-SafetyBench scoring environment."
+    )
 PY
 
 if [[ ! -d "${ASB_ROOT}/score" ]]; then
@@ -173,6 +184,7 @@ echo "python_bin=${PYTHON_BIN}"
 echo "batch_size=${BATCH_SIZE}"
 echo "cuda_visible_devices=${CUDA_VISIBLE_DEVICES}"
 echo "force_asb_export=${FORCE_ASB_EXPORT}"
+echo "reuse_asb_shield_results=${REUSE_ASB_SHIELD_RESULTS}"
 
 if [[ "${SHIELD_PRECHECK}" == "1" ]]; then
   run_maybe_timeout "${SHIELD_PRECHECK_TIMEOUT}" "${PYTHON_BIN}" - "${SHIELD_MODEL}" <<'PY'
@@ -218,6 +230,14 @@ if [[ "${ASB_SHIELD_DRY_RUN:-0}" == "1" ]]; then
   exit 0
 fi
 
+SHIELD_RESULT_DIR="${ASB_ROOT}/score/shield_results/${TARGET_NAME}"
+if [[ "${REUSE_ASB_SHIELD_RESULTS}" == "1" ]]; then
+  echo "[INFO] Reusing existing ShieldAgent result dir if present: ${SHIELD_RESULT_DIR}"
+else
+  rm -rf "${SHIELD_RESULT_DIR}"
+  echo "[INFO] Removed stale ShieldAgent result dir before scoring: ${SHIELD_RESULT_DIR}"
+fi
+
 cd "${ASB_ROOT}/score"
 CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES}" \
 "${PYTHON_BIN}" eval_with_shield.py \
@@ -229,6 +249,6 @@ CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES}" \
   --target_model_name "${TARGET_NAME}"
 
 echo "Official ShieldAgent outputs:"
-echo "${ASB_ROOT}/score/shield_results/${TARGET_NAME}/"
+echo "${SHIELD_RESULT_DIR}/"
 echo "Log file:"
 echo "${LOG_FILE}"
