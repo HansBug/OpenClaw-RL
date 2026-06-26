@@ -279,6 +279,30 @@ def test_ucb_random_seed_reproduces_tie_break_and_epsilon(monkeypatch):
     assert third != first
 
 
+def test_ucb_random_seed_salt_changes_stream(monkeypatch):
+    _reset_local_agent57_state()
+    monkeypatch.setenv("EXPLORE_AGENT57_LITE", "1")
+    monkeypatch.setenv("EXPLORE_AGENT57_CONTROLLER", "ucb")
+    monkeypatch.setenv("EXPLORE_AGENT57_K", "6")
+    monkeypatch.setenv("EXPLORE_AGENT57_LIFELONG_BACKEND", "local")
+    monkeypatch.setenv("EXPLORE_AGENT57_KEEP_BASELINE", "0")
+    monkeypatch.setenv("EXPLORE_AGENT57_UCB_EPSILON", "1.0")
+    monkeypatch.setenv("EXPLORE_AGENT57_UCB_RANDOM_SEED", "123")
+    monkeypatch.setenv("EXPLORE_AGENT57_UCB_SEED_SALT", "worker-a")
+    first = [a57.assign_group_arms(6, dataset="seta") for _ in range(4)]
+
+    monkeypatch.setenv("EXPLORE_AGENT57_UCB_SEED_SALT", "worker-a")
+    a57._reset_ucb_rng_for_tests()
+    second = [a57.assign_group_arms(6, dataset="seta") for _ in range(4)]
+
+    monkeypatch.setenv("EXPLORE_AGENT57_UCB_SEED_SALT", "worker-b")
+    a57._reset_ucb_rng_for_tests()
+    third = [a57.assign_group_arms(6, dataset="seta") for _ in range(4)]
+
+    assert first == second
+    assert third != first
+
+
 def test_lifelong_key_v1_ignores_context_metadata(monkeypatch):
     monkeypatch.setenv("EXPLORE_AGENT57_LIFELONG_KEY_VERSION", "v1")
     config = a57.config_from_env()
@@ -544,12 +568,17 @@ def test_lifelong_sqlite_updates_counts_and_stats_in_one_path(tmp_path, monkeypa
     try:
         meta = dict(conn.execute("SELECT name, value FROM meta").fetchall())
         count = conn.execute("SELECT count FROM lifelong_counts").fetchone()[0]
+        columns = {
+            row[1]: str(row[2]).upper()
+            for row in conn.execute("PRAGMA table_info(lifelong_counts)")
+        }
     finally:
         conn.close()
 
     assert int(meta["lifelong_traj_seen"]) == 2
     assert int(meta["lifelong_raw_n"]) == 2
     assert count > 1.0
+    assert columns["count"] == "REAL"
 
 
 def test_standardized_life_mod_override_drives_ngu_product(monkeypatch):

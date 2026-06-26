@@ -28,6 +28,65 @@ def _env_str(name: str, default: str = "") -> str:
     return default if raw is None else raw.strip()
 
 
+def _env_int(name: str, default: int) -> int:
+    raw = os.getenv(name)
+    if raw is None or raw == "":
+        return default
+    try:
+        return int(raw)
+    except ValueError:
+        logger.warning("Invalid %s=%r; using %d", name, raw, default)
+        return default
+
+
+def _schedule_multiplier(schedule: str, train_step: Any, decay_steps: int) -> float:
+    schedule = str(schedule or "constant").strip().lower()
+    if schedule in {"", "constant", "none", "off"}:
+        return 1.0
+    if decay_steps <= 0 or train_step is None:
+        return 1.0
+    try:
+        step = max(0.0, float(train_step))
+    except (TypeError, ValueError):
+        return 1.0
+    progress = min(1.0, step / float(decay_steps))
+    if schedule == "linear":
+        return max(0.0, 1.0 - progress)
+    if schedule == "cosine":
+        return 0.5 * (1.0 + math.cos(math.pi * progress))
+    logger.warning("Unknown EXPLORE_ADVANTAGE_LAMBDA_SCHEDULE=%r; using constant", schedule)
+    return 1.0
+
+
+def _sample_train_step(sample: Any) -> Any:
+    metadata = getattr(sample, "metadata", None)
+    if isinstance(metadata, dict):
+        for key in ("train_step", "rollout_step", "rollout_id"):
+            if metadata.get(key) is not None:
+                return metadata.get(key)
+    reward = getattr(sample, "reward", None)
+    if isinstance(reward, dict):
+        for key in ("train_step", "rollout_step", "rollout_id"):
+            if reward.get(key) is not None:
+                return reward.get(key)
+    return None
+
+
+def _batch_train_step(samples: list[Any]) -> Any:
+    values = [_sample_train_step(sample) for sample in samples]
+    numeric: list[float] = []
+    for value in values:
+        if value is None:
+            continue
+        try:
+            numeric.append(float(value))
+        except (TypeError, ValueError):
+            continue
+    if numeric:
+        return max(numeric)
+    return next((value for value in values if value is not None), None)
+
+
 def _reward_value(args: Any, sample: Any) -> float:
     reward = getattr(sample, "reward", None)
     key = getattr(args, "reward_key", None)
@@ -72,6 +131,15 @@ def _status_name(sample: Any) -> str:
     status = getattr(sample, "status", "")
     value = getattr(status, "value", status)
     return str(value).lower()
+
+
+def _status_intrinsic_scale(sample: Any) -> float:
+    status = _status_name(sample)
+    if "truncated" in status:
+        return max(0.0, _env_float("EXPLORE_ADVANTAGE_TRUNCATED_INTRINSIC_SCALE", 1.0))
+    if any(part in status for part in ("failed", "aborted")):
+        return max(0.0, _env_float("EXPLORE_ADVANTAGE_FAILED_INTRINSIC_SCALE", 1.0))
+    return 1.0
 
 
 def _configured_truncation_penalty() -> float:
@@ -205,6 +273,15 @@ def _dual_stream_post_process(
         "EXPLORE_ADVANTAGE_LAMBDA",
         _env_float("EXPLORE_ADVANTAGE_BONUS_COEF", 0.1),
     )
+    lambda_schedule = _env_str("EXPLORE_ADVANTAGE_LAMBDA_SCHEDULE", "constant")
+    lambda_decay_steps = max(0, _env_int("EXPLORE_ADVANTAGE_LAMBDA_DECAY_STEPS", 0))
+    train_step = _batch_train_step(samples)
+    lambda_multiplier = _schedule_multiplier(
+        lambda_schedule,
+        train_step,
+        lambda_decay_steps,
+    )
+    effective_lambda = lambda_coef * lambda_multiplier
     arm_weight_mode = _env_str("EXPLORE_ADVANTAGE_ARM_WEIGHT_MODE", "normalized_beta").lower()
     trust_key = _env_str("EXPLORE_ADVANTAGE_TRUST_KEY", "explore_agent57_trust")
     clip = _env_float("EXPLORE_ADVANTAGE_BONUS_CLIP", 0.0)
@@ -228,7 +305,8 @@ def _dual_stream_post_process(
         trust = _component_value(sample, trust_key)
         if trust_missing and trust_key == "explore_agent57_trust":
             trust = 1.0
-        raw_bonus = float(lambda_coef * arm_weight * trust * intrinsic_adv[i])
+        status_scale = _status_intrinsic_scale(sample)
+        raw_bonus = float(effective_lambda * arm_weight * trust * status_scale * intrinsic_adv[i])
         bonus = max(-clip, min(clip, raw_bonus)) if clip > 0 else raw_bonus
         adjusted[i] += bonus
         exploration_extra[i] = bonus
@@ -237,13 +315,19 @@ def _dual_stream_post_process(
             reward["explore_post_norm_intrinsic_value"] = intrinsic_values[i]
             reward["explore_post_norm_bonus_raw"] = raw_bonus
             reward["explore_post_norm_bonus"] = bonus
-            reward["explore_post_norm_bonus_coef"] = lambda_coef
+            reward["explore_post_norm_bonus_base_coef"] = lambda_coef
+            reward["explore_post_norm_bonus_coef"] = effective_lambda
+            reward["explore_post_norm_bonus_schedule"] = lambda_schedule
+            reward["explore_post_norm_bonus_decay_steps"] = lambda_decay_steps
+            reward["explore_post_norm_bonus_schedule_multiplier"] = lambda_multiplier
+            reward["explore_post_norm_train_step"] = train_step
             reward["explore_post_norm_bonus_clip"] = clip
             reward["explore_post_norm_bonus_mode"] = "dual_stream"
             reward["explore_post_norm_intrinsic_key"] = intrinsic_key
             reward["explore_post_norm_intrinsic_advantage"] = intrinsic_adv[i]
             reward["explore_post_norm_arm_weight"] = arm_weight
             reward["explore_post_norm_trust"] = trust
+            reward["explore_post_norm_status_intrinsic_scale"] = status_scale
             reward["explore_post_norm_adjusted_reward"] = adjusted[i]
             reward["postprocess_total_reward"] = adjusted[i]
     return _apply_truncation_penalties(

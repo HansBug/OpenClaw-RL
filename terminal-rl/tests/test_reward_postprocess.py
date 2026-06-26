@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 from types import SimpleNamespace
 
 import sys
@@ -23,10 +24,14 @@ class DummySample:
         beta: float,
         trust: float = 1.0,
         status: str | None = None,
+        train_step: int | None = None,
     ) -> None:
         self.group_index = group_index
         self.index = index
         self.status = status or "completed"
+        self.metadata = {}
+        if train_step is not None:
+            self.metadata["train_step"] = train_step
         self.reward = {
             "score": score,
             "raw_score": score,
@@ -66,6 +71,77 @@ def test_dual_stream_advantage_adds_group_normalized_intrinsic(monkeypatch):
     assert samples[1].reward["explore_post_norm_intrinsic_advantage"] == 0.5
     assert samples[1].reward["explore_post_norm_trust"] == 1.0
     assert samples[1].reward["explore_post_norm_adjusted_reward"] == 0.1
+
+
+def test_dual_stream_lambda_schedule_uses_train_step(monkeypatch):
+    monkeypatch.setenv("EXPLORE_ADVANTAGE_BONUS", "1")
+    monkeypatch.setenv("EXPLORE_ADVANTAGE_BONUS_ENABLED", "1")
+    monkeypatch.setenv("EXPLORE_ADVANTAGE_BONUS_MODE", "dual_stream")
+    monkeypatch.setenv("EXPLORE_ADVANTAGE_LAMBDA", "0.2")
+    monkeypatch.setenv("EXPLORE_ADVANTAGE_LAMBDA_SCHEDULE", "cosine")
+    monkeypatch.setenv("EXPLORE_ADVANTAGE_LAMBDA_DECAY_STEPS", "120")
+    monkeypatch.setenv("EXPLORE_ADVANTAGE_ARM_WEIGHT_MODE", "normalized_beta")
+    monkeypatch.setenv("EXPLORE_ADVANTAGE_BONUS_CLIP", "0")
+    args = SimpleNamespace(
+        reward_key="score",
+        advantage_estimator="grpo",
+        rewards_normalization=True,
+        grpo_std_normalization=False,
+        dynamic_history=False,
+    )
+    samples = [
+        DummySample(group_index=0, index=0, score=1.0, intrinsic=0.0, beta=0.01, train_step=60),
+        DummySample(group_index=0, index=1, score=1.0, intrinsic=1.0, beta=0.02, train_step=60),
+    ]
+
+    _, adjusted = reward_postprocess.post_process_rewards(args, samples)
+
+    assert math.isclose(adjusted[0], -0.025)
+    assert math.isclose(adjusted[1], 0.05)
+    assert samples[1].reward["explore_post_norm_bonus_base_coef"] == 0.2
+    assert samples[1].reward["explore_post_norm_bonus_coef"] == 0.1
+    assert samples[1].reward["explore_post_norm_bonus_schedule"] == "cosine"
+    assert math.isclose(
+        samples[1].reward["explore_post_norm_bonus_schedule_multiplier"],
+        0.5,
+    )
+
+
+def test_dual_stream_can_suppress_truncated_intrinsic(monkeypatch):
+    monkeypatch.setenv("EXPLORE_ADVANTAGE_BONUS", "1")
+    monkeypatch.setenv("EXPLORE_ADVANTAGE_BONUS_ENABLED", "1")
+    monkeypatch.setenv("EXPLORE_ADVANTAGE_BONUS_MODE", "dual_stream")
+    monkeypatch.setenv("EXPLORE_ADVANTAGE_LAMBDA", "0.2")
+    monkeypatch.setenv("EXPLORE_ADVANTAGE_ARM_WEIGHT_MODE", "normalized_beta")
+    monkeypatch.setenv("EXPLORE_ADVANTAGE_BONUS_CLIP", "0")
+    monkeypatch.setenv("EXPLORE_ADVANTAGE_TRUNCATED_INTRINSIC_SCALE", "0")
+    monkeypatch.setenv("EXPLORE_TRUNCATION_PENALTY", "-0.03")
+    args = SimpleNamespace(
+        reward_key="score",
+        advantage_estimator="grpo",
+        rewards_normalization=True,
+        grpo_std_normalization=False,
+        dynamic_history=False,
+    )
+    samples = [
+        DummySample(group_index=0, index=0, score=1.0, intrinsic=0.0, beta=0.01),
+        DummySample(
+            group_index=0,
+            index=1,
+            score=1.0,
+            intrinsic=1.0,
+            beta=0.02,
+            status="truncated",
+        ),
+    ]
+
+    _, adjusted = reward_postprocess.post_process_rewards(args, samples)
+
+    assert math.isclose(adjusted[0], -0.05)
+    assert math.isclose(adjusted[1], -0.03)
+    assert samples[1].reward["explore_post_norm_bonus"] == 0.0
+    assert samples[1].reward["explore_post_norm_status_intrinsic_scale"] == 0.0
+    assert samples[1].reward["explore_truncation_penalty"] == -0.03
 
 
 def test_component_postnorm_mode_remains_backward_compatible(monkeypatch):

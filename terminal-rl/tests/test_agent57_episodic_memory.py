@@ -14,6 +14,7 @@ from agent57_episodic_memory import (  # noqa: E402
     CountBasedEpisodicMemoryConfig,
     SimHashKNNEpisodicMemory,
     SimHashKNNEpisodicMemoryConfig,
+    _as_numeric_vector,
     create_episodic_memory_backend,
     resolve_episodic_backend_name,
 )
@@ -126,6 +127,21 @@ def test_simhash_knn_records_query_stats_and_floor():
     stats = memory.last_query_stats()
     assert stats["exact_repeat"] == 1.0
     assert stats["probe_count"] == 9
+
+
+def test_simhash_fallback_vector_tokenizes_structured_state():
+    vector = _as_numeric_vector(
+        {
+            "tool": "shell",
+            "signature": "shell|pytest",
+            "observation": "test_pass:lenS",
+            "exit": "exit0",
+        },
+        fallback_dim=64,
+    )
+
+    assert int((vector != 0).sum()) > 1
+    assert math.isclose(float((vector * vector).sum()), 1.0)
 
 
 def test_simhash_knn_supports_l2_and_string_states():

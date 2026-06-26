@@ -342,6 +342,7 @@ _EXPLORE_AGENT57_EPISODIC_INCLUDE_TURN = _env_bool(
 )
 _CMD_COUNTER: Dict[str, int] = {}  # process-level counter for command novelty
 _AGENT57_LAST_EPISODIC_STATS: Dict[str, float] = {}
+_AGENT57_LAST_EPISODIC_BY_TURN: Dict[int, float] = {}
 
 # ── Exploration: LP-RND lifelong novelty (草案 C, zero-extra-param) ───────────
 # Reuses the rollout_log_probs already computed by slime (no extra forward pass).
@@ -681,13 +682,16 @@ def _explore_episode_signature_novelty(
     reducer: str = "sum",
 ) -> float:
     """Episode-local novelty used by Agent57 NGU-lite product mode."""
-    global _AGENT57_LAST_EPISODIC_STATS
+    global _AGENT57_LAST_EPISODIC_STATS, _AGENT57_LAST_EPISODIC_BY_TURN
     _AGENT57_LAST_EPISODIC_STATS = {}
+    _AGENT57_LAST_EPISODIC_BY_TURN = {}
     if not turn_records:
         return 0.0
     total = 0.0
     action_count = 0
     episode_counter: Dict[str, int] = {}
+    turn_total: Dict[int, float] = {}
+    turn_count: Dict[int, int] = {}
     episodic_memory = create_episodic_memory_backend(_AGENT57_CONFIG.episodic_backend)
     empty_bucket_count = 0.0
     exact_repeat_count = 0.0
@@ -695,9 +699,16 @@ def _explore_episode_signature_novelty(
     probe_count_total = 0.0
     for action in _iter_explore_actions(turn_records):
         action_count += 1
+        try:
+            turn_idx = int(action.get("turn_idx", -1))
+        except (TypeError, ValueError):
+            turn_idx = -1
         if episodic_memory is not None:
             state = _explore_agent57_episodic_state(action)
-            total += float(episodic_memory.compute_novelty(state))
+            novelty = float(episodic_memory.compute_novelty(state))
+            total += novelty
+            turn_total[turn_idx] = turn_total.get(turn_idx, 0.0) + novelty
+            turn_count[turn_idx] = turn_count.get(turn_idx, 0) + 1
             query_stats_fn = getattr(episodic_memory, "last_query_stats", None)
             query_stats = query_stats_fn() if callable(query_stats_fn) else {}
             empty_bucket_count += float(query_stats.get("empty_bucket", 0.0) or 0.0)
@@ -709,9 +720,24 @@ def _explore_episode_signature_novelty(
         key_src = action["signature"]
         key = hashlib.md5(key_src.encode()).hexdigest()[:10]
         episode_counter[key] = episode_counter.get(key, 0) + 1
-        total += 1.0 / math.sqrt(episode_counter[key])
+        novelty = 1.0 / math.sqrt(episode_counter[key])
+        total += novelty
+        turn_total[turn_idx] = turn_total.get(turn_idx, 0.0) + novelty
+        turn_count[turn_idx] = turn_count.get(turn_idx, 0) + 1
     value = total / action_count if reducer == "mean" and action_count > 0 else total
     if action_count > 0:
+        if reducer == "mean":
+            _AGENT57_LAST_EPISODIC_BY_TURN = {
+                idx: turn_total[idx] / max(1, turn_count.get(idx, 0))
+                for idx in turn_total
+                if idx >= 0
+            }
+        else:
+            _AGENT57_LAST_EPISODIC_BY_TURN = {
+                idx: turn_total[idx]
+                for idx in turn_total
+                if idx >= 0
+            }
         _AGENT57_LAST_EPISODIC_STATS = {
             "explore_agent57_episodic_action_count": float(action_count),
             "explore_agent57_episodic_empty_bucket_count": float(empty_bucket_count),
@@ -3759,6 +3785,21 @@ async def generate(
                         if not isinstance(s.metadata, dict):
                             s.metadata = {}
                         s.reward.update(_agent57_metrics)
+                        try:
+                            _turn_idx = int(s.metadata.get("turn_idx", -1))
+                        except (TypeError, ValueError):
+                            _turn_idx = -1
+                        _turn_episodic = float(
+                            _AGENT57_LAST_EPISODIC_BY_TURN.get(_turn_idx, 0.0)
+                        )
+                        _turn_life_mod = float(
+                            _agent57_metrics.get("explore_agent57_ngu_life_mod", 1.0)
+                            or 1.0
+                        )
+                        s.reward["explore_agent57_turn_episodic"] = _turn_episodic
+                        s.reward["explore_agent57_turn_intrinsic_signal"] = (
+                            _turn_episodic * _turn_life_mod
+                        )
                         s.metadata["agent57"] = {
                             "enabled": bool(_AGENT57_CONFIG.enabled),
                             "arm_id": _agent57_arm_id,
@@ -3810,6 +3851,10 @@ async def generate(
             if isinstance(r, dict) and r.get("turn_idx") is not None
         }
         for s in samples:
+            s.metadata["train_step"] = run_ctx.train_step
+            s.metadata["rollout_step"] = run_ctx.rollout_step
+            s.metadata["rollout_id"] = run_ctx.rollout_id
+            s.metadata["uid"] = run_ctx.uid
             s.metadata["model_turn_count"] = agent_runner.model_turn_count
             s.metadata["parse_error_count"] = agent_runner.parse_error_count
             s.metadata["data_source"] = data_source or s.metadata.get("data_source")
