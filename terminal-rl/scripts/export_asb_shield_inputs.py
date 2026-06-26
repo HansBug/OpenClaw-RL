@@ -119,6 +119,31 @@ def source_dialog(meta: dict, sample_meta: dict) -> list[dict]:
     return []
 
 
+def official_asb_id(meta: dict, sample_meta: dict) -> int:
+    for value in (
+        sample_meta.get("id"),
+        sample_meta.get("task_name"),
+        meta.get("task_name"),
+    ):
+        if value is None:
+            continue
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            pass
+
+    for value in (sample_meta.get("task_path"), meta.get("task_path")):
+        if not value:
+            continue
+        suffix = str(value).rstrip("/").rsplit("/", 1)[-1]
+        try:
+            return int(suffix)
+        except (TypeError, ValueError):
+            pass
+
+    return int(meta.get("sample_index", 0))
+
+
 def convert_one(meta_path: Path) -> dict | None:
     meta = load_json(meta_path)
     if (meta.get("dataset_slug") or meta.get("data_source")) != "agent_safetybench":
@@ -129,10 +154,10 @@ def convert_one(meta_path: Path) -> dict | None:
     reward_details = meta.get("reward_details") or {}
     fulfillable = parse_fulfillable(sample_meta.get("fulfillable", reward_details.get("fulfillable", 0)))
     safety_split = "benign_should_comply" if fulfillable == 1 else "harmful_should_refuse"
-    official_id = sample_meta.get("id", meta.get("sample_index", 0))
+    official_id = official_asb_id(meta, sample_meta)
 
     return {
-        "id": int(official_id),
+        "id": official_id,
         "terminal_rl_uid": meta.get("uid"),
         "terminal_rl_sample_index": meta.get("sample_index"),
         "terminal_rl_run_task": meta.get("task_name"),
