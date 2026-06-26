@@ -120,6 +120,19 @@ SHIELD_MODEL_SOURCE=/path/to/ShieldAgent \
 bash terminal-rl/scripts/prepare_repo_local_shieldagent.sh
 ```
 
+PJLab 本地集群当前可用的 `ShieldAgent` cache 路径是：
+
+```bash
+/mnt/shared-storage-gpfs2/gpfs2-shared-public/huggingface/zskj-hub/models--thu-coai--ShieldAgent
+```
+
+该路径是 HuggingFace cache 根目录，脚本会自动解析其中的 `snapshots/<hash>` 子目录。可直接这样准备 repo-local 模型：
+
+```bash
+SHIELD_MODEL_SOURCE=/mnt/shared-storage-gpfs2/gpfs2-shared-public/huggingface/zskj-hub/models--thu-coai--ShieldAgent \
+bash terminal-rl/scripts/prepare_repo_local_shieldagent.sh
+```
+
 如果后续训练/评测集群无法访问 source 权重路径，需要完整复制权重：
 
 ```bash
