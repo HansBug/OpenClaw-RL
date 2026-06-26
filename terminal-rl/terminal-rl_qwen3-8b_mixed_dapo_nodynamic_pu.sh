@@ -408,13 +408,14 @@ case "${CLAUDE_CODE_LLM_BACKEND}" in
 esac
 CLAUDE_CODE_MODEL="${CLAUDE_CODE_MODEL:-}"
 CLAUDE_CODE_QWEN_GATEWAY_MODEL="${CLAUDE_CODE_QWEN_GATEWAY_MODEL:-qwen-8b-sglang}"
-CLAUDE_CODE_WORKSPACE_ROOT="${CLAUDE_CODE_WORKSPACE_ROOT:-${RUN_DIR}/claude_code_workspaces}"
+CLAUDE_CODE_LOCAL_RUN_ROOT="${CLAUDE_CODE_LOCAL_RUN_ROOT:-${CLAUDE_CODE_WORKSPACE_ROOT:-${RUN_LOG_DIR}/claude_code_cli}}"
+CLAUDE_CODE_WORKSPACE_ROOT="${CLAUDE_CODE_WORKSPACE_ROOT:-${CLAUDE_CODE_LOCAL_RUN_ROOT}}"
 CLAUDE_CODE_TURN_TIMEOUT_SEC="${CLAUDE_CODE_TURN_TIMEOUT_SEC:-900}"
 CLAUDE_CODE_TOOL_TIMEOUT_MS="${CLAUDE_CODE_TOOL_TIMEOUT_MS:-300000}"
 CLAUDE_CODE_MAX_TOOL_ROUNDS="${CLAUDE_CODE_MAX_TOOL_ROUNDS:-10}"
 CLAUDE_CODE_OUTPUT_FORMAT="${CLAUDE_CODE_OUTPUT_FORMAT:-json}"
 CLAUDE_CODE_PERMISSION_MODE="${CLAUDE_CODE_PERMISSION_MODE:-bypassPermissions}"
-CLAUDE_CODE_ALLOWED_TOOLS="${CLAUDE_CODE_ALLOWED_TOOLS:-mcp__terminal_rl__shell_exec,mcp__terminal_rl__shell_view,mcp__terminal_rl__shell_write_to_process,mcp__terminal_rl__shell_write_content_to_file}"
+CLAUDE_CODE_ALLOWED_TOOLS="${CLAUDE_CODE_ALLOWED_TOOLS:-mcp__terminal_rl__shell_exec,mcp__terminal_rl__shell_view,mcp__terminal_rl__shell_write_to_process,mcp__terminal_rl__shell_write_content_to_file,mcp__terminal_rl__read_file,mcp__terminal_rl__write_file,mcp__terminal_rl__list_dir}"
 CLAUDE_CODE_DISALLOWED_TOOLS="${CLAUDE_CODE_DISALLOWED_TOOLS:-}"
 CLAUDE_CODE_EXTRA_ARGS="${CLAUDE_CODE_EXTRA_ARGS:-}"
 CLAUDE_CODE_SYSTEM_PROMPT="${CLAUDE_CODE_SYSTEM_PROMPT:-}"
@@ -1832,7 +1833,8 @@ cat > "${RUN_DIR}/config/run_config.json" <<CFGEOF
   "claude_code_llm_backend": "${CLAUDE_CODE_LLM_BACKEND}",
   "claude_code_model": "${CLAUDE_CODE_MODEL}",
   "claude_code_qwen_gateway_model": "${CLAUDE_CODE_QWEN_GATEWAY_MODEL}",
-  "claude_code_workspace_root": "${CLAUDE_CODE_WORKSPACE_ROOT}",
+  "claude_code_local_run_root": "${CLAUDE_CODE_LOCAL_RUN_ROOT}",
+  "claude_code_workspace_root_compat": "${CLAUDE_CODE_WORKSPACE_ROOT}",
   "claude_code_max_tool_rounds": "${CLAUDE_CODE_MAX_TOOL_ROUNDS}",
   "claude_code_tool_timeout_ms": "${CLAUDE_CODE_TOOL_TIMEOUT_MS}",
   "claude_code_turn_timeout_sec": "${CLAUDE_CODE_TURN_TIMEOUT_SEC}",
@@ -1905,6 +1907,7 @@ if [[ "${HARNESS_OPTION}" == "claude-code" ]]; then
     \"CLAUDE_CODE_LLM_BACKEND\": \"${CLAUDE_CODE_LLM_BACKEND}\",
     \"CLAUDE_CODE_MODEL\": \"${CLAUDE_CODE_MODEL}\",
     \"CLAUDE_CODE_QWEN_GATEWAY_MODEL\": \"${CLAUDE_CODE_QWEN_GATEWAY_MODEL}\",
+    \"CLAUDE_CODE_LOCAL_RUN_ROOT\": \"${CLAUDE_CODE_LOCAL_RUN_ROOT}\",
     \"CLAUDE_CODE_WORKSPACE_ROOT\": \"${CLAUDE_CODE_WORKSPACE_ROOT}\",
     \"CLAUDE_CODE_TURN_TIMEOUT_SEC\": \"${CLAUDE_CODE_TURN_TIMEOUT_SEC}\",
     \"CLAUDE_CODE_TOOL_TIMEOUT_MS\": \"${CLAUDE_CODE_TOOL_TIMEOUT_MS}\",

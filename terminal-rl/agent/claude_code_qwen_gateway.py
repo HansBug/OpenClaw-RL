@@ -283,6 +283,16 @@ class ClaudeCodeQwenGateway:
         output_token_logprobs = [
             float(x[0]) for x in raw_logprobs if isinstance(x, (list, tuple)) and len(x) >= 2
         ]
+        if raw_text and not output_token_ids:
+            raise RuntimeError(
+                "SGLang response text was non-empty but output_token_logprobs "
+                "did not contain token ids; refusing to build trainable claude-code sample"
+            )
+        if len(output_token_ids) != len(output_token_logprobs):
+            raise RuntimeError(
+                "SGLang output_token_logprobs token/logprob length mismatch: "
+                f"{len(output_token_ids)} tokens vs {len(output_token_logprobs)} logprobs"
+            )
 
         clean_text = raw_text
         tool_blocks: list[dict[str, Any]] = []

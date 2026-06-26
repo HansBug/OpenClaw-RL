@@ -12,11 +12,14 @@ import tempfile
 import threading
 import time
 import uuid
+from datetime import date
 from dataclasses import dataclass, field
+from functools import lru_cache
 from pathlib import Path
 from typing import Any, Dict, List
 
 from agent.claude_code_qwen_gateway import ClaudeCodeQwenGateway
+from agent.prompts import get_developer_agent_prompt
 from custom_types import Interaction, TurnResult
 from inference_client import SGLangTurnClient
 
@@ -27,7 +30,10 @@ DEFAULT_ALLOWED_TOOLS = (
     "mcp__terminal_rl__shell_exec,"
     "mcp__terminal_rl__shell_view,"
     "mcp__terminal_rl__shell_write_to_process,"
-    "mcp__terminal_rl__shell_write_content_to_file"
+    "mcp__terminal_rl__shell_write_content_to_file,"
+    "mcp__terminal_rl__read_file,"
+    "mcp__terminal_rl__write_file,"
+    "mcp__terminal_rl__list_dir"
 )
 
 
@@ -78,6 +84,18 @@ def _env_float(name: str, default: float) -> float:
         return default
 
 
+def _env_mode(name: str, default: str = "auto") -> str:
+    raw = os.getenv(name)
+    if raw is None or raw == "":
+        return default
+    text = raw.strip().lower()
+    if text in {"1", "true", "yes", "on", "force", "always"}:
+        return "force"
+    if text in {"0", "false", "no", "off", "never", "skip"}:
+        return "skip"
+    return text
+
+
 def _normalize_llm_backend(value: str | None) -> str:
     text = str(value or "sglang").strip().lower().replace("_", "-")
     if text in {"sglang", "qwen", "qwen-sglang", "local", "local-sglang"}:
@@ -90,6 +108,24 @@ def _normalize_llm_backend(value: str | None) -> str:
 
 def _repo_root() -> Path:
     return Path(__file__).resolve().parents[2]
+
+
+@lru_cache(maxsize=32)
+def _claude_cli_help_text(cli_path: str, timeout_sec: float) -> str:
+    try:
+        with tempfile.TemporaryDirectory() as tmp:
+            completed = subprocess.run(
+                [cli_path, "--help"],
+                text=True,
+                cwd=tmp,
+                capture_output=True,
+                timeout=timeout_sec if timeout_sec > 0 else None,
+                check=False,
+            )
+    except Exception as exc:
+        logger.debug("Unable to probe Claude Code CLI help for %s: %s", cli_path, exc)
+        return ""
+    return f"{completed.stdout or ''}\n{completed.stderr or ''}"
 
 
 def _text_from_message_content(content: Any) -> str:
@@ -226,12 +262,13 @@ class ClaudeCodeAgent:
         non_think_mode: bool | None = None,
         max_parse_errors: int | None = None,
     ) -> None:
-        _ = (model_type, max_total_tokens, non_think_mode)
+        _ = (model_type, max_total_tokens)
         self._sglang_client = sglang_client
         self._env_client = env_client
         self._lease_id = lease_id
         self._run_context = run_context
         self._task_meta = task_meta or {}
+        self._non_think_mode = True if non_think_mode is None else bool(non_think_mode)
         self.max_parse_errors = max(1, int(max_parse_errors or 3))
         self.parse_error_count = 0
         self._prompt = ""
@@ -239,6 +276,7 @@ class ClaudeCodeAgent:
         self._last_response: ClaudeCodeResponse | None = None
         self._tmpdir: tempfile.TemporaryDirectory[str] | None = None
         self._workspace = self._resolve_workspace()
+        self._local_run_dir = self._workspace
         self._tool_log_path = self._workspace / "terminal_rl_tool_calls.jsonl"
         self._stdout_path = self._workspace / "claude_stdout.log"
         self._stderr_path = self._workspace / "claude_stderr.log"
@@ -258,6 +296,17 @@ class ClaudeCodeAgent:
         self._tool_timeout_ms = _env_int("CLAUDE_CODE_TOOL_TIMEOUT_MS", 300_000)
         self._max_turns = max(1, _env_int("CLAUDE_CODE_MAX_TOOL_ROUNDS", 10))
         self._mcp_python = os.getenv("CLAUDE_CODE_MCP_PYTHON", sys.executable).strip() or sys.executable
+        self._cli_help_timeout_sec = _env_float("CLAUDE_CODE_HELP_TIMEOUT_SEC", 5.0)
+        self._max_turns_arg_mode = _env_mode("CLAUDE_CODE_MAX_TURNS_ARG", "auto")
+        self._strict_mcp_config = _env_flag("CLAUDE_CODE_STRICT_MCP_CONFIG", True)
+        self._disable_builtin_tools = _env_flag("CLAUDE_CODE_DISABLE_BUILTIN_TOOLS", True)
+        self._bare_mode = _env_flag("CLAUDE_CODE_BARE", self._llm_backend == "sglang")
+        builtin_tools = os.getenv("CLAUDE_CODE_BUILTIN_TOOLS")
+        self._builtin_tools = "" if builtin_tools is None else builtin_tools
+        self._no_session_persistence = _env_flag(
+            "CLAUDE_CODE_NO_SESSION_PERSISTENCE",
+            True,
+        )
         self._permission_mode = os.getenv(
             "CLAUDE_CODE_PERMISSION_MODE",
             "bypassPermissions",
@@ -372,19 +421,34 @@ class ClaudeCodeAgent:
             self._tmpdir = None
 
     def _resolve_workspace(self) -> Path:
-        raw = os.getenv("CLAUDE_CODE_WORKSPACE")
+        raw = os.getenv("CLAUDE_CODE_LOCAL_RUN_DIR") or os.getenv("CLAUDE_CODE_WORKSPACE")
         if raw:
             path = Path(raw).expanduser()
         else:
             uid = getattr(self._run_context, "uid", None) or uuid.uuid4().hex[:8]
+            group_index = getattr(self._run_context, "group_index", None)
+            sample_index = getattr(self._run_context, "sample_index", None)
             task_name = str(self._task_meta.get("task_name") or "task")
-            root = Path(
-                os.getenv(
-                    "CLAUDE_CODE_WORKSPACE_ROOT",
-                    str(_repo_root() / "runs" / "claude_code_workspaces"),
-                )
+            root_env = os.getenv("CLAUDE_CODE_LOCAL_RUN_ROOT") or os.getenv(
+                "CLAUDE_CODE_WORKSPACE_ROOT"
             )
-            path = root / f"claude-code-{_sanitize_filename(task_name)}-{uid}"
+            if root_env:
+                root = Path(root_env).expanduser()
+            else:
+                run_log_dir = getattr(self._run_context, "log_dir", None)
+                if run_log_dir:
+                    root = Path(run_log_dir).expanduser() / "claude_code_cli"
+                else:
+                    root = _repo_root() / "runs" / "claude_code_cli"
+            suffix_parts = [str(uid)]
+            if group_index is not None:
+                suffix_parts.append(f"g{group_index}")
+            if sample_index is not None:
+                suffix_parts.append(f"s{sample_index}")
+            path = root / (
+                f"claude-code-{_sanitize_filename(task_name)}-"
+                f"{_sanitize_filename('-'.join(suffix_parts))}"
+            )
         path.mkdir(parents=True, exist_ok=True)
         return path
 
@@ -475,16 +539,28 @@ class ClaudeCodeAgent:
 
     def _build_cli_args(self, cli_path: str) -> list[str]:
         args = [cli_path, "-p", "--output-format", self._output_format]
+        if self._bare_mode and self._cli_supports_option(cli_path, "--bare"):
+            args.append("--bare")
         if self._model:
             args.extend(["--model", self._model])
-        args.extend(["--max-turns", str(self._max_turns)])
+        if self._should_use_cli_option(cli_path, "--max-turns", self._max_turns_arg_mode):
+            args.extend(["--max-turns", str(self._max_turns)])
         args.extend(["--mcp-config", str(self._mcp_config_path)])
+        if self._strict_mcp_config and self._cli_supports_option(cli_path, "--strict-mcp-config"):
+            args.append("--strict-mcp-config")
+        if self._disable_builtin_tools and self._cli_supports_option(cli_path, "--tools"):
+            args.extend(["--tools", self._builtin_tools])
         if self._allowed_tools:
             args.extend(["--allowedTools", self._allowed_tools])
         if self._disallowed_tools:
             args.extend(["--disallowedTools", self._disallowed_tools])
         if self._permission_mode:
             args.extend(["--permission-mode", self._permission_mode])
+        if (
+            self._no_session_persistence
+            and self._cli_supports_option(cli_path, "--no-session-persistence")
+        ):
+            args.append("--no-session-persistence")
         system_prompt = self._system_prompt or self._default_system_prompt()
         if system_prompt:
             args.extend(["--append-system-prompt", system_prompt])
@@ -492,19 +568,47 @@ class ClaudeCodeAgent:
             args.extend(shlex.split(self._extra_args))
         return args
 
+    def _cli_supports_option(self, cli_path: str, option: str) -> bool:
+        help_text = _claude_cli_help_text(cli_path, self._cli_help_timeout_sec)
+        return bool(help_text and option in help_text)
+
+    def _should_use_cli_option(self, cli_path: str, option: str, mode: str) -> bool:
+        if mode == "skip":
+            return False
+        if mode == "force":
+            return True
+        supported = self._cli_supports_option(cli_path, option)
+        if not supported:
+            logger.info(
+                "Skipping Claude Code CLI option %s because it was not found in --help. "
+                "Set CLAUDE_CODE_MAX_TURNS_ARG=1 to force it.",
+                option,
+            )
+        return supported
+
     def _default_system_prompt(self) -> str:
-        return (
+        camel_prompt = get_developer_agent_prompt(
+            current_date=str(date.today()),
+            system="Linux (in Docker)",
+            machine=os.getenv("CLAUDE_CODE_MACHINE", "x86_64"),
+            is_workforce=False,
+            non_think_mode=self._non_think_mode,
+        )
+        mcp_boundary = (
             "You are running inside the OpenClaw terminal-rl harness. Use only the "
             "terminal_rl MCP tools for task inspection and modification; they execute "
-            "inside the benchmark task environment. Do not rely on local Read, Write, "
-            "Edit, or Bash tools for task state. Keep command output bounded and stop "
-            "once the task is complete."
+            "inside the remote benchmark Docker/container lease. Use shell_exec, "
+            "read_file, write_file, list_dir, shell_view, and shell_write_to_process "
+            "through the MCP server for all reads, writes, and commands. Do not rely "
+            "on local Read, Write, Edit, or Bash tools for task state. Keep command "
+            "output bounded and stop once the task is complete."
         )
+        return f"{camel_prompt}\n\n<terminal_rl_mcp_boundary>\n{mcp_boundary}\n</terminal_rl_mcp_boundary>"
 
     def _build_subprocess_env(self) -> dict[str, str]:
         env = dict(os.environ)
         env.setdefault("CLAUDE_CODE_ENTRYPOINT", "terminal-rl")
-        env.setdefault("CLAUDE_CODE_SESSION_ID", self._session_id)
+        env["TERMINAL_RL_CLAUDE_CODE_SESSION_ID"] = self._session_id
         if self._uses_sglang_gateway():
             gateway = self._ensure_qwen_gateway()
             env["ANTHROPIC_BASE_URL"] = gateway.base_url
@@ -656,7 +760,10 @@ class ClaudeCodeAgent:
             ),
             "llm_backend": self._llm_backend,
             "session_id": self._session_id,
-            "workspace": str(self._workspace),
+            "local_run_dir": str(self._local_run_dir),
+            "local_run_dir_kind": "logs_and_cli_control_only",
+            "workspace": str(self._local_run_dir),
+            "workspace_kind": "logs_and_cli_control_only",
             "task_path": self._task_meta.get("task_path"),
             "returncode": completed.returncode,
             "stdout_path": str(self._stdout_path),

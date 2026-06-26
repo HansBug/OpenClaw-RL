@@ -63,7 +63,9 @@ def test_claude_code_agent_runs_cli_and_writes_mcp_config(tmp_path, monkeypatch)
     fake_cli = tmp_path / "claude"
     fake_cli.write_text(
         "#!/usr/bin/env python3\n"
-        "import json, pathlib, sys\n"
+        "import json, os, pathlib, sys\n"
+        "assert 'CLAUDE_CODE_SESSION_ID' not in os.environ\n"
+        "assert os.environ['TERMINAL_RL_CLAUDE_CODE_SESSION_ID'].startswith('terminal-rl-claude-')\n"
         "pathlib.Path('argv.json').write_text(json.dumps(sys.argv[1:]))\n"
         "print(json.dumps({'result': 'done from claude'}))\n",
         encoding="utf-8",
@@ -104,6 +106,7 @@ def test_claude_code_agent_runs_cli_and_writes_mcp_config(tmp_path, monkeypatch)
     assert result.interaction.output_text == "done from claude"
     assert result.model_response.info["harness_option"] == "claude-code"
     assert result.model_response.info["non_trainable"] is True
+    assert result.model_response.info["workspace_kind"] == "logs_and_cli_control_only"
     assert result.model_response.tool_calls_count == 0
 
     workspace = Path(result.model_response.info["workspace"])
@@ -195,6 +198,118 @@ def test_claude_code_sglang_backend_records_qwen_logprobs(tmp_path, monkeypatch)
     assert result.model_response.info["qwen_gateway_turns"] == 1
 
 
+def test_claude_code_cli_args_skip_unsupported_max_turns(tmp_path, monkeypatch):
+    fake_cli = tmp_path / "claude"
+    fake_cli.write_text(
+        "#!/usr/bin/env python3\n"
+        "import sys\n"
+        "if '--help' in sys.argv:\n"
+        "    print('Usage: claude -p --output-format --mcp-config --allowedTools')\n"
+        "    raise SystemExit(0)\n"
+        "raise SystemExit(0)\n",
+        encoding="utf-8",
+    )
+    fake_cli.chmod(0o755)
+    monkeypatch.setenv("CLAUDE_CODE_CLI", str(fake_cli))
+    monkeypatch.setenv("CLAUDE_CODE_LLM_BACKEND", "anthropic")
+    monkeypatch.setenv("CLAUDE_CODE_WORKSPACE_ROOT", str(tmp_path / "workspaces"))
+    monkeypatch.setenv("CLAUDE_CODE_HELP_TIMEOUT_SEC", "2")
+
+    agent = claude_agent_module.ClaudeCodeAgent(
+        model_type="Qwen3",
+        sglang_client=DummySGLangClient(),
+        env_client=FakeEnvClient(),
+        lease_id="lease-1",
+        run_context=types.SimpleNamespace(uid="abc123", group_index=1, sample_index=2),
+        task_meta={"task_name": "seta-task", "task_path": "seta_env/1"},
+        max_total_tokens=8192,
+    )
+    args = agent._build_cli_args(str(fake_cli))
+
+    assert "--max-turns" not in args
+    assert "--mcp-config" in args
+    assert "--allowedTools" in args
+
+
+def test_claude_code_cli_args_disable_local_builtin_tools_when_supported(tmp_path, monkeypatch):
+    fake_cli = tmp_path / "claude"
+    fake_cli.write_text(
+        "#!/usr/bin/env python3\n"
+        "import sys\n"
+        "if '--help' in sys.argv:\n"
+        "    print('--bare --max-turns --tools --strict-mcp-config --no-session-persistence')\n"
+        "    raise SystemExit(0)\n"
+        "raise SystemExit(0)\n",
+        encoding="utf-8",
+    )
+    fake_cli.chmod(0o755)
+    monkeypatch.setenv("CLAUDE_CODE_CLI", str(fake_cli))
+    monkeypatch.setenv("CLAUDE_CODE_LLM_BACKEND", "anthropic")
+    monkeypatch.setenv("CLAUDE_CODE_WORKSPACE_ROOT", str(tmp_path / "workspaces"))
+    monkeypatch.setenv("CLAUDE_CODE_HELP_TIMEOUT_SEC", "2")
+
+    agent = claude_agent_module.ClaudeCodeAgent(
+        model_type="Qwen3",
+        sglang_client=DummySGLangClient(),
+        env_client=FakeEnvClient(),
+        lease_id="lease-1",
+        run_context=types.SimpleNamespace(uid="abc123", group_index=1, sample_index=2),
+        task_meta={"task_name": "seta-task", "task_path": "seta_env/1"},
+        max_total_tokens=8192,
+    )
+    args = agent._build_cli_args(str(fake_cli))
+
+    assert "--bare" not in args
+    assert args[args.index("--max-turns") + 1] == "10"
+    assert "--strict-mcp-config" in args
+    assert "--no-session-persistence" in args
+    assert args[args.index("--tools") + 1] == ""
+    allowed = args[args.index("--allowedTools") + 1]
+    assert "mcp__terminal_rl__shell_exec" in allowed
+    assert "mcp__terminal_rl__read_file" in allowed
+    assert "mcp__terminal_rl__write_file" in allowed
+
+
+def test_claude_code_sglang_uses_log_dir_and_bare_mode(tmp_path, monkeypatch):
+    fake_cli = tmp_path / "claude"
+    fake_cli.write_text(
+        "#!/usr/bin/env python3\n"
+        "import sys\n"
+        "if '--help' in sys.argv:\n"
+        "    print('--bare --mcp-config --allowedTools')\n"
+        "    raise SystemExit(0)\n"
+        "raise SystemExit(0)\n",
+        encoding="utf-8",
+    )
+    fake_cli.chmod(0o755)
+    monkeypatch.setenv("CLAUDE_CODE_CLI", str(fake_cli))
+    monkeypatch.setenv("CLAUDE_CODE_LLM_BACKEND", "sglang")
+    monkeypatch.delenv("CLAUDE_CODE_LOCAL_RUN_ROOT", raising=False)
+    monkeypatch.delenv("CLAUDE_CODE_WORKSPACE_ROOT", raising=False)
+    monkeypatch.setenv("CLAUDE_CODE_HELP_TIMEOUT_SEC", "2")
+
+    log_dir = tmp_path / "rollout_logs"
+    agent = claude_agent_module.ClaudeCodeAgent(
+        model_type="Qwen3",
+        sglang_client=DummySGLangClient(),
+        env_client=FakeEnvClient(),
+        lease_id="lease-1",
+        run_context=types.SimpleNamespace(
+            uid="abc123",
+            group_index=1,
+            sample_index=2,
+            log_dir=log_dir,
+        ),
+        task_meta={"task_name": "seta-task", "task_path": "seta_env/1"},
+        max_total_tokens=8192,
+    )
+    args = agent._build_cli_args(str(fake_cli))
+
+    assert "--bare" in args
+    assert str(agent._local_run_dir).startswith(str(log_dir / "claude_code_cli"))
+    assert agent._local_run_dir.name == "claude-code-seta-task-abc123-g1-s2"
+
+
 def test_qwen_gateway_converts_anthropic_messages_to_sglang_logprob_record(tmp_path):
     class FakeSGLangClient(DummySGLangClient):
         seen_payload = None
@@ -238,6 +353,36 @@ def test_qwen_gateway_converts_anthropic_messages_to_sglang_logprob_record(tmp_p
     record = gateway.records()[0]
     assert record["output_token_ids"] == [101, 102]
     assert record["output_token_logprobs"] == [-0.1, -0.2]
+
+
+def test_qwen_gateway_rejects_nonempty_text_without_logprobs(tmp_path):
+    client = DummySGLangClient()
+    gateway = ClaudeCodeQwenGateway(
+        sglang_client=client,
+        records_path=tmp_path / "records.jsonl",
+        model_name="qwen-8b-test",
+    )
+
+    def fake_post(payload):
+        _ = payload
+        return {
+            "text": "qwen final answer",
+            "meta_info": {"finish_reason": {"type": "stop"}},
+        }
+
+    gateway._post_sglang = fake_post
+    try:
+        gateway._build_message_response(
+            {
+                "model": "claude-sonnet-4-5",
+                "max_tokens": 16,
+                "messages": [{"role": "user", "content": "fix the bug"}],
+            }
+        )
+    except RuntimeError as exc:
+        assert "output_token_logprobs" in str(exc)
+    else:
+        raise AssertionError("expected missing logprobs to fail")
 
 
 def test_parse_claude_stream_json_prefers_result_event():

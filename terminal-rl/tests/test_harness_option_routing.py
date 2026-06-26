@@ -23,6 +23,11 @@ def test_training_script_routes_harness_without_polluting_camel_runtime():
     assert 'claude-code|claude_code)' in script
     assert 'if [[ "${HARNESS_OPTION}" == "claude-code" && "${DRY_RUN}" != "1" ]]' in script
     assert 'CLAUDE_CODE_MARK_NON_TRAINABLE' in script
+    assert 'CLAUDE_CODE_LOCAL_RUN_ROOT="${CLAUDE_CODE_LOCAL_RUN_ROOT:-${CLAUDE_CODE_WORKSPACE_ROOT:-${RUN_LOG_DIR}/claude_code_cli}}"' in script
+    assert '\\"CLAUDE_CODE_LOCAL_RUN_ROOT\\": \\"${CLAUDE_CODE_LOCAL_RUN_ROOT}\\"' in script
+    assert "mcp__terminal_rl__read_file" in script
+    assert "mcp__terminal_rl__write_file" in script
+    assert "mcp__terminal_rl__list_dir" in script
     assert '\\"HARNESS_OPTION\\": \\"${HARNESS_OPTION}\\"' in script
     assert '-- "${TRAIN_PYTHON}" -u "${SLIME_DIR}/train_async.py"' in script
 

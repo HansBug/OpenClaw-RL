@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import shlex
 import time
 import uuid
 from pathlib import Path
@@ -89,6 +90,14 @@ def _record_tool_call(record: dict[str, Any]) -> None:
         fh.write("\n")
 
 
+def _clamp_int(value: Any, *, default: int, minimum: int, maximum: int) -> int:
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        parsed = default
+    return max(minimum, min(maximum, parsed))
+
+
 def _exec_terminal_tool(tool_name: str, arguments: dict[str, Any]) -> str:
     timeout = max(1.0, _env_float("CLAUDE_CODE_TOOL_TIMEOUT_SEC", 300.0))
     try:
@@ -171,6 +180,42 @@ def shell_write_content_to_file(file_path: str, content: str) -> str:
     return _exec_terminal_tool(
         "shell_write_content_to_file",
         {"file_path": file_path, "content": content},
+    )
+
+
+@mcp.tool(description="Read bytes from a file inside the terminal-rl task environment.")
+def read_file(file_path: str, offset: int = 0, max_bytes: int = 20000) -> str:
+    offset = _clamp_int(offset, default=0, minimum=0, maximum=10_000_000)
+    max_bytes = _clamp_int(max_bytes, default=20_000, minimum=1, maximum=200_000)
+    quoted_path = shlex.quote(file_path)
+    if offset:
+        command = (
+            f"dd if={quoted_path} bs=1 skip={offset} count={max_bytes} "
+            "2>/dev/null"
+        )
+    else:
+        command = f"head -c {max_bytes} {quoted_path}"
+    return _exec_terminal_tool(
+        "shell_exec",
+        {"command": command, "block": True, "timeout": 20},
+    )
+
+
+@mcp.tool(description="Write text content to a file inside the terminal-rl task environment.")
+def write_file(file_path: str, content: str) -> str:
+    return _exec_terminal_tool(
+        "shell_write_content_to_file",
+        {"file_path": file_path, "content": content},
+    )
+
+
+@mcp.tool(description="List a directory inside the terminal-rl task environment.")
+def list_dir(path: str = ".", max_entries: int = 200) -> str:
+    max_entries = _clamp_int(max_entries, default=200, minimum=1, maximum=1000)
+    command = f"ls -la {shlex.quote(path)} | head -n {max_entries}"
+    return _exec_terminal_tool(
+        "shell_exec",
+        {"command": command, "block": True, "timeout": 20},
     )
 
 
