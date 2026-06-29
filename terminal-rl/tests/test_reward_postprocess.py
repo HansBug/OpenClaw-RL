@@ -25,6 +25,7 @@ class DummySample:
         trust: float = 1.0,
         status: str | None = None,
         train_step: int | None = None,
+        raw_score: float | None = None,
     ) -> None:
         self.group_index = group_index
         self.index = index
@@ -34,7 +35,7 @@ class DummySample:
             self.metadata["train_step"] = train_step
         self.reward = {
             "score": score,
-            "raw_score": score,
+            "raw_score": score if raw_score is None else raw_score,
             "base_score": score,
             "explore_agent57_intrinsic_signal": intrinsic,
             "explore_agent57_beta": beta,
@@ -142,6 +143,60 @@ def test_dual_stream_can_suppress_truncated_intrinsic(monkeypatch):
     assert samples[1].reward["explore_post_norm_bonus"] == 0.0
     assert samples[1].reward["explore_post_norm_status_intrinsic_scale"] == 0.0
     assert samples[1].reward["explore_truncation_penalty"] == -0.03
+
+
+def test_dual_stream_outcome_status_gate_rewards_high_quality_truncation(monkeypatch):
+    monkeypatch.setenv("EXPLORE_ADVANTAGE_BONUS", "1")
+    monkeypatch.setenv("EXPLORE_ADVANTAGE_BONUS_ENABLED", "1")
+    monkeypatch.setenv("EXPLORE_ADVANTAGE_BONUS_MODE", "dual_stream")
+    monkeypatch.setenv("EXPLORE_ADVANTAGE_LAMBDA", "0.2")
+    monkeypatch.setenv("EXPLORE_ADVANTAGE_ARM_WEIGHT_MODE", "none")
+    monkeypatch.setenv("EXPLORE_ADVANTAGE_GATE_MODE", "outcome_status")
+    monkeypatch.setenv("EXPLORE_ADVANTAGE_COMPLETED_FLOOR", "0.5")
+    monkeypatch.setenv("EXPLORE_ADVANTAGE_TRUNCATED_FLOOR", "0.15")
+    monkeypatch.setenv("EXPLORE_ADVANTAGE_BONUS_CLIP", "0")
+    monkeypatch.setenv("EXPLORE_TRUNCATION_PENALTY", "-0.03")
+    monkeypatch.setenv("EXPLORE_TRUNCATION_PENALTY_OUTCOME_AWARE", "1")
+    args = SimpleNamespace(
+        reward_key="score",
+        advantage_estimator="grpo",
+        rewards_normalization=True,
+        grpo_std_normalization=False,
+        dynamic_history=False,
+    )
+    samples = [
+        DummySample(
+            group_index=0,
+            index=0,
+            score=1.0,
+            raw_score=0.0,
+            intrinsic=0.0,
+            beta=0.01,
+            trust=0.0,
+        ),
+        DummySample(
+            group_index=0,
+            index=1,
+            score=1.0,
+            raw_score=1.0,
+            intrinsic=1.0,
+            beta=0.02,
+            trust=0.0,
+            status="truncated",
+        ),
+    ]
+
+    _, adjusted = reward_postprocess.post_process_rewards(args, samples)
+
+    assert math.isclose(adjusted[0], -0.05)
+    assert math.isclose(adjusted[1], 0.1)
+    assert samples[0].reward["explore_post_norm_effective_gate"] == 0.5
+    assert samples[1].reward["explore_post_norm_effective_gate"] == 1.0
+    assert samples[1].reward["explore_post_norm_quality_gate"] == 1.0
+    assert samples[1].reward["explore_post_norm_outcome_score"] == 1.0
+    assert samples[1].reward["explore_post_norm_status_floor"] == 0.15
+    assert samples[1].reward["explore_truncation_penalty"] == 0.0
+    assert samples[1].reward["explore_truncation_penalty_multiplier"] == 0.0
 
 
 def test_component_postnorm_mode_remains_backward_compatible(monkeypatch):

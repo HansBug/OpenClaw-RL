@@ -109,6 +109,22 @@ def _component_value(sample: Any, key: str) -> float:
     return 0.0
 
 
+def _component_value_or_none(sample: Any, key: str) -> float | None:
+    reward = getattr(sample, "reward", None)
+    if not isinstance(reward, dict) or key not in reward:
+        return None
+    value = reward.get(key)
+    if isinstance(value, bool):
+        return float(value)
+    if isinstance(value, (int, float)) and math.isfinite(float(value)):
+        return float(value)
+    return None
+
+
+def _clamp01(value: float) -> float:
+    return max(0.0, min(1.0, float(value)))
+
+
 def _sync_reward_aliases(
     reward: dict[str, Any] | None,
     *,
@@ -142,6 +158,69 @@ def _status_intrinsic_scale(sample: Any) -> float:
     return 1.0
 
 
+def _advantage_gate_mode() -> str:
+    return _env_str("EXPLORE_ADVANTAGE_GATE_MODE", "legacy").lower()
+
+
+def _uses_outcome_status_gate(gate_mode: str | None = None) -> bool:
+    mode = _advantage_gate_mode() if gate_mode is None else str(gate_mode or "").lower()
+    return mode in {"outcome", "outcome_status", "quality", "quality_gate", "status_quality"}
+
+
+def _outcome_candidate_keys() -> list[str]:
+    configured = _env_str("EXPLORE_ADVANTAGE_OUTCOME_KEY", "raw_score")
+    keys = [configured] if configured else []
+    keys.extend(
+        [
+            "raw_score",
+            "accuracy",
+            "success_score",
+            "unit_test_pass_rate",
+            "test_acc",
+            "pass_rate",
+            "base_score",
+            "score",
+        ]
+    )
+    out: list[str] = []
+    for key in keys:
+        if key and key not in out:
+            out.append(key)
+    return out
+
+
+def _normalize_outcome_value(key: str, value: float) -> float:
+    if key in {"score", "base_score", "task_reward", "raw_reward"} and value < 0.0:
+        return _clamp01(0.5 * (value + 1.0))
+    return _clamp01(value)
+
+
+def _outcome_score(sample: Any) -> float:
+    for key in _outcome_candidate_keys():
+        value = _component_value_or_none(sample, key)
+        if value is not None:
+            return _normalize_outcome_value(key, value)
+    status = _status_name(sample)
+    return 1.0 if "completed" in status else 0.0
+
+
+def _status_quality_floor(sample: Any) -> float:
+    status = _status_name(sample)
+    if "truncated" in status:
+        return _clamp01(_env_float("EXPLORE_ADVANTAGE_TRUNCATED_FLOOR", 0.15))
+    if "aborted" in status:
+        return _clamp01(_env_float("EXPLORE_ADVANTAGE_ABORTED_FLOOR", 0.0))
+    if "failed" in status:
+        return _clamp01(_env_float("EXPLORE_ADVANTAGE_FAILED_FLOOR", 0.0))
+    return _clamp01(_env_float("EXPLORE_ADVANTAGE_COMPLETED_FLOOR", 0.5))
+
+
+def _quality_gate(sample: Any) -> tuple[float, float, float]:
+    outcome = _outcome_score(sample)
+    floor = _status_quality_floor(sample)
+    return _clamp01(floor + (1.0 - floor) * outcome), outcome, floor
+
+
 def _configured_truncation_penalty() -> float:
     return _env_float(
         "EXPLORE_TRUNCATION_PENALTY",
@@ -156,22 +235,30 @@ def _apply_truncation_penalties(
     exploration_extra: list[float] | None = None,
 ) -> list[float]:
     penalty_value = _configured_truncation_penalty()
+    outcome_aware = _env_flag("EXPLORE_TRUNCATION_PENALTY_OUTCOME_AWARE", "0")
     should_sync_aliases = exploration_extra is not None
-    if penalty_value == 0.0 and not should_sync_aliases:
+    if penalty_value == 0.0 and not should_sync_aliases and not outcome_aware:
         return adjusted
 
     result = list(adjusted)
     extra = exploration_extra or [0.0 for _ in samples]
     for i, sample in enumerate(samples):
         is_truncated = "truncated" in _status_name(sample)
-        penalty = float(penalty_value if is_truncated else 0.0)
+        outcome = _outcome_score(sample)
+        multiplier = (1.0 - outcome) if outcome_aware else 1.0
+        if not is_truncated:
+            multiplier = 0.0
+        penalty = float(penalty_value * multiplier if is_truncated else 0.0)
         result[i] += penalty
         reward = getattr(sample, "reward", None)
         if isinstance(reward, dict):
-            if penalty_value != 0.0:
+            if penalty_value != 0.0 or outcome_aware:
                 reward["explore_truncation_penalty"] = penalty
                 reward["explore_truncation_penalty_coef"] = penalty_value
                 reward["explore_truncation_penalty_applied"] = bool(is_truncated)
+                reward["explore_truncation_penalty_outcome_aware"] = bool(outcome_aware)
+                reward["explore_truncation_penalty_outcome_score"] = outcome
+                reward["explore_truncation_penalty_multiplier"] = multiplier
             reward["explore_post_norm_adjusted_reward"] = result[i]
             reward["postprocess_total_reward"] = result[i]
             _sync_reward_aliases(
@@ -284,6 +371,7 @@ def _dual_stream_post_process(
     effective_lambda = lambda_coef * lambda_multiplier
     arm_weight_mode = _env_str("EXPLORE_ADVANTAGE_ARM_WEIGHT_MODE", "normalized_beta").lower()
     trust_key = _env_str("EXPLORE_ADVANTAGE_TRUST_KEY", "explore_agent57_trust")
+    gate_mode = _advantage_gate_mode()
     clip = _env_float("EXPLORE_ADVANTAGE_BONUS_CLIP", 0.0)
 
     intrinsic_values = [_component_value(sample, intrinsic_key) for sample in samples]
@@ -306,7 +394,12 @@ def _dual_stream_post_process(
         if trust_missing and trust_key == "explore_agent57_trust":
             trust = 1.0
         status_scale = _status_intrinsic_scale(sample)
-        raw_bonus = float(effective_lambda * arm_weight * trust * status_scale * intrinsic_adv[i])
+        quality_gate, outcome, status_floor = _quality_gate(sample)
+        if _uses_outcome_status_gate(gate_mode):
+            gate = quality_gate
+        else:
+            gate = trust * status_scale
+        raw_bonus = float(effective_lambda * arm_weight * gate * intrinsic_adv[i])
         bonus = max(-clip, min(clip, raw_bonus)) if clip > 0 else raw_bonus
         adjusted[i] += bonus
         exploration_extra[i] = bonus
@@ -328,6 +421,11 @@ def _dual_stream_post_process(
             reward["explore_post_norm_arm_weight"] = arm_weight
             reward["explore_post_norm_trust"] = trust
             reward["explore_post_norm_status_intrinsic_scale"] = status_scale
+            reward["explore_post_norm_gate_mode"] = gate_mode
+            reward["explore_post_norm_effective_gate"] = gate
+            reward["explore_post_norm_quality_gate"] = quality_gate
+            reward["explore_post_norm_outcome_score"] = outcome
+            reward["explore_post_norm_status_floor"] = status_floor
             reward["explore_post_norm_adjusted_reward"] = adjusted[i]
             reward["postprocess_total_reward"] = adjusted[i]
     return _apply_truncation_penalties(

@@ -340,6 +340,23 @@ _EXPLORE_AGENT57_EPISODIC_INCLUDE_TURN = _env_bool(
     "EXPLORE_AGENT57_EPISODIC_INCLUDE_TURN",
     True,
 )
+_EXPLORE_AGENT57_EPISODIC_TURN_MODE = (
+    os.getenv("EXPLORE_AGENT57_EPISODIC_TURN_MODE", "bucket").strip().lower()
+)
+if _EXPLORE_AGENT57_EPISODIC_TURN_MODE in {"", "1", "true", "yes", "on", "coarse"}:
+    _EXPLORE_AGENT57_EPISODIC_TURN_MODE = "bucket"
+elif _EXPLORE_AGENT57_EPISODIC_TURN_MODE in {"0", "false", "no", "off"}:
+    _EXPLORE_AGENT57_EPISODIC_TURN_MODE = "none"
+elif _EXPLORE_AGENT57_EPISODIC_TURN_MODE in {"stage"}:
+    _EXPLORE_AGENT57_EPISODIC_TURN_MODE = "phase"
+elif _EXPLORE_AGENT57_EPISODIC_TURN_MODE not in {"none", "bucket", "phase"}:
+    logger.warning(
+        "Invalid EXPLORE_AGENT57_EPISODIC_TURN_MODE=%r; using bucket",
+        _EXPLORE_AGENT57_EPISODIC_TURN_MODE,
+    )
+    _EXPLORE_AGENT57_EPISODIC_TURN_MODE = "bucket"
+if not _EXPLORE_AGENT57_EPISODIC_INCLUDE_TURN:
+    _EXPLORE_AGENT57_EPISODIC_TURN_MODE = "none"
 _CMD_COUNTER: Dict[str, int] = {}  # process-level counter for command novelty
 _AGENT57_LAST_EPISODIC_STATS: Dict[str, float] = {}
 _AGENT57_LAST_EPISODIC_BY_TURN: Dict[int, float] = {}
@@ -525,10 +542,20 @@ def _explore_structured_tool_signature(
 
 
 def _explore_turn_bucket(turn_idx: Any) -> str:
+    if _EXPLORE_AGENT57_EPISODIC_TURN_MODE == "none":
+        return "turn_ignored"
     try:
         idx = int(turn_idx)
     except (TypeError, ValueError):
         return "turn_unknown"
+    if _EXPLORE_AGENT57_EPISODIC_TURN_MODE == "phase":
+        if idx <= 0:
+            return "phase_open"
+        if idx <= 2:
+            return "phase_probe"
+        if idx <= 5:
+            return "phase_work"
+        return "phase_late"
     if idx <= 0:
         return "turn0"
     if idx <= 2:
@@ -634,7 +661,8 @@ def _explore_agent57_episodic_state(action: Dict[str, Any]) -> Dict[str, Any]:
     if _EXPLORE_AGENT57_EPISODIC_OBS_MODE != "none":
         state["observation"] = str(action.get("obs_bucket") or "no_result")
         state["exit"] = str(action.get("exit_bucket") or "exit_unknown")
-    if _EXPLORE_AGENT57_EPISODIC_INCLUDE_TURN:
+    if _EXPLORE_AGENT57_EPISODIC_TURN_MODE != "none":
+        state["turn_mode"] = _EXPLORE_AGENT57_EPISODIC_TURN_MODE
         state["turn"] = str(action.get("turn_bucket") or "turn_unknown")
     return state
 
@@ -717,7 +745,7 @@ def _explore_episode_signature_novelty(
             probe_count_total += float(query_stats.get("probe_count", 0.0) or 0.0)
             episodic_memory.add(state)
             continue
-        key_src = action["signature"]
+        key_src = _stable_json(_explore_agent57_episodic_state(action))
         key = hashlib.md5(key_src.encode()).hexdigest()[:10]
         episode_counter[key] = episode_counter.get(key, 0) + 1
         novelty = 1.0 / math.sqrt(episode_counter[key])
@@ -745,6 +773,15 @@ def _explore_episode_signature_novelty(
             "explore_agent57_episodic_exact_repeat_count": float(exact_repeat_count),
             "explore_agent57_episodic_candidate_count_mean": float(candidate_count_total / action_count),
             "explore_agent57_episodic_probe_count_mean": float(probe_count_total / action_count),
+            "explore_agent57_episodic_include_turn": float(
+                _EXPLORE_AGENT57_EPISODIC_TURN_MODE != "none"
+            ),
+            "explore_agent57_episodic_turn_mode_code": float(
+                {"none": 0, "bucket": 1, "phase": 2}.get(
+                    _EXPLORE_AGENT57_EPISODIC_TURN_MODE,
+                    1,
+                )
+            ),
         }
     return value
 
@@ -1860,6 +1897,8 @@ def _exploration_audit_from_reward(reward: Dict[str, Any]) -> Dict[str, Any]:
         "explore_agent57_episodic_exact_repeat_count",
         "explore_agent57_episodic_candidate_count_mean",
         "explore_agent57_episodic_probe_count_mean",
+        "explore_agent57_episodic_include_turn",
+        "explore_agent57_episodic_turn_mode_code",
         "explore_agent57_lifelong_raw",
         "explore_agent57_lifelong_z",
         "explore_agent57_lifelong_stat_n",
@@ -2009,6 +2048,8 @@ def _save_rollout_artifacts(
                 "explore_agent57_episodic_exact_repeat_count",
                 "explore_agent57_episodic_candidate_count_mean",
                 "explore_agent57_episodic_probe_count_mean",
+                "explore_agent57_episodic_include_turn",
+                "explore_agent57_episodic_turn_mode_code",
                 "explore_agent57_lifelong_raw",
                 "explore_agent57_lifelong_z",
                 "explore_agent57_lifelong_stat_n",
