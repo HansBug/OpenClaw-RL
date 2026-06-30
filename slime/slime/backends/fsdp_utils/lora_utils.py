@@ -16,11 +16,22 @@ import torch.distributed as dist
 logger = logging.getLogger(__name__)
 
 
+def _trainable_parameter_names(model: torch.nn.Module) -> set[str]:
+    return {name for name, param in model.named_parameters() if param.requires_grad}
+
+
+def _filter_trainable_state_dict(
+    state_dict: dict[str, torch.Tensor],
+    trainable_names: set[str],
+) -> dict[str, torch.Tensor]:
+    return {name: tensor for name, tensor in state_dict.items() if name in trainable_names}
+
+
 def apply_lora(model: torch.nn.Module, args: Namespace) -> torch.nn.Module:
     """Wrap *model* with PEFT LoRA adapters according to *args*.
 
     Returns the PeftModel wrapper.  All base-model parameters are frozen;
-    only the LoRA parameters are trainable.
+    only the LoRA parameters and PEFT modules_to_save parameters are trainable.
     """
     from peft import LoraConfig, get_peft_model
 
@@ -74,7 +85,7 @@ def propagate_no_split_modules(model: torch.nn.Module) -> torch.nn.Module:
 
 
 def save_lora_checkpoint(model: torch.nn.Module, path: Path) -> None:
-    """Save only the LoRA adapter weights + config to *path*.
+    """Save LoRA adapter trainable weights + config to *path*.
 
     Only rank 0 writes to disk.  All ranks participate in the state-dict
     gathering (handled by FSDP through ``state_dict()``).
@@ -87,9 +98,19 @@ def save_lora_checkpoint(model: torch.nn.Module, path: Path) -> None:
         options=StateDictOptions(full_state_dict=True, cpu_offload=True),
     )
 
+    trainable_names = _trainable_parameter_names(model)
+
     if dist.get_rank() == 0:
-        # Filter to only LoRA keys
-        lora_state = {k: v for k, v in full_state.items() if "lora_" in k}
+        # Save every trainable adapter parameter. This includes PEFT LoRA
+        # tensors and any modules_to_save parameters kept fully trainable.
+        lora_state = _filter_trainable_state_dict(full_state, trainable_names)
+        missing = sorted(trainable_names - set(lora_state))
+        if missing:
+            logger.warning(
+                "FSDP state dict is missing %d trainable LoRA parameter(s); examples: %s",
+                len(missing),
+                missing[:8],
+            )
         path.mkdir(parents=True, exist_ok=True)
         torch.save(lora_state, path / "adapter_weights.pt")
 
@@ -107,7 +128,7 @@ def save_lora_checkpoint(model: torch.nn.Module, path: Path) -> None:
                     json.dump(cfg_dict, f, indent=2)
                 break  # Only save the first (default) adapter
 
-        logger.info(f"Saved LoRA adapter ({len(lora_state)} tensors) to {path}")
+        logger.info(f"Saved LoRA adapter/trainable state ({len(lora_state)} tensors) to {path}")
 
     dist.barrier()
 
@@ -124,31 +145,33 @@ def load_lora_checkpoint(model: torch.nn.Module, path: Path) -> None:
         logger.warning(f"No LoRA adapter found at {adapter_file}; skipping load.")
         return
 
+    trainable_names = _trainable_parameter_names(model)
+
     if dist.get_rank() == 0:
         lora_state = torch.load(adapter_file, map_location="cpu", weights_only=True)
-        logger.info(f"Loaded LoRA adapter ({len(lora_state)} tensors) from {path}")
+        full_state = _filter_trainable_state_dict(lora_state, trainable_names)
+        missing = sorted(trainable_names - set(full_state))
+        if missing:
+            logger.warning(
+                "LoRA checkpoint is missing %d trainable parameter(s); examples: %s",
+                len(missing),
+                missing[:8],
+            )
+        logger.info(f"Loaded LoRA adapter/trainable state ({len(full_state)} tensors) from {path}")
     else:
-        lora_state = {}
+        full_state = {}
 
-    # Build a full state dict with LoRA weights overlaid
-    full_state = {}
-    for name, param in model.named_parameters():
-        if "lora_" in name:
-            if name in lora_state:
-                full_state[name] = lora_state[name]
-
-    if full_state:
-        set_model_state_dict(
-            model,
-            full_state,
-            options=StateDictOptions(
-                full_state_dict=True,
-                cpu_offload=True,
-                broadcast_from_rank0=True,
-                strict=False,
-            ),
-        )
-        logger.info(f"Loaded {len(full_state)} LoRA parameters from checkpoint.")
+    set_model_state_dict(
+        model,
+        full_state,
+        options=StateDictOptions(
+            full_state_dict=True,
+            cpu_offload=True,
+            broadcast_from_rank0=True,
+            strict=False,
+        ),
+    )
+    logger.info(f"Loaded {len(full_state)} LoRA parameters from checkpoint.")
 
     dist.barrier()
 

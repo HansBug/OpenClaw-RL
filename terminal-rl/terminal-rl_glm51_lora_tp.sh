@@ -6,7 +6,7 @@
 # to slime Megatron + TP/PP/EP + lightweight Megatron LoRA adapters.
 #   * Use GLM-5.1 HF snapshot directly; bridge loads it into Megatron
 #   * Use the lightrft_py312 conda env for Ray / sglang
-#   * Adapter-only checkpoint saving by default
+#   * Adapter-only warm-start checkpoint saving by default
 #   * Structured logs at logs/<run_name>/{train.log,router.log,run_config.json}
 #
 # Prerequisites:
@@ -494,6 +494,9 @@ else
   SAVE_CKPT=""
 fi
 BASE_LOAD="${BASE_LOAD:-${HF_CKPT}}"
+# Adapter checkpoints are warm-start inputs only: they restore LoRA weights after
+# BASE_LOAD, but do not restore optimizer, scheduler, RNG, or rollout position.
+# RESUME_LOAD is kept as a compatibility alias for old wrapper invocations.
 MEGATRON_LORA_ADAPTER_LOAD="${MEGATRON_LORA_ADAPTER_LOAD:-${RESUME_LOAD:-}}"
 export BASE_LOAD MEGATRON_LORA_ADAPTER_LOAD
 
@@ -1340,6 +1343,7 @@ cat > "${RUN_DIR}/config/run_config.json" <<CFGEOF
   "ref_load": "${REF_LOAD}",
   "base_load": "${BASE_LOAD}",
   "megatron_lora_adapter_load": "${MEGATRON_LORA_ADAPTER_LOAD}",
+  "megatron_lora_adapter_mode": "warm_start",
   "save_ckpt": "${SAVE_CKPT}",
   "num_gpus": ${NUM_GPUS},
   "actor_num_nodes": ${ACTOR_NUM_NODES},

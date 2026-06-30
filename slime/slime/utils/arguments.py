@@ -228,13 +228,19 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 "--megatron-lora-save-adapter-only",
                 action=argparse.BooleanOptionalAction,
                 default=True,
-                help="Save only Megatron LoRA adapter weights instead of full Megatron checkpoints.",
+                help=(
+                    "Save only Megatron LoRA adapter weights for adapter warm start. "
+                    "This does not save optimizer, scheduler, RNG, or full training resume state."
+                ),
             )
             parser.add_argument(
                 "--megatron-lora-adapter-load",
                 type=str,
                 default=None,
-                help="Path to a saved Megatron LoRA adapter checkpoint to load after base weights.",
+                help=(
+                    "Path to a saved Megatron LoRA adapter warm-start checkpoint to load after base weights. "
+                    "Use --load for the base/full Megatron checkpoint."
+                ),
             )
             parser.add_argument(
                 "--megatron-lora-include-experts",

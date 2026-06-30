@@ -149,7 +149,7 @@ export MAX_TURN="${MAX_TURN:-10}"
 export HF_CKPT="${HF_CKPT:-/mnt/shared-storage-gpfs2/gpfs2-shared-public/huggingface/hub/models--zai-org--GLM-4.5-Air/snapshots/a24ceef6ce4f3536971efe9b778bdaa1bab18daa}"
 export REF_LOAD="${REF_LOAD:-${HF_CKPT}}"
 export CUSTOM_CONFIG_PATH="${CUSTOM_CONFIG_PATH:-${OPENCLAW_RL_HOME}/terminal-rl/configs/rollout_glm45_air_think.yaml}"
-export WORKER_URLS="${WORKER_URLS:-http://100.96.29.229:18081}"
+export WORKER_URLS="${WORKER_URLS:-http://100.100.66.216:18081}"
 
 echo "=== Terminal-RL GLM-4.5-Air LoRA 2-node ==="
 echo "NODE_RANK=${NODE_RANK}"

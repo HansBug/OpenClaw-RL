@@ -18,6 +18,9 @@ from megatron.core.tensor_parallel.mappings import (
 
 logger = logging.getLogger(__name__)
 
+ADAPTER_TRACKER_FILE = "latest_adapter_checkpointed_iteration.txt"
+STANDARD_TRACKER_FILE = "latest_checkpointed_iteration.txt"
+
 
 def _split_target_modules(target_modules: str | None) -> list[str]:
     if not target_modules:
@@ -230,9 +233,13 @@ def _resolve_adapter_path(path: str | None) -> Path | None:
     if adapter_path.is_file():
         return adapter_path
 
-    if adapter_path.is_dir() and (adapter_path / "latest_checkpointed_iteration.txt").is_file():
-        step = int((adapter_path / "latest_checkpointed_iteration.txt").read_text().strip())
-        adapter_path = adapter_path / f"iter_{step:07d}"
+    if adapter_path.is_dir():
+        for tracker_name in (ADAPTER_TRACKER_FILE, STANDARD_TRACKER_FILE):
+            tracker_path = adapter_path / tracker_name
+            if tracker_path.is_file():
+                step = int(tracker_path.read_text().strip())
+                adapter_path = adapter_path / f"iter_{step:07d}"
+                break
 
     if adapter_path.is_dir() and (adapter_path / "model").is_dir():
         adapter_path = adapter_path / "model"
@@ -289,6 +296,8 @@ def save_megatron_lora_checkpoint(model: list[torch.nn.Module], args, iteration:
         checkpoint_dir.mkdir(parents=True, exist_ok=True)
         metadata = {
             "format": "megatron_lora_sharded",
+            "checkpoint_type": "adapter_only_warm_start",
+            "training_resume_supported": False,
             "iteration": step_id,
             "rollout_id": iteration,
             "next_rollout_id": iteration + 1,
@@ -298,7 +307,7 @@ def save_megatron_lora_checkpoint(model: list[torch.nn.Module], args, iteration:
             "lora_target_modules": getattr(args, "lora_target_modules", None),
         }
         (checkpoint_dir / "meta.json").write_text(json.dumps(metadata, indent=2, sort_keys=True))
-        (Path(args.save).expanduser() / "latest_checkpointed_iteration.txt").write_text(str(step_id))
+        (Path(args.save).expanduser() / ADAPTER_TRACKER_FILE).write_text(str(step_id))
         logger.info("Saved Megatron LoRA adapter checkpoint metadata to %s", model_dir)
     _dist_barrier()
 
