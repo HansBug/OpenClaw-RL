@@ -668,7 +668,7 @@ def train(
                 if train_step_id == 0 and "train/kl_loss" in log_dict:
                     assert log_dict["train/kl_loss"] == 0.0, f"{log_dict=}"
 
-            logger.info(f"{role_tag}step {train_step_id}: {log_dict}")
+            logger.info(f"{role_tag}train-step {train_step_id}: {log_dict}")
 
             if args.ci_save_grad_norm is not None:
                 ci_save_grad_norm_path = args.ci_save_grad_norm.format(

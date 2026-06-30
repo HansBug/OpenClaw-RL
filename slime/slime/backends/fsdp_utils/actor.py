@@ -743,9 +743,8 @@ class FSDPTrainRayActor(TrainRayActor):
                 if self.args.use_kl_loss and "kl_loss" in aggregated:
                     kl_info = f", kl_loss: {aggregated['kl_loss']:.4f}, kl_penalty: {aggregated['kl_loss'] * self.args.kl_loss_coef:.4f}"
                     logger.info(kl_info)
-                logger.info(f"step {self.global_step}: {log_dict}")
-
                 log_dict["train/step"] = self.global_step
+                logger.info(f"train-step {self.global_step}: {log_dict}")
                 logging_utils.log(self.args, log_dict, step_key="train/step")
             self.global_step += 1
 
