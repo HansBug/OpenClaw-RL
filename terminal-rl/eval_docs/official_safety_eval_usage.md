@@ -24,7 +24,7 @@
 bash terminal-rl/scripts/run_safety_official_eval.sh <name>=<eval_run_dir>
 ```
 
-该 wrapper 会自动完成 ASB 输入导出、ShieldAgent 调用和最终 summary。只想单独准备数据或单独汇总时，可以直接调用 Python 工具。
+该 wrapper 会自动完成 ASB 输入导出、ShieldAgent 调用和最终 summary。它的输入是已经完成的 Terminal-RL eval trajectory，不负责启动模型推理生成 trajectory。只想单独准备数据或单独汇总时，可以直接调用 Python 工具。
 
 ## 2. 数据集简介
 
@@ -111,18 +111,23 @@ runs/eval/<run_name>/trajectories/*/traj.json
 | max new tokens | `max_new_tokens=16384` |
 | suites | `agentharm` + `agent_safetybench` |
 
-通用命令模板：
+两个 bench 的选择发生在 Terminal-RL eval 启动阶段，而不是官方评分汇总阶段。通用命令模板：
 
 ```bash
 cd /path/to/OpenClaw-RL
 
-EVAL_SUITE=mock_safety \
+EVAL_SUITE=agentharm,agent_safetybench \
 EVAL_CKPT=<checkpoint_or_alias> \
 EVAL_OUTPUT_DIR=runs/eval/<run_name> \
 bash terminal-rl/<your_terminal_rl_eval_script>.sh
 ```
 
-实际项目中可使用已有的 Qwen3-8B eval 启动脚本；关键是输出目录中必须包含完整 `trajectories`。
+如果本地 eval 启动脚本使用组合 suite 名称，也可以用等价的 `EVAL_SUITE=mock_safety` 或项目内约定的 `agentharm+agent_safetybench` alias。实际项目中可使用已有的 Qwen3-8B eval 启动脚本；关键是输出目录中必须包含完整 `trajectories`，并且至少包含：
+
+```text
+dataset_slug=agentharm
+dataset_slug=agent_safetybench
+```
 
 ## 4. 依赖和本地路径
 
@@ -191,12 +196,61 @@ bash terminal-rl/scripts/prepare_shieldagent.sh
 
 训练集群无外网时不要依赖下载，直接使用已经准备好的 `runs/models/ShieldAgent`。
 
-## 5. 一键运行官方评分并汇总
+## 5. 完整 Example
 
-对一个或多个已完成 eval run 生成官方得分表：
+下面分两种场景说明。第一种是从 checkpoint 开始的完整流程；第二种是已经有 `runs/eval/<run>` trajectories 后的最短评分命令。
+
+### 5.1 从 checkpoint 到最终得分
+
+步骤 1：准备 `ShieldAgent` 模型。只需要在每个 repo/workspace 中准备一次。
 
 ```bash
 cd /path/to/OpenClaw-RL
+
+SHIELD_MODEL_SOURCE=/mnt/shared-storage-gpfs2/gpfs2-shared-public/huggingface/zskj-hub/models--thu-coai--ShieldAgent \
+bash terminal-rl/scripts/prepare_shieldagent.sh
+```
+
+步骤 2：选择两个 bench 并生成 Terminal-RL eval trajectories。
+
+```bash
+EVAL_SUITE=agentharm,agent_safetybench \
+EVAL_CKPT=<checkpoint_or_alias> \
+EVAL_OUTPUT_DIR=runs/eval/<run_name> \
+bash terminal-rl/<your_terminal_rl_eval_script>.sh
+```
+
+该步骤由项目已有 eval launcher 负责。本 PR 新增脚本不启动模型推理，只消费生成后的 `trajectories`。
+
+步骤 3：从 trajectories 自动准备 ASB 数据格式、运行 `ShieldAgent`、汇总最终得分。
+
+```bash
+PYTHON_BIN=/mnt/shared-storage-user/puyuan/conda_envs/lightrft_py312/bin/python \
+ASB_ROOT=/mnt/shared-storage-user/puyuan/code/Agent-SafetyBench \
+BATCH_SIZE=4 \
+CUDA_VISIBLE_DEVICES=0 \
+bash terminal-rl/scripts/run_safety_official_eval.sh \
+  <model_name>=runs/eval/<run_name>
+```
+
+步骤 4：查看输出。
+
+```text
+runs/official_asb_shield_inputs/<target_name>/gen_res.json
+runs/official_asb_shield_logs/<target_name>/run_YYYYMMDD_HHMMSS.log
+<Agent-SafetyBench>/score/shield_results/<target_name>/
+runs/official_safety_eval/summary_YYYYMMDD_HHMMSS.md
+```
+
+### 5.2 已有 trajectories 后的最短评分命令
+
+如果 `runs/eval/<init_eval_run>` 和 `runs/eval/<tuned_eval_run>` 已经存在，并且其中已经包含 `agentharm` 与 `agent_safetybench` trajectories，则下面命令是完整的官方评分 + 汇总命令：
+
+```bash
+cd /path/to/OpenClaw-RL
+
+SHIELD_MODEL_SOURCE=/mnt/shared-storage-gpfs2/gpfs2-shared-public/huggingface/zskj-hub/models--thu-coai--ShieldAgent \
+bash terminal-rl/scripts/prepare_shieldagent.sh
 
 PYTHON_BIN=/mnt/shared-storage-user/puyuan/conda_envs/lightrft_py312/bin/python \
 ASB_ROOT=/mnt/shared-storage-user/puyuan/code/Agent-SafetyBench \
@@ -207,14 +261,17 @@ bash terminal-rl/scripts/run_safety_official_eval.sh \
   tuned=runs/eval/<tuned_eval_run>
 ```
 
-输出：
+这条命令包含：
 
-```text
-runs/official_asb_shield_inputs/<target_name>/gen_res.json
-runs/official_asb_shield_logs/<target_name>/run_YYYYMMDD_HHMMSS.log
-<Agent-SafetyBench>/score/shield_results/<target_name>/
-runs/official_safety_eval/summary_YYYYMMDD_HHMMSS.md
-```
+| 环节 | 是否包含 | 说明 |
+| --- | --- | --- |
+| `ShieldAgent` 模型准备 | 是 | `prepare_shieldagent.sh` |
+| ASB 数据格式准备 | 是 | wrapper 自动调用 `prepare_asb_shield_inputs.py` |
+| 两个 bench 选择 | 否 | 已经在生成 `runs/eval/<run>` trajectory 时完成 |
+| ASB 官方 judge 调用 | 是 | wrapper 调用官方 `eval_with_shield.py` |
+| AH/ASB 得分统计 | 是 | wrapper 调用 `summarize_safety_eval.py` 输出 summary |
+
+因此：如果还没有 eval trajectories，这个 example 不是从 checkpoint 开始的完整流程；如果 trajectories 已经存在，它就是完整的官方 scoring/report 流程。
 
 正式评分默认行为：
 
