@@ -732,6 +732,10 @@ class RunSlot:
     first_step_ts: float | None = None
     evaluate_completed_ts: float | None = None
     drop_scheduled: bool = False  # P0 fix: Flag to prevent double-pop race
+    reset_quarantined: bool = False
+    reset_quarantine_reason: str | None = None
+    reset_quarantine_started_ts: float | None = None
+    reset_quarantine_watcher: asyncio.Task | None = None
 
 
 @dataclass
@@ -778,6 +782,7 @@ class WorkerPool:
         self._run_to_task: dict[str, str] = {}
         self._idempotency: dict[tuple[str, str], tuple[str, float]] = {}
         self._lock = asyncio.Lock()
+        self._shutdown_started = False
 
         self._close_sem = asyncio.Semaphore(max_concurrent_closes)
         self.max_concurrent_resets = _env_int("WORKER_MAX_CONCURRENT_RESETS", 16)
@@ -794,6 +799,14 @@ class WorkerPool:
         self._force_cleanup_task_started: dict[asyncio.Task, float] = {}
         self._force_cleanup_task_labels: dict[asyncio.Task, str] = {}
         self._close_requested_release_tasks: dict[str, asyncio.Task] = {}
+        self._reset_quarantine_watchers: set[asyncio.Task] = set()
+        self._recent_close_failures: dict[str, dict[str, Any]] = {}
+        self._close_failure_ttl = max(
+            60.0, _env_float("WORKER_CLOSE_FAILURE_TTL", 3600.0)
+        )
+        self._close_failure_max = max(
+            1, _env_int("WORKER_CLOSE_FAILURE_MAX", 256)
+        )
 
         # P0 fix: Track reset count for automatic shim cleanup
         self._reset_count: int = 0
@@ -952,7 +965,13 @@ class WorkerPool:
 
     async def _begin_run_op(self, run_lease_id: str, op_name: str) -> RunSlot:
         async with self._lock:
+            if self._shutdown_started:
+                raise RuntimeError(f"Worker is shutting down; rejecting {op_name}")
             run_slot = self._get_run_slot(run_lease_id)
+            if run_slot.reset_quarantined:
+                raise RuntimeError(
+                    f"Run {run_lease_id} has a quarantined reset; rejecting {op_name}"
+                )
             if run_slot.close_requested:
                 raise RuntimeError(
                     f"Run {run_lease_id} is closing; rejecting new {op_name} request"
@@ -983,7 +1002,9 @@ class WorkerPool:
             now = time.time()
             run_slot.in_flight_ops = max(0, run_slot.in_flight_ops - 1)
             run_slot.last_used_ts = now
-            if success:
+            if run_slot.reset_quarantined:
+                run_slot.phase = "reset_quarantined"
+            elif success:
                 if op_name == "reset":
                     run_slot.reset_completed_ts = now
                     run_slot.phase = "ready"
@@ -1004,7 +1025,16 @@ class WorkerPool:
                 run_slot.active_op = None
 
             # P0 fix: Check drop_scheduled flag to prevent double-pop race
-            if run_slot.close_requested and run_slot.in_flight_ops == 0 and not run_slot.drop_scheduled:
+            if (
+                run_slot.close_requested
+                and run_slot.in_flight_ops == 0
+                and not run_slot.drop_scheduled
+                and not run_slot.reset_quarantined
+                and not (
+                    run_slot.reset_future is not None
+                    and not run_slot.reset_future.done()
+                )
+            ):
                 popped = self._pop_run_slot_locked(run_slot.run_lease_id)
                 if popped is not None:
                     task_key, popped_slot = popped
@@ -1028,9 +1058,10 @@ class WorkerPool:
                 reason=close_reason,
             )
 
-        # FIX-1: Handle timeout drop AFTER _finish_run_op completes to prevent TOCTOU race
-        # This ensures in_flight_ops is decremented before lease removal
-        if is_timeout_drop:
+        # Mark a timed-out reset for removal after its outer reset future is done.
+        # The public reset path performs the actual pop/cleanup so no Docker
+        # cleanup can overlap the tail of _run_reset_once().
+        if is_timeout_drop and not run_slot.reset_quarantined:
             logger.info(
                 "Timeout drop deferred until after _finish_run_op: lease=%s op=%s",
                 run_slot.run_lease_id,
@@ -1072,6 +1103,62 @@ class WorkerPool:
             self._force_cleanup_task_labels.pop(task, None)
         return len(done)
 
+    @staticmethod
+    async def _join_task_uncancellable(task: asyncio.Task[Any]) -> None:
+        """Join *task* without turning a second cancellation into detachment."""
+        while not task.done():
+            try:
+                # ``shield(task)`` can immediately re-raise CancelledError while
+                # a cancellation-resistant child is still unwinding on Python
+                # 3.10.  Waiting on the task set observes completion without
+                # propagating the child's cancellation state or busy-spinning.
+                await asyncio.wait({task}, timeout=0.1)
+            except asyncio.CancelledError:
+                current = asyncio.current_task()
+                if current is not None and hasattr(current, "uncancel"):
+                    current.uncancel()
+        await asyncio.gather(task, return_exceptions=True)
+
+    def _track_force_cleanup_task(
+        self, task: asyncio.Task[Any], *, label: str
+    ) -> None:
+        self._force_cleanup_tasks.add(task)
+        self._force_cleanup_task_started[task] = time.time()
+        self._force_cleanup_task_labels[task] = label
+
+        def _on_done(done_task: asyncio.Task[Any]) -> None:
+            self._force_cleanup_tasks.discard(done_task)
+            self._force_cleanup_task_started.pop(done_task, None)
+            self._force_cleanup_task_labels.pop(done_task, None)
+
+        task.add_done_callback(_on_done)
+
+    def _record_close_failure(
+        self, run_slot: RunSlot, run_lease_id: str, *, reason: str, error: str
+    ) -> None:
+        self._recent_close_failures[run_lease_id] = {
+            "lease_id": run_lease_id,
+            "task_key": run_slot.task_key,
+            "reason": reason,
+            "error": error[:1000],
+            "timestamp": time.time(),
+        }
+        while len(self._recent_close_failures) > self._close_failure_max:
+            oldest = next(iter(self._recent_close_failures))
+            self._recent_close_failures.pop(oldest, None)
+
+    def _clear_close_failure(self, run_lease_id: str) -> None:
+        self._recent_close_failures.pop(run_lease_id, None)
+
+    def _prune_recent_close_failures(self, now: float) -> None:
+        expired = [
+            lease_id
+            for lease_id, failure in self._recent_close_failures.items()
+            if now - float(failure.get("timestamp", 0.0)) > self._close_failure_ttl
+        ]
+        for lease_id in expired:
+            self._recent_close_failures.pop(lease_id, None)
+
     async def _close_run_slot_with_semaphore(self, run_slot: RunSlot) -> None:
         try:
             await asyncio.wait_for(
@@ -1092,7 +1179,7 @@ class WorkerPool:
 
     async def _force_cleanup_after_close_failure(
         self, run_slot: RunSlot, run_lease_id: str, *, reason: str
-    ) -> None:
+    ) -> bool:
         # STABILITY FIX: Increase timeout from 30s to 90s to handle Docker operations under load
         # Analysis shows 93 force cleanup timeouts; Docker container removal can take 60-90s under pressure
         timeout = _env_float("WORKER_FORCE_CLEANUP_TIMEOUT", 90.0)
@@ -1110,6 +1197,8 @@ class WorkerPool:
                 run_lease_id,
                 reason,
             )
+            self._clear_close_failure(run_lease_id)
+            return True
         except asyncio.TimeoutError:
             logger.warning(
                 "Force cleanup timed out for run session %s after %s (timeout=%.1fs)",
@@ -1117,12 +1206,26 @@ class WorkerPool:
                 reason,
                 timeout,
             )
-        except Exception:
+            self._record_close_failure(
+                run_slot,
+                run_lease_id,
+                reason=reason,
+                error=f"force cleanup timed out after {timeout:.1f}s",
+            )
+            return False
+        except Exception as exc:
             logger.exception(
                 "Force cleanup failed after %s for run session %s",
                 reason,
                 run_lease_id,
             )
+            self._record_close_failure(
+                run_slot,
+                run_lease_id,
+                reason=reason,
+                error=f"{type(exc).__name__}: {exc}",
+            )
+            return False
 
     async def _close_run_slot(
         self, task_key: str, run_lease_id: str, run_slot: RunSlot, *, reason: str
@@ -1130,6 +1233,7 @@ class WorkerPool:
         logger.warning("%s %s (task=%s)", reason, run_lease_id, task_key)
         try:
             await self._close_run_slot_with_semaphore(run_slot)
+            self._clear_close_failure(run_lease_id)
         except asyncio.TimeoutError:
             logger.warning(
                 "Timed out closing run session %s "
@@ -1149,11 +1253,16 @@ class WorkerPool:
                 "cleanup before dropping it from the pool.",
                 run_lease_id,
             )
-            await asyncio.shield(
+            cleanup_task = asyncio.create_task(
                 self._force_cleanup_after_close_failure(
                     run_slot, run_lease_id, reason="close_cancelled"
                 )
             )
+            self._track_force_cleanup_task(
+                cleanup_task,
+                label=f"close_cancelled lease={run_lease_id} task={task_key}",
+            )
+            await self._join_task_uncancellable(cleanup_task)
             raise
         except Exception:
             logger.exception("Failed to close run session %s", run_lease_id)
@@ -1184,18 +1293,10 @@ class WorkerPool:
         if not slots:
             return
         task = asyncio.create_task(self._force_cleanup_slots(slots, reason=reason))
-        self._force_cleanup_tasks.add(task)
-        self._force_cleanup_task_started[task] = time.time()
-        self._force_cleanup_task_labels[task] = (
-            f"{reason} leases={','.join(rid for _tk, rid, _slot in slots[:8])}"
+        self._track_force_cleanup_task(
+            task,
+            label=f"{reason} leases={','.join(rid for _tk, rid, _slot in slots[:8])}",
         )
-
-        def _on_done(done_task: asyncio.Task) -> None:
-            self._force_cleanup_tasks.discard(done_task)
-            self._force_cleanup_task_started.pop(done_task, None)
-            self._force_cleanup_task_labels.pop(done_task, None)
-
-        task.add_done_callback(_on_done)
 
     def _schedule_close_requested_force_release(
         self, run_lease_id: str, *, reason: str
@@ -1229,7 +1330,33 @@ class WorkerPool:
     ) -> None:
         if delay > 0:
             await asyncio.sleep(delay)
-        slot_to_force_cleanup: tuple[str, str, RunSlot] | None = None
+        reset_future: asyncio.Task | None = None
+        async with self._lock:
+            task_key = self._run_to_task.get(run_lease_id)
+            task_slot = self._tasks.get(task_key) if task_key is not None else None
+            run_slot = task_slot.runs.get(run_lease_id) if task_slot else None
+            if run_slot is not None and run_slot.reset_quarantined:
+                return
+            if (
+                run_slot is not None
+                and run_slot.close_requested
+                and run_slot.reset_future is not None
+                and not run_slot.reset_future.done()
+            ):
+                reset_future = run_slot.reset_future
+
+        # A reset may still create Docker objects after cancellation begins.
+        # Join it before removing the lease or starting cleanup.
+        if reset_future is not None:
+            reset_future.cancel()
+            joined = await self._cancel_and_join_reset_task(reset_future)
+            if not joined and run_slot is not None:
+                await self._quarantine_reset_run(
+                    run_slot,
+                    reset_future,
+                    reason=f"close_requested_reset_join_timeout:{reason}",
+                )
+
         async with self._lock:
             task_key = self._run_to_task.get(run_lease_id)
             if task_key is None:
@@ -1237,6 +1364,12 @@ class WorkerPool:
             task_slot = self._tasks.get(task_key)
             run_slot = task_slot.runs.get(run_lease_id) if task_slot else None
             if run_slot is None or not run_slot.close_requested:
+                return
+            if reset_future is not None and run_slot.reset_future is not reset_future:
+                return
+            if run_slot.reset_quarantined:
+                return
+            if run_slot.reset_future is not None and not run_slot.reset_future.done():
                 return
             if run_slot.in_flight_ops <= 0 and not run_slot.lock.locked():
                 popped = self._pop_run_slot_locked(run_lease_id)
@@ -1257,13 +1390,9 @@ class WorkerPool:
                         reason=f"Force-releasing idle close_requested run: {reason}",
                     )
                 return
-            popped = self._pop_run_slot_locked(run_lease_id)
-            if popped is None:
-                return
-            task_key, run_slot = popped
             logger.warning(
-                "Force-releasing close_requested in-flight run lease=%s task=%s "
-                "reason=%s phase=%s in_flight=%d active_op=%s %s",
+                "Deferring close_requested run lease=%s task=%s until its active "
+                "operation finishes: reason=%s phase=%s in_flight=%d active_op=%s %s",
                 run_lease_id,
                 task_key,
                 reason,
@@ -1272,13 +1401,7 @@ class WorkerPool:
                 run_slot.active_op,
                 self._run_slot_container_ref(run_slot),
             )
-            slot_to_force_cleanup = (task_key, run_lease_id, run_slot)
-
-        if slot_to_force_cleanup is not None:
-            self._schedule_force_cleanup_slots(
-                [slot_to_force_cleanup],
-                reason=f"close_requested_force_release:{reason}",
-            )
+            return
 
     def _reap_idle_locked(self) -> list[tuple[str, str, RunSlot]]:
         now = time.time()
@@ -1296,6 +1419,8 @@ class WorkerPool:
         for task_key, task_slot in list(self._tasks.items()):
             expired_runs: list[str] = []
             for rid, rslot in task_slot.runs.items():
+                if rslot.reset_future is not None and not rslot.reset_future.done():
+                    continue
                 if rslot.in_flight_ops > 0 or rslot.lock.locked():
                     continue
                 if rslot.close_requested:
@@ -1344,6 +1469,13 @@ class WorkerPool:
             if run_slot.close_requested_ts is not None
             else 0.0
         )
+        if run_slot.reset_quarantined:
+            quarantine_age_sec = (
+                now - run_slot.reset_quarantine_started_ts
+                if run_slot.reset_quarantine_started_ts is not None
+                else 0.0
+            )
+            return "reset_quarantined", quarantine_age_sec
         if (
             run_slot.phase == "allocated"
             and allocated_ttl > 0
@@ -1380,6 +1512,10 @@ class WorkerPool:
         self, task_key: str, request_id: str | None = None
     ) -> dict[str, Any]:
         async with self._lock:
+            if self._shutdown_started:
+                raise CapacityError(
+                    "WORKER_SHUTTING_DOWN", "Worker is shutting down"
+                )
             expired_slots = self._reap_idle_locked()
 
             if request_id:
@@ -1388,6 +1524,12 @@ class WorkerPool:
                 if cached is not None:
                     run_lease_id, _ = cached
                     if run_lease_id in self._run_to_task:
+                        cached_slot = self._get_run_slot(run_lease_id)
+                        if cached_slot.reset_quarantined:
+                            raise CapacityError(
+                                "TASK_RESET_QUARANTINED",
+                                f"Task {task_key} has a quarantined reset",
+                            )
                         logger.info(
                             "allocate_ok lease_id=%s task_key=%s request_id=%s reused=%s",
                             run_lease_id,
@@ -1398,6 +1540,13 @@ class WorkerPool:
                         return {"lease_id": run_lease_id, "reused": True}
 
             task_slot = self._tasks.get(task_key)
+            if task_slot is not None and any(
+                run.reset_quarantined for run in task_slot.runs.values()
+            ):
+                raise CapacityError(
+                    "TASK_RESET_QUARANTINED",
+                    f"Task {task_key} has a quarantined reset",
+                )
             if task_slot is None:
                 if len(self._tasks) >= self.max_tasks:
                     raise CapacityError(
@@ -1455,38 +1604,225 @@ class WorkerPool:
             float(timeouts.ensure_image) + float(timeouts.reset_session) + 120.0,
         )
 
+    @staticmethod
+    async def _cancel_and_join_reset_task(
+        task: asyncio.Task[Any],
+        *,
+        deadline: float | None = None,
+        label: str = "reset",
+    ) -> bool:
+        """Best-effort join of a cancelled reset within an absolute deadline."""
+        def _consume_late_result(done_task: asyncio.Task[Any]) -> None:
+            try:
+                done_task.exception()
+            except asyncio.CancelledError:
+                pass
+            except Exception:
+                logger.exception("Quarantined %s task failed after its join deadline", label)
+
+        loop = asyncio.get_running_loop()
+        if deadline is None:
+            timeout = max(
+                0.1, _env_float("WORKER_RESET_CANCEL_JOIN_TIMEOUT", 15.0)
+            )
+            deadline = loop.time() + timeout
+        if not task.done():
+            task.cancel()
+        while not task.done():
+            remaining = deadline - loop.time()
+            if remaining <= 0:
+                task.cancel()
+                logger.error(
+                    "Cancelled %s task did not stop before its join deadline; "
+                    "the caller must retain its lease in quarantine",
+                    label,
+                )
+                task.add_done_callback(_consume_late_result)
+                return False
+            try:
+                done, _ = await asyncio.wait({task}, timeout=remaining)
+            except asyncio.CancelledError:
+                current = asyncio.current_task()
+                if current is not None and hasattr(current, "uncancel"):
+                    current.uncancel()
+                task.cancel()
+                continue
+            if task not in done:
+                task.cancel()
+                logger.error(
+                    "Cancelled %s task did not stop before its join deadline; "
+                    "the caller must retain its lease in quarantine",
+                    label,
+                )
+                task.add_done_callback(_consume_late_result)
+                return False
+        await asyncio.gather(task, return_exceptions=True)
+        return True
+
+    async def _watch_quarantined_reset(
+        self, run_slot: RunSlot, reset_future: asyncio.Task[Any]
+    ) -> None:
+        while not reset_future.done():
+            try:
+                # Observe rather than await the reset result.  A reset task may
+                # have a pending cancellation while its Docker thread is still
+                # exiting; asyncio.wait avoids a tight CancelledError loop.
+                await asyncio.wait({reset_future}, timeout=0.1)
+            except asyncio.CancelledError:
+                current = asyncio.current_task()
+                if current is not None and hasattr(current, "uncancel"):
+                    current.uncancel()
+                continue
+
+        slot_to_cleanup: tuple[str, str, RunSlot] | None = None
+        async with self._lock:
+            if not reset_future.done() or not run_slot.reset_quarantined:
+                return
+            current_task_key = self._run_to_task.get(run_slot.run_lease_id)
+            current_task_slot = (
+                self._tasks.get(current_task_key)
+                if current_task_key is not None
+                else None
+            )
+            if (
+                current_task_slot is None
+                or current_task_slot.runs.get(run_slot.run_lease_id) is not run_slot
+            ):
+                return
+            popped = self._pop_run_slot_locked(run_slot.run_lease_id)
+            if popped is not None:
+                task_key, popped_slot = popped
+                slot_to_cleanup = (task_key, run_slot.run_lease_id, popped_slot)
+
+        if slot_to_cleanup is not None:
+            logger.warning(
+                "Quarantined reset finished; removing lease=%s and starting Docker cleanup",
+                run_slot.run_lease_id,
+            )
+            await self._force_cleanup_slots(
+                [slot_to_cleanup], reason="reset_quarantine_finished"
+            )
+
+    async def _quarantine_reset_run(
+        self,
+        run_slot: RunSlot,
+        reset_future: asyncio.Task[Any],
+        *,
+        reason: str,
+    ) -> bool:
+        async with self._lock:
+            if reset_future.done():
+                return False
+            task_key = self._run_to_task.get(run_slot.run_lease_id)
+            task_slot = self._tasks.get(task_key) if task_key is not None else None
+            if task_slot is None or task_slot.runs.get(run_slot.run_lease_id) is not run_slot:
+                return False
+
+            now = time.time()
+            run_slot.reset_quarantined = True
+            run_slot.reset_quarantine_reason = reason
+            run_slot.reset_quarantine_started_ts = now
+            run_slot.close_requested = True
+            run_slot.close_reason = reason
+            run_slot.close_requested_ts = now
+            run_slot.phase = "reset_quarantined"
+            run_slot.last_used_ts = now
+            for idem_key, (lease_id, _timestamp) in list(self._idempotency.items()):
+                if lease_id == run_slot.run_lease_id:
+                    self._idempotency.pop(idem_key, None)
+
+            watcher = run_slot.reset_quarantine_watcher
+            if watcher is None or watcher.done():
+                watcher = asyncio.create_task(
+                    self._watch_quarantined_reset(run_slot, reset_future)
+                )
+                run_slot.reset_quarantine_watcher = watcher
+                self._reset_quarantine_watchers.add(watcher)
+
+                def _on_done(done_task: asyncio.Task[Any]) -> None:
+                    self._reset_quarantine_watchers.discard(done_task)
+
+                watcher.add_done_callback(_on_done)
+
+        logger.error(
+            "Reset cancellation join deadline expired; quarantined lease=%s task=%s "
+            "reason=%s. No lease removal or Docker cleanup will occur until reset exits.",
+            run_slot.run_lease_id,
+            run_slot.task_key,
+            reason,
+        )
+        return True
+
     async def _drop_resetting_run_for_timeout(
         self, run_lease_id: str, run_slot: RunSlot, *, timeout: float
     ) -> None:
-        popped_slot: tuple[str, str, RunSlot] | None = None
         async with self._lock:
+            if run_slot.reset_quarantined:
+                return
             task_key = self._run_to_task.get(run_lease_id)
             if task_key is None:
                 return
             current = self._tasks.get(task_key)
             if current is None or current.runs.get(run_lease_id) is not run_slot:
                 return
-            # P0 fix: Set drop_scheduled flag to prevent _finish_run_op from also trying to pop
             run_slot.drop_scheduled = True
-            popped = self._pop_run_slot_locked(run_lease_id)
-            if popped is not None:
-                popped_task_key, popped_run_slot = popped
-                logger.warning(
-                    "Dropping reset-timed-out run lease=%s task=%s timeout=%.1fs "
-                    "phase=%s in_flight=%d %s",
-                    run_lease_id,
-                    popped_task_key,
-                    timeout,
-                    popped_run_slot.phase,
-                    popped_run_slot.in_flight_ops,
-                    self._run_slot_container_ref(popped_run_slot),
-                )
-                popped_slot = (popped_task_key, run_lease_id, popped_run_slot)
+            run_slot.close_requested = True
+            run_slot.close_reason = f"reset_timeout:{timeout:.1f}s"
+            run_slot.close_requested_ts = time.time()
+            run_slot.phase = "closing_requested"
+            logger.warning(
+                "Reset timed out; retaining lease=%s task=%s until the outer reset "
+                "future exits before Docker cleanup %s",
+                run_lease_id,
+                task_key,
+                self._run_slot_container_ref(run_slot),
+            )
 
-        if popped_slot is not None:
+    async def _finalize_completed_reset(
+        self, run_slot: RunSlot, reset_future: asyncio.Task[Any]
+    ) -> None:
+        slot_to_close: tuple[str, str, RunSlot] | None = None
+        force_cleanup = False
+        async with self._lock:
+            if not reset_future.done() or run_slot.reset_quarantined:
+                return
+            task_key = self._run_to_task.get(run_slot.run_lease_id)
+            task_slot = self._tasks.get(task_key) if task_key is not None else None
+            if (
+                task_slot is None
+                or task_slot.runs.get(run_slot.run_lease_id) is not run_slot
+                or run_slot.reset_future is not reset_future
+                or (not run_slot.close_requested and not run_slot.drop_scheduled)
+                or run_slot.in_flight_ops > 0
+                or run_slot.lock.locked()
+            ):
+                return
+            popped = self._pop_run_slot_locked(run_slot.run_lease_id)
+            if popped is not None:
+                popped_task_key, popped_slot = popped
+                slot_to_close = (
+                    popped_task_key,
+                    run_slot.run_lease_id,
+                    popped_slot,
+                )
+                force_cleanup = popped_slot.drop_scheduled
+
+        if slot_to_close is None:
+            return
+        if force_cleanup:
             self._schedule_force_cleanup_slots(
-                [popped_slot],
-                reason=f"reset_timeout:{timeout:.1f}s",
+                [slot_to_close], reason=run_slot.close_reason or "reset_failed"
+            )
+        else:
+            task_key, run_lease_id, popped_slot = slot_to_close
+            self._schedule_close(
+                task_key,
+                run_lease_id,
+                popped_slot,
+                reason=(
+                    "Closing run slot after completed reset: "
+                    f"{popped_slot.close_reason or 'close_requested'}"
+                ),
             )
 
     async def _acquire_reset_admission(self, run_lease_id: str) -> None:
@@ -1540,14 +1876,6 @@ class WorkerPool:
         run_slot: RunSlot | None = None
         reset_admission_acquired = False
 
-        def _consume_cancelled_reset_task(task: asyncio.Task[Any]) -> None:
-            try:
-                task.exception()
-            except asyncio.CancelledError:
-                pass
-            except Exception:
-                pass
-
         try:
             await self._acquire_reset_admission(run_lease_id)
             reset_admission_acquired = True
@@ -1561,11 +1889,7 @@ class WorkerPool:
                         timeouts=timeouts,
                     )
                 )
-                try:
-                    done, _ = await asyncio.wait({reset_task}, timeout=warn_timeout)
-                except asyncio.CancelledError:
-                    reset_task.cancel()
-                    raise
+                done, _ = await asyncio.wait({reset_task}, timeout=warn_timeout)
 
                 if reset_task not in done:
                     logger.warning(
@@ -1585,7 +1909,6 @@ class WorkerPool:
                         raise
                     is_timeout_drop = True
                     reset_task.cancel()
-                    reset_task.add_done_callback(_consume_cancelled_reset_task)
                     raise TimeoutError(
                         f"WORKER_RESET_TIMEOUT lease_id={run_lease_id} "
                         f"after {reset_timeout:.1f}s"
@@ -1595,7 +1918,10 @@ class WorkerPool:
         finally:
             if not success and reset_task is not None and not reset_task.done():
                 reset_task.cancel()
-                reset_task.add_done_callback(_consume_cancelled_reset_task)
+                # TerminalEnv.reset may own a non-cancellable Docker thread. Keep
+                # this wrapper alive until that thread exits; callers quarantine
+                # the outer reset future if their bounded join deadline expires.
+                await self._join_task_uncancellable(reset_task)
             if run_slot is not None:
                 await self._finish_run_op(
                     run_slot,
@@ -1620,16 +1946,18 @@ class WorkerPool:
         request_id = str(request_id or "")
         future: asyncio.Task
 
-        def _consume_reset_future_exception(task: asyncio.Task[Any]) -> None:
-            try:
-                task.exception()
-            except asyncio.CancelledError:
-                pass
-            except Exception:
-                pass
-
         async with self._lock:
+            if self._shutdown_started:
+                raise RuntimeError("Worker is shutting down; rejecting reset")
             run_slot = self._get_run_slot(run_lease_id)
+            if run_slot.reset_quarantined:
+                raise RuntimeError(
+                    f"Run {run_lease_id} has a quarantined reset; rejecting reset"
+                )
+            if run_slot.close_requested:
+                raise RuntimeError(
+                    f"Run {run_lease_id} is closing; rejecting reset"
+                )
             existing = run_slot.reset_future
             if request_id and run_slot.reset_request_id == request_id:
                 if run_slot.reset_result is not None:
@@ -1668,7 +1996,23 @@ class WorkerPool:
         except asyncio.CancelledError as exc:
             if not future.done():
                 future.cancel()
-                future.add_done_callback(_consume_reset_future_exception)
+            joined = await self._cancel_and_join_reset_task(
+                future, label=f"reset wrapper lease={run_lease_id}"
+            )
+            if not joined:
+                async with self._lock:
+                    try:
+                        run_slot = self._get_run_slot(run_lease_id)
+                    except KeyError:
+                        run_slot = None
+                if run_slot is not None:
+                    await self._quarantine_reset_run(
+                        run_slot,
+                        future,
+                        reason="reset_request_cancel_join_timeout",
+                    )
+            else:
+                await self._finalize_completed_reset(run_slot, future)
             async with self._lock:
                 try:
                     run_slot = self._get_run_slot(run_lease_id)
@@ -1676,12 +2020,14 @@ class WorkerPool:
                     pass
                 else:
                     if run_slot.reset_future is future:
-                        run_slot.reset_future = None
-                        run_slot.reset_result = None
+                        if not run_slot.reset_quarantined and future.done():
+                            run_slot.reset_future = None
+                            run_slot.reset_result = None
             raise TimeoutError(
                 f"WORKER_RESET_CANCELLED lease_id={run_lease_id} request_id={request_id}"
             ) from exc
         except Exception:
+            await self._finalize_completed_reset(run_slot, future)
             raise
         else:
             async with self._lock:
@@ -1696,6 +2042,7 @@ class WorkerPool:
                     return result
                 if run_slot.reset_future is future:
                     run_slot.reset_result = dict(result)
+            await self._finalize_completed_reset(run_slot, future)
             return result
 
     async def exec_tool(
@@ -1769,7 +2116,14 @@ class WorkerPool:
                 self._run_slot_container_ref(run_slot),
                 stack,
             )
-            if run_slot.in_flight_ops > 0 or run_slot.lock.locked():
+            if (
+                run_slot.in_flight_ops > 0
+                or run_slot.lock.locked()
+                or (
+                    run_slot.reset_future is not None
+                    and not run_slot.reset_future.done()
+                )
+            ):
                 run_slot.phase = "closing_requested"
                 self._schedule_close_requested_force_release(
                     run_lease_id, reason=reason
@@ -1791,6 +2145,7 @@ class WorkerPool:
             self._prune_done_closing_tasks()
             self._prune_done_force_cleanup_tasks()
             now = time.time()
+            self._prune_recent_close_failures(now)
             allocated_ttl = _env_float("WORKER_ALLOCATED_TTL", 120.0)
             resetting_ttl = _env_float("WORKER_RESETTING_TTL", 2100.0)
             closing_ttl = _env_float("WORKER_CLOSING_REQUESTED_TTL", 300.0)
@@ -1823,6 +2178,7 @@ class WorkerPool:
             total_runs = 0
             in_flight_runs = 0
             closing_requested_runs = 0
+            reset_quarantined_runs = 0
             for tk, ts in self._tasks.items():
                 task_id = _task_id_from_ref(tk)
                 if task_id:
@@ -1834,6 +2190,8 @@ class WorkerPool:
                         in_flight_runs += 1
                     if rslot.close_requested:
                         closing_requested_runs += 1
+                    if rslot.reset_quarantined:
+                        reset_quarantined_runs += 1
                     container_info = self._run_slot_container_info(rslot)
                     for key in ("id", "short_id"):
                         value = container_info.get(key)
@@ -1890,6 +2248,13 @@ class WorkerPool:
                         "in_flight_ops": rslot.in_flight_ops,
                         "active_op": rslot.active_op,
                         "close_requested": rslot.close_requested,
+                        "reset_quarantined": rslot.reset_quarantined,
+                        "reset_quarantine_reason": rslot.reset_quarantine_reason,
+                        "reset_quarantine_age_sec": round(
+                            now - rslot.reset_quarantine_started_ts, 1
+                        )
+                        if rslot.reset_quarantine_started_ts is not None
+                        else 0.0,
                         "age_sec": round(now - rslot.last_used_ts, 1),
                         "created_age_sec": round(created_age_sec, 1),
                         "reset_age_sec": round(reset_age_sec, 1),
@@ -1917,8 +2282,21 @@ class WorkerPool:
                 "total_active_runs": total_runs,
                 "in_flight_runs": in_flight_runs,
                 "closing_requested_runs": closing_requested_runs,
+                "reset_quarantined_runs": reset_quarantined_runs,
+                "pending_reset_quarantine_watchers": len(
+                    self._reset_quarantine_watchers
+                ),
                 "pending_closes": len(self._closing_tasks),
                 "pending_force_cleanups": len(self._force_cleanup_tasks),
+                "pending_close_labels": sorted(
+                    self._closing_task_labels.values()
+                ),
+                "pending_force_cleanup_labels": sorted(
+                    self._force_cleanup_task_labels.values()
+                ),
+                "recent_close_failures": list(
+                    self._recent_close_failures.values()
+                ),
                 "reset_admission": {
                     "max_concurrent": self.max_concurrent_resets,
                     "available": int(getattr(self._reset_admission_sem, "_value", 0)),
@@ -1977,7 +2355,8 @@ class WorkerPool:
             ]
             skipped_young = pending_before_cancel - len(tasks_to_cancel)
 
-        # P0 fix: Cancel tasks and wait for their cancellation handlers using shield
+        # Cancel once, then observe completion without wait_for(gather). A second
+        # cancellation would detach the cleanup started by _close_run_slot().
         cancelled = 0
         for task in tasks_to_cancel:
             if not task.done():
@@ -1985,20 +2364,15 @@ class WorkerPool:
                 cancelled += 1
 
         if tasks_to_cancel:
-            try:
-                # P0 fix: Use asyncio.shield to ensure cancellation handlers complete
-                await asyncio.shield(
-                    asyncio.wait_for(
-                        asyncio.gather(*tasks_to_cancel, return_exceptions=True),
-                        timeout=max(0.1, cancel_timeout),
-                    )
-                )
-            except asyncio.TimeoutError:
+            _done, pending = await asyncio.wait(
+                set(tasks_to_cancel), timeout=max(0.1, cancel_timeout)
+            )
+            if pending:
                 logger.warning(
                     "Timed out waiting for pending close task cancellation: "
                     "reason=%s pending=%d timeout=%.1fs",
                     reason,
-                    len(tasks_to_cancel),
+                    len(pending),
                     cancel_timeout,
                 )
 
@@ -2052,6 +2426,15 @@ class WorkerPool:
                         run_slot, now
                     )
                     if not stale_reason or stale_age_sec < min_age:
+                        continue
+                    if run_slot.reset_quarantined:
+                        continue
+                    if (
+                        run_slot.reset_future is not None
+                        and not run_slot.reset_future.done()
+                    ):
+                        # Live reset cancellation/join belongs to the dedicated
+                        # resetting repair path; generic repair must not detach it.
                         continue
                     popped = self._pop_run_slot_locked(run_lease_id)
                     if popped is None:
@@ -2109,13 +2492,20 @@ class WorkerPool:
     ) -> dict[str, Any]:
         now = time.time()
         slots_to_force_cleanup: list[tuple[str, str, RunSlot]] = []
+        candidates: list[
+            tuple[str, str, RunSlot, asyncio.Task[Any] | None, float]
+        ] = []
         repaired_runs: list[dict[str, Any]] = []
+        skipped_active = 0
         async with self._lock:
             self._prune_done_closing_tasks()
             self._prune_done_force_cleanup_tasks()
             for task_key, task_slot in list(self._tasks.items()):
                 for run_lease_id, run_slot in list(task_slot.runs.items()):
                     if not run_slot.close_requested:
+                        continue
+                    if run_slot.reset_quarantined:
+                        skipped_active += 1
                         continue
                     close_age_sec = (
                         now - run_slot.close_requested_ts
@@ -2124,30 +2514,96 @@ class WorkerPool:
                     )
                     if close_age_sec < min_age:
                         continue
-                    popped = self._pop_run_slot_locked(run_lease_id)
-                    if popped is None:
-                        continue
-                    popped_task_key, popped_slot = popped
-                    slots_to_force_cleanup.append(
-                        (popped_task_key, run_lease_id, popped_slot)
+                    candidates.append(
+                        (
+                            task_key,
+                            run_lease_id,
+                            run_slot,
+                            run_slot.reset_future,
+                            close_age_sec,
+                        )
                     )
-                    repaired_runs.append(
-                        {
-                            "lease_id": run_lease_id,
-                            "task_key": popped_task_key,
-                            "phase": popped_slot.phase,
-                            "reason": "close_requested_capacity_pressure",
-                            "age_sec": round(close_age_sec, 1),
-                            "in_flight_ops": popped_slot.in_flight_ops,
-                            "active_op": popped_slot.active_op,
-                            "close_requested": popped_slot.close_requested,
-                            "container": self._run_slot_container_info(popped_slot),
-                        }
-                    )
-                    if max_repairs > 0 and len(repaired_runs) >= max_repairs:
+                    if max_repairs > 0 and len(candidates) >= max_repairs:
                         break
-                if max_repairs > 0 and len(repaired_runs) >= max_repairs:
+                if max_repairs > 0 and len(candidates) >= max_repairs:
                     break
+
+        reset_join_deadline = asyncio.get_running_loop().time() + max(
+            0.1, _env_float("WORKER_RESET_CANCEL_JOIN_TIMEOUT", 15.0)
+        )
+        for (
+            _task_key,
+            _run_lease_id,
+            run_slot,
+            reset_future,
+            _close_age_sec,
+        ) in candidates:
+            if reset_future is not None and not reset_future.done():
+                reset_future.cancel()
+                joined = await self._cancel_and_join_reset_task(
+                    reset_future,
+                    deadline=reset_join_deadline,
+                    label=f"close-requested reset lease={_run_lease_id}",
+                )
+                if not joined:
+                    await self._quarantine_reset_run(
+                        run_slot,
+                        reset_future,
+                        reason=f"repair_close_requested_join_timeout:{reason}",
+                    )
+
+        async with self._lock:
+            for (
+                task_key,
+                run_lease_id,
+                run_slot,
+                reset_future,
+                close_age_sec,
+            ) in candidates:
+                current_task_key = self._run_to_task.get(run_lease_id)
+                current_task_slot = (
+                    self._tasks.get(current_task_key)
+                    if current_task_key is not None
+                    else None
+                )
+                if (
+                    current_task_key != task_key
+                    or current_task_slot is None
+                    or current_task_slot.runs.get(run_lease_id) is not run_slot
+                ):
+                    continue
+                if run_slot.reset_quarantined:
+                    skipped_active += 1
+                    continue
+                if run_slot.reset_future is not reset_future:
+                    skipped_active += 1
+                    continue
+                if reset_future is not None and not reset_future.done():
+                    skipped_active += 1
+                    continue
+                if run_slot.in_flight_ops > 0 or run_slot.lock.locked():
+                    skipped_active += 1
+                    continue
+                popped = self._pop_run_slot_locked(run_lease_id)
+                if popped is None:
+                    continue
+                popped_task_key, popped_slot = popped
+                slots_to_force_cleanup.append(
+                    (popped_task_key, run_lease_id, popped_slot)
+                )
+                repaired_runs.append(
+                    {
+                        "lease_id": run_lease_id,
+                        "task_key": popped_task_key,
+                        "phase": popped_slot.phase,
+                        "reason": "close_requested_capacity_pressure",
+                        "age_sec": round(close_age_sec, 1),
+                        "in_flight_ops": popped_slot.in_flight_ops,
+                        "active_op": popped_slot.active_op,
+                        "close_requested": popped_slot.close_requested,
+                        "container": self._run_slot_container_info(popped_slot),
+                    }
+                )
 
         if slots_to_force_cleanup and wait_for_cleanup:
             await self._force_cleanup_slots(
@@ -2168,6 +2624,7 @@ class WorkerPool:
             "wait_for_cleanup": wait_for_cleanup,
             "repaired_count": len(repaired_runs),
             "repaired_runs": repaired_runs,
+            "skipped_active": skipped_active,
         }
 
     async def repair_resetting_runs(
@@ -2180,6 +2637,9 @@ class WorkerPool:
     ) -> dict[str, Any]:
         now = time.time()
         slots_to_force_cleanup: list[tuple[str, str, RunSlot]] = []
+        candidates: list[
+            tuple[str, str, RunSlot, asyncio.Task[Any] | None, float]
+        ] = []
         repaired_runs: list[dict[str, Any]] = []
         async with self._lock:
             self._prune_done_closing_tasks()
@@ -2195,35 +2655,98 @@ class WorkerPool:
                     )
                     if reset_age_sec < min_age:
                         continue
-                    if (
-                        run_slot.reset_future is not None
-                        and not run_slot.reset_future.done()
-                    ):
-                        run_slot.reset_future.cancel()
-                    popped = self._pop_run_slot_locked(run_lease_id)
-                    if popped is None:
-                        continue
-                    popped_task_key, popped_slot = popped
-                    slots_to_force_cleanup.append(
-                        (popped_task_key, run_lease_id, popped_slot)
+                    reset_future = run_slot.reset_future
+                    run_slot.close_requested = True
+                    run_slot.close_reason = f"repair_resetting_runs:{reason}"
+                    run_slot.close_requested_ts = now
+                    run_slot.drop_scheduled = True
+                    run_slot.phase = "closing_requested"
+                    candidates.append(
+                        (
+                            task_key,
+                            run_lease_id,
+                            run_slot,
+                            reset_future,
+                            reset_age_sec,
+                        )
                     )
-                    repaired_runs.append(
-                        {
-                            "lease_id": run_lease_id,
-                            "task_key": popped_task_key,
-                            "phase": popped_slot.phase,
-                            "reason": "resetting_storm_repair",
-                            "age_sec": round(reset_age_sec, 1),
-                            "in_flight_ops": popped_slot.in_flight_ops,
-                            "active_op": popped_slot.active_op,
-                            "close_requested": popped_slot.close_requested,
-                            "container": self._run_slot_container_info(popped_slot),
-                        }
-                    )
-                    if max_repairs > 0 and len(repaired_runs) >= max_repairs:
+                    if max_repairs > 0 and len(candidates) >= max_repairs:
                         break
-                if max_repairs > 0 and len(repaired_runs) >= max_repairs:
+                if max_repairs > 0 and len(candidates) >= max_repairs:
                     break
+
+        reset_join_deadline = asyncio.get_running_loop().time() + max(
+            0.1, _env_float("WORKER_RESET_CANCEL_JOIN_TIMEOUT", 15.0)
+        )
+        for (
+            _task_key,
+            _run_lease_id,
+            run_slot,
+            reset_future,
+            _reset_age_sec,
+        ) in candidates:
+            if reset_future is not None and not reset_future.done():
+                reset_future.cancel()
+                joined = await self._cancel_and_join_reset_task(
+                    reset_future,
+                    deadline=reset_join_deadline,
+                    label=f"stale reset lease={_run_lease_id}",
+                )
+                if not joined:
+                    await self._quarantine_reset_run(
+                        run_slot,
+                        reset_future,
+                        reason=f"repair_resetting_join_timeout:{reason}",
+                    )
+
+        async with self._lock:
+            for (
+                task_key,
+                run_lease_id,
+                run_slot,
+                reset_future,
+                reset_age_sec,
+            ) in candidates:
+                current_task_key = self._run_to_task.get(run_lease_id)
+                current_task_slot = (
+                    self._tasks.get(current_task_key)
+                    if current_task_key is not None
+                    else None
+                )
+                if (
+                    current_task_key != task_key
+                    or current_task_slot is None
+                    or current_task_slot.runs.get(run_lease_id) is not run_slot
+                ):
+                    continue
+                if run_slot.reset_quarantined:
+                    continue
+                if run_slot.reset_future is not reset_future:
+                    continue
+                if reset_future is not None and not reset_future.done():
+                    continue
+                if run_slot.in_flight_ops > 0 or run_slot.lock.locked():
+                    continue
+                popped = self._pop_run_slot_locked(run_lease_id)
+                if popped is None:
+                    continue
+                popped_task_key, popped_slot = popped
+                slots_to_force_cleanup.append(
+                    (popped_task_key, run_lease_id, popped_slot)
+                )
+                repaired_runs.append(
+                    {
+                        "lease_id": run_lease_id,
+                        "task_key": popped_task_key,
+                        "phase": popped_slot.phase,
+                        "reason": "resetting_storm_repair",
+                        "age_sec": round(reset_age_sec, 1),
+                        "in_flight_ops": popped_slot.in_flight_ops,
+                        "active_op": popped_slot.active_op,
+                        "close_requested": popped_slot.close_requested,
+                        "container": self._run_slot_container_info(popped_slot),
+                    }
+                )
 
         if slots_to_force_cleanup and wait_for_cleanup:
             await self._force_cleanup_slots(
@@ -2329,19 +2852,20 @@ class WorkerPool:
         min_age_sec = max(0.0, _env_float("WORKER_ORPHAN_DOCKER_SWEEP_MIN_AGE", 600.0))
         max_remove = _env_int("WORKER_ORPHAN_DOCKER_SWEEP_MAX_REMOVE", 128)
         timeout = max(1.0, _env_float("WORKER_ORPHAN_DOCKER_SWEEP_TIMEOUT", 30.0))
-        try:
-            removed = await asyncio.wait_for(
-                asyncio.to_thread(
-                    force_remove_orphan_docker_objects,
-                    active_container_names=active_container_names,
-                    active_project_names=active_project_names,
-                    active_task_ids=active_task_ids,
-                    reason="periodic_reap",
-                    min_age_sec=min_age_sec,
-                    max_remove=max_remove,
-                ),
-                timeout=timeout,
+        sweep_task = asyncio.create_task(
+            asyncio.to_thread(
+                force_remove_orphan_docker_objects,
+                active_container_names=active_container_names,
+                active_project_names=active_project_names,
+                active_task_ids=active_task_ids,
+                reason="periodic_reap",
+                min_age_sec=min_age_sec,
+                max_remove=max_remove,
+                cleanup_timeout=timeout,
             )
+        )
+        try:
+            removed = await asyncio.shield(sweep_task)
             if removed < 0:
                 self._record_orphan_sweep_failure("docker_ps_failed")
                 return
@@ -2357,7 +2881,7 @@ class WorkerPool:
                     len(active_task_ids),
                     min_age_sec,
                 )
-        except asyncio.TimeoutError:
+        except (asyncio.TimeoutError, TimeoutError):
             logger.warning(
                 "Periodic orphan Docker sweep timed out after %.1fs "
                 "active_containers=%d active_projects=%d active_tasks=%d",
@@ -2367,6 +2891,12 @@ class WorkerPool:
                 len(active_task_ids),
             )
             self._record_orphan_sweep_failure(f"timeout_after_{timeout:.1f}s")
+        except asyncio.CancelledError:
+            # Cancelling asyncio.to_thread does not stop its worker thread.
+            # Join the bounded sweep so it cannot mutate Docker state after
+            # this reaper invocation has returned.
+            await self._join_task_uncancellable(sweep_task)
+            raise
         except Exception:
             self._record_orphan_sweep_failure("exception")
             logger.exception("Periodic orphan Docker sweep failed")
@@ -2386,6 +2916,8 @@ class WorkerPool:
 
     async def _maybe_cleanup_shims(self) -> None:
         """P0 fix: Proactively clean Docker shims to prevent resource exhaustion."""
+        if not _env_bool("WORKER_SHIM_CLEANUP_ENABLED", True):
+            return
         try:
             now = time.time()
             cleanup_interval = _env_float("WORKER_SHIM_CLEANUP_INTERVAL", 600.0)  # 10 min default
@@ -2481,12 +3013,72 @@ class WorkerPool:
 
     async def shutdown(self) -> None:
         async with self._lock:
+            self._shutdown_started = True
+            reset_entries = [
+                (run_slot, run_slot.reset_future)
+                for task_slot in self._tasks.values()
+                for run_slot in task_slot.runs.values()
+                if run_slot.reset_future is not None
+                and not run_slot.reset_future.done()
+                and not run_slot.reset_quarantined
+            ]
+            reset_futures = {future for _run_slot, future in reset_entries}
+
+        # A reset may create Docker objects while cancellation propagates. Join
+        # every reset before removing leases or starting close/force cleanup.
+        reset_join_timeout = max(
+            0.1,
+            _env_float(
+                "WORKER_SHUTDOWN_RESET_JOIN_TIMEOUT",
+                _env_float("WORKER_RESET_CANCEL_JOIN_TIMEOUT", 15.0) + 5.0,
+            ),
+        )
+        reset_join_deadline = asyncio.get_running_loop().time() + reset_join_timeout
+        for reset_future in reset_futures:
+            reset_future.cancel()
+        reset_join_failures = 0
+        for reset_future in reset_futures:
+            joined = await self._cancel_and_join_reset_task(
+                reset_future,
+                deadline=reset_join_deadline,
+                label="reset wrapper during shutdown",
+            )
+            if not joined:
+                quarantined_any = False
+                for run_slot, entry_future in reset_entries:
+                    if entry_future is reset_future:
+                        quarantined_any = (
+                            await self._quarantine_reset_run(
+                                run_slot,
+                                reset_future,
+                                reason="shutdown_reset_join_timeout",
+                            )
+                            or quarantined_any
+                        )
+                if quarantined_any:
+                    reset_join_failures += 1
+        if reset_join_failures:
+            logger.error(
+                "Shutdown reset join deadline %.1fs expired for %d task(s); "
+                "their leases remain quarantined and cleanup is deferred until reset exits",
+                reset_join_timeout,
+                reset_join_failures,
+            )
+
+        async with self._lock:
             slots_to_close: list[tuple[str, str, RunSlot]] = []
-            for task_key, task_slot in self._tasks.items():
-                for run_lease_id, run_slot in task_slot.runs.items():
-                    slots_to_close.append((task_key, run_lease_id, run_slot))
-            self._tasks.clear()
-            self._run_to_task.clear()
+            all_slots = [
+                (task_key, run_lease_id, run_slot)
+                for task_key, task_slot in self._tasks.items()
+                for run_lease_id, run_slot in task_slot.runs.items()
+            ]
+            for _task_key, run_lease_id, run_slot in all_slots:
+                if run_slot.reset_quarantined:
+                    continue
+                popped = self._pop_run_slot_locked(run_lease_id)
+                if popped is not None:
+                    task_key, popped_slot = popped
+                    slots_to_close.append((task_key, run_lease_id, popped_slot))
             self._idempotency.clear()
 
         for task_key, run_lease_id, run_slot in slots_to_close:

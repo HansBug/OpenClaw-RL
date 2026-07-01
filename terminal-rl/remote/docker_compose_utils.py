@@ -474,14 +474,19 @@ def build_docker_image(
         _record_build_active(1)
         try:
             _raise_if_cancelled(cancel_event, build_key=build_key, stage="before_build")
-            import inspect
-
             logger.info("Building Docker image for task=%s image=%s", task_name, build_key)
             try:
-                if "timeout" in inspect.signature(compose_manager.build).parameters:
-                    compose_manager.build(timeout=timeout)
-                else:
-                    compose_manager.build()
+                command = compose_manager.get_docker_compose_command(["build"])
+                compose_manager.env["http_proxy"] = os.getenv("HTTP_PROXY", "")
+                compose_manager.env["https_proxy"] = os.getenv("HTTPS_PROXY", "")
+                subprocess.run(
+                    command,
+                    env=compose_manager.env,
+                    check=True,
+                    capture_output=True,
+                    text=True,
+                    timeout=timeout,
+                )
             except Exception as exc:
                 message = _shorten_output(str(exc), max_chars=1200) or type(exc).__name__
                 _BUILD_FAILED[build_key] = (time.time(), message)
@@ -764,7 +769,10 @@ def compose_up_no_build(
                             note=f"Initial command {' '.join(command)} failed with exit code {exc.returncode}.",
                         )
                     ) from fallback_exc
-                container = compose_manager._client.containers.get(container_name)
+                client = compose_manager._client
+                if hasattr(client.api, "timeout"):
+                    client.api.timeout = max(1.0, min(float(timeout), 30.0))
+                container = client.containers.get(container_name)
                 terminal.container = container
                 compose_manager._client_container = container
                 _apply_container_runtime_limits(container_name, logger=logger)
@@ -789,7 +797,10 @@ def compose_up_no_build(
             )
         ) from exc
 
-    container = compose_manager._client.containers.get(container_name)
+    client = compose_manager._client
+    if hasattr(client.api, "timeout"):
+        client.api.timeout = max(1.0, min(float(timeout), 30.0))
+    container = client.containers.get(container_name)
     terminal.container = container
     compose_manager._client_container = container
     _apply_container_runtime_limits(container_name, logger=logger)

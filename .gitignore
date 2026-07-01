@@ -11,6 +11,11 @@ logs
 docs/
 a3s-code-adapter/docs/
 
+# Generated SWE-smith data and Terminal-Bench task directories.
+terminal-rl/dataset/swesmith_convert/
+terminal-rl/dataset/swesmith_env/
+terminal-rl/dataset/swesmith_smoke/
+
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
