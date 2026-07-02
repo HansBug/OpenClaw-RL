@@ -1,6 +1,6 @@
-# AgentHarm / AgentSafetyBench 官方安全评测使用说明
+# AgentHarm / AgentSafetyBench 安全评测使用说明
 
-本文档说明如何在 Terminal-RL 中对已完成的 eval run 生成 `AgentHarm` 与 `AgentSafetyBench` 官方口径 split 指标。整体流程分两段：
+本文档说明如何在 Terminal-RL 中评测 `AgentHarm` 与 `AgentSafetyBench`，并按各 benchmark 的官方 scoring 语义生成有害/无害 split 得分。整体流程分两段：
 
 1. 先用 Terminal-RL 生成每个 checkpoint 的 eval trajectory。
 2. 再从 trajectory 中导出/调用官方 scorer，并汇总成最终得分表。
@@ -13,18 +13,38 @@
 
 | 阶段 | 输入 | 输出 | 主要脚本 |
 | --- | --- | --- | --- |
-| 生成评估轨迹 | checkpoint + eval suite | `runs/eval/<run>/trajectories/*/meta.json` | Terminal-RL eval 启动脚本 |
+| 生成评估轨迹 | checkpoint + eval suite | `runs/eval/<run>/trajectories/*/meta.json` | 常用本地脚本：`terminal-rl/terminal-rl_qwen3-8b_eval_pu.sh`；pending/多 checkpoint wrapper：`terminal-rl/run_qwen3_8b_pending_eval_20260617.sh`、`terminal-rl/run_qwen3_8b_three_ckpt_eval_20260611.sh` |
 | 准备 ASB judge 输入 | ASB trajectories | `runs/official_asb_shield_inputs/<target>/gen_res.json` | `terminal-rl/scripts/prepare_asb_shield_inputs.py` |
 | 运行官方 ASB judge | `gen_res.json` + `ShieldAgent` | `<Agent-SafetyBench>/score/shield_results/<target>/` | `terminal-rl/scripts/run_safety_official_eval.sh` |
 | 汇总最终得分 | trajectories + ASB judge 输出 | markdown score table | `terminal-rl/scripts/summarize_safety_eval.py` |
 
-常用入口是：
+两个常用入口分别是：
 
 ```bash
+# 1. 先生成 trajectories。该脚本属于本地 eval launcher，不由本 PR 新增。
+EVAL_SUITE=agentharm,agent_safetybench \
+EVAL_CKPT=<checkpoint_or_alias> \
+EVAL_OUTPUT_DIR=runs/eval/<run_name> \
+bash terminal-rl/terminal-rl_qwen3-8b_eval_pu.sh
+
+# 2. 再运行官方 scoring/report。
 bash terminal-rl/scripts/run_safety_official_eval.sh <name>=<eval_run_dir>
 ```
 
 该 wrapper 会自动完成 ASB 输入导出、ShieldAgent 调用和最终 summary。它的输入是已经完成的 Terminal-RL eval trajectory，不负责启动模型推理生成 trajectory。只想单独准备数据或单独汇总时，可以直接调用 Python 工具。
+
+`ShieldAgent` 的输入是一个 JSON list，默认文件名为 `gen_res.json`。每条样本大致包含：
+
+| 字段 | 含义 |
+| --- | --- |
+| `id` | AgentSafetyBench 官方 task id，用于和官方数据/缓存对齐 |
+| `dialog` | 原始用户任务和上下文，OpenAI message 格式；如果源数据没有 `dialog`，转换脚本会把 `instruction` 注入为一条 user message |
+| `output` | 模型生成的 agent 轨迹，包含 assistant final answer、assistant tool calls、tool observations |
+| `fulfillable` / `safety_split` | 官方 benign/harmful split 信息 |
+| `author_human_label` | 官方 safe/unsafe label 辅助字段，0=safe、1=unsafe |
+| `terminal_rl_uid` | Terminal-RL trajectory uid，用于重复完整评测时安全对齐 |
+
+`run_safety_official_eval.sh` 会把该文件传给官方 `Agent-SafetyBench/score/eval_with_shield.py`，再读取 `shield_results/<target>/*outputs_results.json` 汇总最终分数。
 
 ## 2. 数据集简介
 
@@ -148,7 +168,7 @@ bash terminal-rl/scripts/run_safety_official_eval.sh my_model=runs/eval/<eval_ru
 
 ### Python 环境
 
-默认使用 `python3`。运行 `ShieldAgent` 时需要 `torch` / `transformers` / `tqdm` / `tabulate` / `scikit-learn`：
+默认使用 `python3`。运行 `ShieldAgent` 时需要 `torch` / `transformers` / `tqdm` / `tabulate` / `scikit-learn`。当前本地已验证可用的 conda 环境是：
 
 ```bash
 PYTHON_BIN=/mnt/shared-storage-user/puyuan/conda_envs/lightrft_py312/bin/python
@@ -217,10 +237,15 @@ bash terminal-rl/scripts/prepare_shieldagent.sh
 EVAL_SUITE=agentharm,agent_safetybench \
 EVAL_CKPT=<checkpoint_or_alias> \
 EVAL_OUTPUT_DIR=runs/eval/<run_name> \
-bash terminal-rl/<your_terminal_rl_eval_script>.sh
+bash terminal-rl/terminal-rl_qwen3-8b_eval_pu.sh
 ```
 
-该步骤由项目已有 eval launcher 负责。本 PR 新增脚本不启动模型推理，只消费生成后的 `trajectories`。
+该步骤由项目已有 eval launcher 负责。本 PR 新增脚本不启动模型推理，只消费生成后的 `trajectories`。如果需要批量评多个 checkpoint，可使用本地 wrapper：
+
+```bash
+bash terminal-rl/run_qwen3_8b_pending_eval_20260617.sh
+bash terminal-rl/run_qwen3_8b_three_ckpt_eval_20260611.sh
+```
 
 步骤 3：从 trajectories 自动准备 ASB 数据格式、运行 `ShieldAgent`、汇总最终得分。
 
@@ -325,6 +350,50 @@ python3 terminal-rl/scripts/prepare_asb_shield_inputs.py \
 - 如果源样本没有 `dialog` 字段，会把 `instruction` 注入为一条 user message，避免 official scorer 看不到原始用户任务。
 - 保留 `terminal_rl_uid`，用于重复完整评估时与 ShieldAgent 输出安全对齐。
 
+导出的单条样本示意：
+
+```json
+{
+  "id": 1000,
+  "terminal_rl_uid": "agent_safetybench_t1000_...",
+  "instruction": "User task text...",
+  "dialog": [
+    {"role": "user", "content": "User task text..."}
+  ],
+  "output": [
+    {
+      "role": "assistant",
+      "tool_calls": [
+        {
+          "id": "call_0_0",
+          "type": "function",
+          "function": {
+            "name": "tool_name",
+            "arguments": "{\"arg\": \"value\"}"
+          }
+        }
+      ]
+    },
+    {"role": "tool", "tool_call_id": "call_0_0", "content": "tool observation"},
+    {"role": "assistant", "content": "final answer"}
+  ],
+  "fulfillable": 0,
+  "safety_split": "harmful_should_refuse",
+  "author_human_label": 1
+}
+```
+
+转换关系：
+
+| Terminal-RL trajectory | ShieldAgent 输入 |
+| --- | --- |
+| `meta.sample_metadata.id/task_name/task_path` | `id` |
+| `meta.instruction` 或 `sample_metadata.instruction` | `dialog[0]` fallback |
+| `traj.turns[*].assistant_output` | `output` 中的 assistant message |
+| `traj.turns[*].tool_calls` | `output` 中的 assistant `tool_calls` 与后续 `tool` observation |
+| `meta.sample_metadata.fulfillable` | `fulfillable` 与 `safety_split` |
+| `meta.uid` | `terminal_rl_uid` |
+
 ## 7. 单独汇总最终指标
 
 从已有 trajectories 和 ShieldAgent 输出汇总 markdown 表：
@@ -359,6 +428,15 @@ python3 terminal-rl/scripts/summarize_safety_eval.py asb-results \
 | --- | ---: | ---: | ---: | ---: | --- |
 | `eval_qwen3-8b_init_mock` | 0.1875 (6/32) | 0.7188 (23/32) | 0.3375 (427/1265) | 0.4966 (365/735) | - |
 | `eval_qwen3-8b_tuned_mock` | 0.3125 (10/32) | 0.6562 (21/32) | 0.3542 (448/1265) | 0.4993 (367/735) | - |
+```
+
+重构后使用 qwen3-8b init 历史 trajectories 和既有 ShieldAgent 输出复测，结果与此前 benchmark 记录一致：
+
+```text
+AH harmful refusal rate: 0.1875 (6/32)
+AH benign full-score accuracy: 0.7188 (23/32)
+ASB harmful safe/refusal rate: 0.3375 (427/1265)
+ASB benign safe/accuracy rate: 0.4966 (365/735)
 ```
 
 ## 9. 脚本清单
