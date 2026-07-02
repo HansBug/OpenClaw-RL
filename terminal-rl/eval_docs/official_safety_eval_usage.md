@@ -190,12 +190,23 @@ PJLab 本地集群当前可用的 `ShieldAgent` cache 路径：
 /mnt/shared-storage-gpfs2/gpfs2-shared-public/huggingface/zskj-hub/models--thu-coai--ShieldAgent
 ```
 
+如果当前训练节点没有挂载 gpfs2，可复用已准备好的 repo-local 实文件目录：
+
+```bash
+/mnt/shared-storage-user/puyuan/zhangchenhao/OpenClaw-RL/runs/models/ShieldAgent
+```
+
 准备 repo-local 模型：
 
 ```bash
 cd /path/to/OpenClaw-RL
 
+# 方式 A：当前节点能访问 gpfs2 cache
 SHIELD_MODEL_SOURCE=/mnt/shared-storage-gpfs2/gpfs2-shared-public/huggingface/zskj-hub/models--thu-coai--ShieldAgent \
+bash terminal-rl/scripts/prepare_shieldagent.sh
+
+# 方式 B：当前节点不能访问 gpfs2，但能访问已准备好的 repo-local 实文件
+SHIELD_MODEL_SOURCE=/mnt/shared-storage-user/puyuan/zhangchenhao/OpenClaw-RL/runs/models/ShieldAgent \
 bash terminal-rl/scripts/prepare_shieldagent.sh
 ```
 
@@ -226,7 +237,10 @@ bash terminal-rl/scripts/prepare_shieldagent.sh
 
 ```bash
 cd /path/to/OpenClaw-RL
+set -e
 
+# gpfs2 不可见时，改用：
+# SHIELD_MODEL_SOURCE=/mnt/shared-storage-user/puyuan/zhangchenhao/OpenClaw-RL/runs/models/ShieldAgent
 SHIELD_MODEL_SOURCE=/mnt/shared-storage-gpfs2/gpfs2-shared-public/huggingface/zskj-hub/models--thu-coai--ShieldAgent \
 bash terminal-rl/scripts/prepare_shieldagent.sh
 ```
@@ -273,7 +287,10 @@ runs/official_safety_eval/summary_YYYYMMDD_HHMMSS.md
 
 ```bash
 cd /path/to/OpenClaw-RL
+set -e
 
+# gpfs2 不可见时，改用：
+# SHIELD_MODEL_SOURCE=/mnt/shared-storage-user/puyuan/zhangchenhao/OpenClaw-RL/runs/models/ShieldAgent
 SHIELD_MODEL_SOURCE=/mnt/shared-storage-gpfs2/gpfs2-shared-public/huggingface/zskj-hub/models--thu-coai--ShieldAgent \
 bash terminal-rl/scripts/prepare_shieldagent.sh
 
