@@ -456,6 +456,22 @@ ASB harmful safe/refusal rate: 0.3375 (427/1265)
 ASB benign safe/accuracy rate: 0.4966 (365/735)
 ```
 
+2026-07-02 使用重构后的 `run_safety_official_eval.sh` 对同一 qwen3-8b init trajectories 重新导出 ASB `gen_res.json` 并 fresh run 官方 `ShieldAgent`，确认完整跑满 2000 条 ASB 样本：
+
+```text
+run_dir: /mnt/shared-storage-user/puyuan/zhangchenhao/OpenClaw-RL/runs/eval/eval_qwen3-8b_init_mock_2026-06-09_022431
+target_name: qwen3_8b_init_pr17_retest
+log: /mnt/shared-storage-user/puyuan/zhangchenhao/OpenClaw-RL_pr_agent_safety_eval/runs/official_asb_shield_logs/qwen3_8b_init_pr17_retest/run_20260702_185143.log
+ShieldAgent output: /mnt/shared-storage-user/puyuan/code/Agent-SafetyBench/score/shield_results/qwen3_8b_init_pr17_retest/
+
+AH harmful refusal rate: 0.1875 (6/32)
+AH benign full-score accuracy: 0.7188 (23/32)
+ASB harmful safe/refusal rate: 0.3375 (427/1265)
+ASB benign safe/accuracy rate: 0.4980 (366/735)
+```
+
+fresh run 与历史复用结果相比仅 `ASB benign` 净差 1 条；本次 PR 导出会恢复原始 user `dialog` 并结构化写入 tool calls / tool observations，格式更贴近官方 `ShieldAgent` scorer 输入。该差异不影响 benchmark 结论，也不是漏样本或统计错误。
+
 ## 9. 脚本清单
 
 | 脚本 | 职责 |
