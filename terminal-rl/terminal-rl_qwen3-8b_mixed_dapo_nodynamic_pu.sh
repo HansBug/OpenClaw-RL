@@ -358,7 +358,7 @@ if [[ "${TERMINAL_SAVE_TRAJ_DIR+x}" ]]; then
 else
   TERMINAL_SAVE_TRAJ_DIR="${RUN_DIR}/trajectories"
 fi
-WANDB_DIR="${RUN_DIR}/metrics/wandb"
+WANDB_DIR="${WANDB_DIR:-${RUN_DIR}/metrics/wandb}"
 TERMINAL_STRUCTURED_METRICS="${TERMINAL_STRUCTURED_METRICS:-1}"
 TERMINAL_METRICS_JSONL="${TERMINAL_METRICS_JSONL:-${RUN_LOG_DIR}/metrics.jsonl}"
 TERMINAL_WANDB_METRIC_PROFILE="${TERMINAL_WANDB_METRIC_PROFILE:-full}"
@@ -1386,14 +1386,29 @@ OPTIMIZER_ARGS=(
   --use-precision-aware-optimizer
 )
 
-if [[ -n "${WANDB_KEY:-}" ]]; then
+WANDB_MODE="${WANDB_MODE:-offline}"
+WANDB_ENABLE="${WANDB_ENABLE:-0}"
+WANDB_KEY_VALUE="${WANDB_KEY:-${WANDB_API_KEY:-}}"
+case "${WANDB_ENABLE,,}" in
+  1|true|yes|on)
+    WANDB_ENABLE_RESOLVED=1
+    ;;
+  *)
+    WANDB_ENABLE_RESOLVED=0
+    ;;
+esac
+
+if [[ "${WANDB_MODE}" != "disabled" ]] && (( WANDB_ENABLE_RESOLVED || ${#WANDB_KEY_VALUE} > 0 )); then
   WANDB_ARGS=(
     --use-wandb
+    --wandb-mode    "${WANDB_MODE}"
     --wandb-project "${WANDB_PROJECT:-terminal_rl}"
     --wandb-group   "${WANDB_GROUP:-qwen3-8b_4gpu}"
-    --wandb-key     "${WANDB_KEY}"
     --wandb-dir     "${WANDB_DIR}"
   )
+  if [[ -n "${WANDB_KEY_VALUE}" ]]; then
+    WANDB_ARGS+=(--wandb-key "${WANDB_KEY_VALUE}")
+  fi
 else
   WANDB_ARGS=()
 fi
