@@ -297,9 +297,25 @@ class Tau2Env:
             solo_mode=False,
         )
 
-    @staticmethod
-    def _tool_schemas(env: Any) -> list[dict[str, Any]]:
-        return [deepcopy(tool.openai_schema) for tool in env.get_tools()]
+    def _tool_schemas(self, env: Any) -> list[dict[str, Any]]:
+        tools = list(env.get_tools())
+        if self._is_solo_mode():
+            try:
+                tools.extend(env.get_user_tools())
+            except Exception:
+                pass
+
+        schemas: list[dict[str, Any]] = []
+        seen_names: set[str] = set()
+        for tool in tools:
+            schema = deepcopy(tool.openai_schema)
+            name = str((schema.get("function") or {}).get("name") or "")
+            if name and name in seen_names:
+                continue
+            if name:
+                seen_names.add(name)
+            schemas.append(schema)
+        return schemas
 
     def _user_message(self, env: Any, task: Any) -> str:
         if not self._is_solo_mode():

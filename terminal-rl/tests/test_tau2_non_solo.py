@@ -93,6 +93,53 @@ class FakeUser:
         )
 
 
+class FakeTool:
+    def __init__(self, name: str) -> None:
+        self.openai_schema = {
+            "type": "function",
+            "function": {
+                "name": name,
+                "parameters": {"type": "object", "properties": {}},
+            },
+        }
+
+
+class FakeTau2ToolEnv:
+    def __init__(self) -> None:
+        self.agent_tools = [FakeTool("get_customer_by_phone")]
+        self.user_tools = [FakeTool("check_network_status"), FakeTool("reseat_sim_card")]
+
+    def get_tools(self):
+        return self.agent_tools
+
+    def get_user_tools(self):
+        return self.user_tools
+
+
+def _schema_names(tool_schemas):
+    return [schema["function"]["name"] for schema in tool_schemas]
+
+
+def test_tau2_env_solo_exposes_agent_and_user_tools():
+    env = Tau2Env()
+    env._task_meta = {"tau2_mode": "solo"}
+
+    assert _schema_names(env._tool_schemas(FakeTau2ToolEnv())) == [
+        "get_customer_by_phone",
+        "check_network_status",
+        "reseat_sim_card",
+    ]
+
+
+def test_tau2_env_non_solo_only_exposes_agent_tools():
+    env = Tau2Env()
+    env._task_meta = {"tau2_mode": "non_solo"}
+
+    assert _schema_names(env._tool_schemas(FakeTau2ToolEnv())) == [
+        "get_customer_by_phone",
+    ]
+
+
 def test_tau2_env_non_solo_generates_follow_up_user_message():
     env = Tau2Env()
     env._task_meta = {"tau2_mode": "non_solo"}

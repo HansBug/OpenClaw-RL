@@ -395,6 +395,52 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                     "You could use `slime.rollout.filter_hub.dynamic_sampling_filters.check_reward_nonzero_std` as an example."
                 ),
             )
+            parser.add_argument(
+                "--dynamic-sampling-max-groups",
+                type=int,
+                default=None,
+                help=(
+                    "Maximum number of prompt groups that one rollout may submit while dynamic sampling tries "
+                    "to collect rollout_batch_size kept groups. If unset and dynamic sampling is enabled, "
+                    "defaults to max(rollout_batch_size*64, over_sampling_batch_size*64). Use <=0 to disable."
+                ),
+            )
+            parser.add_argument(
+                "--dynamic-sampling-max-seconds",
+                type=float,
+                default=None,
+                help=(
+                    "Optional wall-clock timeout in seconds for one dynamic-sampling rollout. "
+                    "Use <=0 or leave unset to disable."
+                ),
+            )
+            parser.add_argument(
+                "--dynamic-sampling-failed-group-abort-min-groups",
+                type=int,
+                default=None,
+                help=(
+                    "Abort one dynamic-sampling rollout early when no group has been kept and at least this many "
+                    "completed prompt groups are entirely FAILED. Leave unset or use <=0 to disable."
+                ),
+            )
+            parser.add_argument(
+                "--dynamic-sampling-failed-group-abort-ratio",
+                type=float,
+                default=1.0,
+                help=(
+                    "Minimum all-FAILED completed-group ratio required by "
+                    "--dynamic-sampling-failed-group-abort-min-groups. Clamped to [0, 1]."
+                ),
+            )
+            parser.add_argument(
+                "--rollout-abort-wait-timeout",
+                type=float,
+                default=300.0,
+                help=(
+                    "Maximum seconds to wait for pending generation tasks to finish after rollout abort. "
+                    "If exceeded, pending tasks are canceled and rollout state is reset."
+                ),
+            )
 
             # partial rollout
             parser.add_argument(
@@ -508,6 +554,53 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 action="store_true",
                 default=False,
                 help="Whether to enable the fault tolerance function during rollout.",
+            )
+            parser.add_argument(
+                "--rollout-generation-max-retries",
+                type=int,
+                default=0,
+                help=(
+                    "How many times the train driver retries a failed rollout_manager.generate call. "
+                    "Use 0 to fail immediately and -1 to retry indefinitely."
+                ),
+            )
+            parser.add_argument(
+                "--rollout-generation-retry-initial-backoff",
+                type=float,
+                default=30.0,
+                help="Initial sleep seconds before retrying a failed rollout generation.",
+            )
+            parser.add_argument(
+                "--rollout-generation-retry-max-backoff",
+                type=float,
+                default=300.0,
+                help="Maximum sleep seconds between rollout generation retries.",
+            )
+            parser.add_argument(
+                "--rollout-generation-retry-backoff-multiplier",
+                type=float,
+                default=2.0,
+                help="Multiplier applied to rollout generation retry backoff after each failure.",
+            )
+            parser.add_argument(
+                "--rollout-generation-env-storm-max-retries",
+                type=int,
+                default=3,
+                help=(
+                    "Maximum consecutive rollout-generation retries allowed when the error looks like "
+                    "an environment allocation storm, such as all dynamic-sampling groups failing, "
+                    "TASK_SLOTS_EXHAUSTED, or repeated /allocate failures. Use -1 to disable this circuit breaker."
+                ),
+            )
+            parser.add_argument(
+                "--rollout-generation-skip-on-failure",
+                action="store_true",
+                default=False,
+                help=(
+                    "After rollout-generation-max-retries is exhausted, skip the failed rollout "
+                    "instead of terminating training. This is intended for transient environment "
+                    "pool outages; skipped rollouts are not sent to actor/critic training."
+                ),
             )
             parser.add_argument(
                 "--rollout-health-check-interval",
