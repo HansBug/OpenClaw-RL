@@ -115,12 +115,36 @@ def _install_import_stubs(monkeypatch):
     terminal_env_mod.TerminalEnv = _DummyEnv
     terminal_env_mod.force_remove_orphan_docker_objects = lambda **_kwargs: 0
 
+    docker_compose_utils_mod = types.ModuleType("terminal-rl.remote.docker_compose_utils")
+
+    class DockerImageBuildError(RuntimeError):
+        pass
+
+    class DockerImagePreparationBacklogError(RuntimeError):
+        pass
+
+    class TaskImageBlacklistedError(DockerImageBuildError):
+        pass
+
+    docker_compose_utils_mod.DockerImageBuildError = DockerImageBuildError
+    docker_compose_utils_mod.DockerImagePreparationBacklogError = (
+        DockerImagePreparationBacklogError
+    )
+    docker_compose_utils_mod.TaskImageBlacklistedError = TaskImageBlacklistedError
+    docker_compose_utils_mod.docker_image_build_status = lambda: {
+        "active": 0,
+        "waiting": 0,
+    }
+
     monkeypatch.setitem(sys.modules, "uvicorn", types.ModuleType("uvicorn"))
     monkeypatch.setitem(sys.modules, "fastapi", fastapi_mod)
     monkeypatch.setitem(sys.modules, "fastapi.responses", responses_mod)
     monkeypatch.setitem(sys.modules, "terminal-rl.custom_types", custom_types_mod)
     monkeypatch.setitem(sys.modules, "terminal-rl.request_utils", request_utils_mod)
     monkeypatch.setitem(sys.modules, "terminal-rl.remote.terminal_env", terminal_env_mod)
+    monkeypatch.setitem(
+        sys.modules, "terminal-rl.remote.docker_compose_utils", docker_compose_utils_mod
+    )
     sys.modules.pop("terminal-rl.remote.pool_server", None)
     return importlib.import_module("terminal-rl.remote.pool_server")
 
@@ -255,6 +279,103 @@ def test_idle_reaper_skips_in_flight_reset(monkeypatch, tmp_path):
         await reset_task
         assert lease_id in pool._run_to_task
         assert env.close_count == 0
+
+    asyncio.run(_case())
+
+
+def test_reset_admission_backlog_does_not_mark_waiter_resetting(monkeypatch, tmp_path):
+    async def _case():
+        monkeypatch.setenv("WORKER_MAX_CONCURRENT_RESETS", "1")
+        monkeypatch.setenv("WORKER_RESET_ADMISSION_TIMEOUT", "0.05")
+        pool_server = _install_import_stubs(monkeypatch)
+        env = _DummyEnv()
+        pool = _new_pool(pool_server, env, tmp_path)
+
+        first = await pool.allocate("task-a")
+        second = await pool.allocate("task-b")
+        first_reset = asyncio.create_task(
+            pool.reset(
+                first["lease_id"],
+                {"task_name": "a", "task_path": "seta_env/a", "instruction": "x"},
+            )
+        )
+        await env.reset_started.wait()
+
+        try:
+            await pool.reset(
+                second["lease_id"],
+                {"task_name": "b", "task_path": "seta_env/b", "instruction": "x"},
+            )
+        except pool_server.ResetAdmissionBacklogError:
+            pass
+        else:
+            raise AssertionError("expected reset admission backlog")
+
+        status = await pool.status()
+        assert status["phase_counts"].get("resetting") == 1
+        assert status["phase_counts"].get("allocated") == 1
+        assert status["reset_admission"]["rejected"] == 1
+
+        env.release_reset.set()
+        await first_reset
+
+    asyncio.run(_case())
+
+
+def test_cancelled_reset_waiter_leaves_admission_queue(monkeypatch, tmp_path):
+    async def _case():
+        monkeypatch.setenv("WORKER_MAX_CONCURRENT_RESETS", "1")
+        monkeypatch.setenv("WORKER_RESET_ADMISSION_TIMEOUT", "10")
+        pool_server = _install_import_stubs(monkeypatch)
+        env = _DummyEnv()
+        pool = _new_pool(pool_server, env, tmp_path)
+
+        first = await pool.allocate("task-a")
+        second = await pool.allocate("task-b")
+        first_reset = asyncio.create_task(
+            pool.reset(
+                first["lease_id"],
+                {"task_name": "a", "task_path": "seta_env/a", "instruction": "x"},
+            )
+        )
+        try:
+            await env.reset_started.wait()
+
+            second_reset = asyncio.create_task(
+                pool.reset(
+                    second["lease_id"],
+                    {"task_name": "b", "task_path": "seta_env/b", "instruction": "x"},
+                )
+            )
+            for _ in range(100):
+                status = await pool.status()
+                if status["reset_admission"]["waiting"] == 1:
+                    break
+                await asyncio.sleep(0.01)
+            assert status["reset_admission"]["waiting"] == 1
+
+            second_reset.cancel()
+            try:
+                await second_reset
+            except TimeoutError as exc:
+                assert "WORKER_RESET_CANCELLED" in str(exc)
+            else:
+                raise AssertionError("expected reset cancellation timeout")
+
+            for _ in range(100):
+                status = await pool.status()
+                if status["reset_admission"]["waiting"] == 0:
+                    break
+                await asyncio.sleep(0.01)
+            assert status["reset_admission"]["waiting"] == 0
+            assert status["phase_counts"].get("resetting") == 1
+            assert status["phase_counts"].get("allocated") == 1
+            async with pool._lock:
+                second_slot = pool._get_run_slot(second["lease_id"])
+                assert second_slot.reset_future is None
+        finally:
+            env.release_reset.set()
+        await first_reset
 
     asyncio.run(_case())
 

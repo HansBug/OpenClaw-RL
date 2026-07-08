@@ -63,6 +63,29 @@ def _offload_rollout_data_to_cpu(rollout_data: RolloutBatch) -> None:
         torch.cuda.synchronize()
 
 
+def _skip_zero_trainable_enabled() -> bool:
+    return os.getenv("SLIME_SKIP_ZERO_TRAINABLE_TRAIN", "1").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+
+
+def _trainable_token_count(rollout_data: RolloutBatch) -> float:
+    masks = rollout_data.get("loss_masks") or []
+    total = 0.0
+    for mask in masks:
+        if isinstance(mask, torch.Tensor):
+            total += float(mask.sum().item())
+        else:
+            try:
+                total += float(sum(mask))
+            except TypeError:
+                total += float(mask or 0.0)
+    return total
+
+
 class MegatronTrainRayActor(TrainRayActor):
     @with_defer(lambda: Timer().start("train_wait"))
     def init(
@@ -450,6 +473,14 @@ class MegatronTrainRayActor(TrainRayActor):
         )
 
     def train_actor(self, rollout_id: int, rollout_data: RolloutBatch) -> None:
+        if _skip_zero_trainable_enabled() and _trainable_token_count(rollout_data) <= 0.0:
+            if is_megatron_main_rank():
+                logger.warning(
+                    "Skipping actor train for rollout_id=%s because all loss_masks are zero",
+                    rollout_id,
+                )
+            return
+
         # Create data iterator for log_probs and train.
         data_iterator, num_microbatches = get_data_iterator(self.args, self.model, rollout_data)
 

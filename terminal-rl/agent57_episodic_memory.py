@@ -68,6 +68,33 @@ def _state_digest(state: Any, *, n: int = 20) -> str:
     return hashlib.md5(text.encode("utf-8", errors="ignore")).hexdigest()[:n]
 
 
+def _state_tokens(value: Any, *, prefix: str = "") -> list[str]:
+    if isinstance(value, np.ndarray):
+        value = value.tolist()
+    if isinstance(value, bytes):
+        value = value.decode("utf-8", errors="replace")
+    if isinstance(value, dict):
+        tokens: list[str] = []
+        for key in sorted(value.keys(), key=str):
+            key_text = str(key)
+            child_prefix = f"{prefix}{key_text}="
+            tokens.append(f"{prefix}{key_text}")
+            tokens.extend(_state_tokens(value.get(key), prefix=child_prefix))
+        return tokens
+    if isinstance(value, (list, tuple)):
+        tokens = []
+        for idx, item in enumerate(value):
+            tokens.extend(_state_tokens(item, prefix=f"{prefix}{idx}:"))
+        return tokens
+    text = str(value)
+    if not text:
+        return [f"{prefix}<empty>"]
+    parts = text.split()
+    if not parts:
+        parts = [text]
+    return [f"{prefix}{part}" for part in parts]
+
+
 def _as_numeric_vector(state: Any, *, fallback_dim: int = 128) -> np.ndarray:
     try:
         arr = np.asarray(state, dtype=np.float64)
@@ -77,8 +104,11 @@ def _as_numeric_vector(state: Any, *, fallback_dim: int = 128) -> np.ndarray:
         pass
 
     vec = np.zeros(max(1, int(fallback_dim)), dtype=np.float64)
-    text = _canonical_state(state)
-    for token in (text.split() or [text or "<empty>"]):
+    tokens = _state_tokens(state)
+    if not tokens:
+        text = _canonical_state(state)
+        tokens = text.split() or [text or "<empty>"]
+    for token in tokens:
         digest = hashlib.md5(token.encode("utf-8", errors="ignore")).digest()
         idx = int.from_bytes(digest[:4], "little") % vec.size
         sign = 1.0 if digest[4] & 1 else -1.0
@@ -179,7 +209,9 @@ class CountBasedEpisodicMemory(EpisodicMemoryBackend):
     def load_state_dict(self, state: dict[str, Any]) -> None:
         if not isinstance(state, dict):
             return
-        config = state.get("config") if isinstance(state, dict) else {}
+        config = state.get("config")
+        if not isinstance(config, dict):
+            config = {}
         self.capacity = max(0, int(config.get("capacity", self.capacity)))
         self.decay = min(1.0, max(0.0, float(config.get("decay", self.decay))))
         counts = state.get("counts", [])
@@ -333,7 +365,11 @@ class SimHashKNNEpisodicMemory(EpisodicMemoryBackend):
         }
 
     def load_state_dict(self, state: dict[str, Any]) -> None:
-        config = state.get("config") if isinstance(state, dict) else {}
+        if not isinstance(state, dict):
+            return
+        config = state.get("config")
+        if not isinstance(config, dict):
+            config = {}
         self.hash_bits = max(1, int(config.get("hash_bits", self.hash_bits)))
         self.bucket_capacity = max(
             1, int(config.get("bucket_capacity", self.bucket_capacity))

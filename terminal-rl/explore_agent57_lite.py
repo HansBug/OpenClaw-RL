@@ -115,6 +115,7 @@ class Agent57LiteConfig:
     ucb_value: str
     ucb_dataset_aware: bool
     ucb_random_seed: int | None
+    ucb_seed_salt: str
     keep_baseline: bool
     lifelong_enabled: bool
     lifelong_coef: float
@@ -245,6 +246,7 @@ def config_from_env() -> Agent57LiteConfig:
             if os.getenv("EXPLORE_AGENT57_UCB_RANDOM_SEED") is not None
             else _env_optional_int("EXPLORE_RANDOM_SEED")
         ),
+        ucb_seed_salt=os.getenv("EXPLORE_AGENT57_UCB_SEED_SALT", "").strip(),
         keep_baseline=_env_bool("EXPLORE_AGENT57_KEEP_BASELINE", True),
         lifelong_enabled=lifelong_enabled,
         lifelong_coef=max(0.0, _env_float("EXPLORE_AGENT57_LIFELONG_COEF", 0.01)),
@@ -364,7 +366,7 @@ def _connect(
             if path_key not in _SQLITE_SCHEMA_INITIALIZED:
                 conn.execute(
                     "CREATE TABLE IF NOT EXISTS lifelong_counts "
-                    "(key TEXT PRIMARY KEY, count INTEGER NOT NULL)"
+                    "(key TEXT PRIMARY KEY, count REAL NOT NULL)"
                 )
                 _ensure_column(
                     conn,
@@ -1332,6 +1334,7 @@ def compute_lifelong_bonus(
         "explore_agent57_ucb_random_seed": (
             -1 if config.ucb_random_seed is None else int(config.ucb_random_seed)
         ),
+        "explore_agent57_ucb_seed_salt": config.ucb_seed_salt,
         "explore_agent57_lifelong_enabled": bool(config.lifelong_enabled),
         "explore_agent57_lifelong_backend": config.lifelong_backend,
         "explore_agent57_lifelong_state_path": config.state_path,
@@ -1632,9 +1635,18 @@ def _ucb_seeded(config: Agent57LiteConfig) -> bool:
     return config.ucb_random_seed is not None
 
 
+def _effective_ucb_seed(config: Agent57LiteConfig) -> int:
+    seed = int(config.ucb_random_seed or 0)
+    if not config.ucb_seed_salt:
+        return seed
+    payload = f"{seed}:{config.ucb_seed_salt}".encode("utf-8", errors="ignore")
+    digest = hashlib.md5(payload).digest()
+    return int.from_bytes(digest[:8], "little", signed=False)
+
+
 def _ucb_rng(config: Agent57LiteConfig) -> np.random.Generator:
     global _UCB_RNG, _UCB_RNG_SEED
-    seed = int(config.ucb_random_seed or 0)
+    seed = _effective_ucb_seed(config)
     if _UCB_RNG is None or _UCB_RNG_SEED != seed:
         _UCB_RNG = np.random.default_rng(seed)
         _UCB_RNG_SEED = seed
@@ -1764,6 +1776,8 @@ def record_arm_event(
     parse_error_count: int,
     bonus: float,
     dataset: str | None = None,
+    normalized_base_score: float | None = None,
+    success_score: float | None = None,
 ) -> None:
     if not config.active:
         return
@@ -1773,8 +1787,21 @@ def record_arm_event(
     final = _finite_float(final_score, base)
     shaped_bonus = _finite_float(bonus)
     dataset_name = _normalize_dataset(dataset)
-    normalized_base = _normalized_base_score(base, dataset_name)
-    success = 1 if base > config.success_threshold else 0
+    if normalized_base_score is None:
+        normalized_base = _normalized_base_score(base, dataset_name)
+    else:
+        normalized_base = min(
+            1.0,
+            max(
+                0.0,
+                _finite_float(
+                    normalized_base_score,
+                    _normalized_base_score(base, dataset_name),
+                ),
+            ),
+        )
+    success_value = base if success_score is None else _finite_float(success_score, base)
+    success = 1 if success_value > config.success_threshold else 0
     event = {
         "arm_id": float(int(arm_id) % max(1, config.k)),
         "base_score": base,

@@ -20,81 +20,48 @@ _METRIC_NAME_RE = re.compile(r"[^A-Za-z0-9_.-]+")
 _REWARD_COMPONENT_KEYS = (
     "raw_score",
     "base_score",
-    "prm_turn_score",
     "safety_score",
-    "explore_intrinsic",
     "explore_intrinsic_scaled",
     "explore_intrinsic_in_total",
-    "explore_intrinsic_effective_coef",
-    "explore_intrinsic_schedule_multiplier",
-    "explore_safety_penalty",
-    "explore_lprnd",
-    "explore_lprnd_raw",
-    "explore_lprnd_effective_coef",
-    "explore_lprnd_schedule_multiplier",
-    "explore_agent57_enabled",
     "explore_agent57_arm_id",
-    "explore_agent57_k",
     "explore_agent57_beta",
-    "explore_agent57_episodic_backend",
-    "explore_agent57_max_bonus",
-    "explore_agent57_ucb_c",
-    "explore_agent57_ucb_window",
-    "explore_agent57_ucb_epsilon",
-    "explore_agent57_ucb_min_per_arm",
-    "explore_agent57_ucb_dataset_aware",
-    "explore_agent57_ucb_random_seed",
-    "explore_agent57_lifelong_bonus_unclipped",
-    "explore_agent57_lifelong_enabled",
-    "explore_agent57_lifelong_coef",
-    "explore_agent57_lifelong_clip",
-    "explore_agent57_lifelong_include_dataset",
-    "explore_agent57_lifelong_include_task",
-    "explore_agent57_lifelong_include_turn",
+    "explore_agent57_trust",
+    "explore_agent57_ngu_episodic",
     "explore_agent57_lifelong_raw",
     "explore_agent57_lifelong_bonus",
-    "explore_agent57_lifelong_unique_keys",
-    "explore_agent57_lifelong_seen_before",
-    "explore_agent57_lifelong_warmup_remaining",
-    "explore_agent57_lifelong_eligible",
-    "explore_agent57_episodic_action_count",
-    "explore_agent57_episodic_empty_bucket_count",
-    "explore_agent57_episodic_empty_bucket_rate",
-    "explore_agent57_episodic_exact_repeat_count",
-    "explore_agent57_episodic_candidate_count_mean",
-    "explore_agent57_episodic_probe_count_mean",
-    "explore_agent57_ngu_mod_clip",
-    "explore_agent57_ngu_episodic",
     "explore_agent57_ngu_life_mod",
     "explore_agent57_intrinsic_signal",
     "explore_agent57_ngu_bonus",
-    "explore_agent57_ngu_bonus_unclipped",
-    "explore_agent57_bonus_unclipped",
-    "explore_agent57_bonus_clipped",
-    "explore_cde_actor_bonus",
-    "explore_cde_actor_log_ppl",
-    "explore_cde_actor_eligible",
-    "explore_cde_actor_base_mean",
-    "explore_cde_actor_cap",
-    "explore_cde_actor_scaled",
-    "explore_cde_actor_clipped",
-    "explore_cde_actor_omega",
-    "explore_cde_actor_base_magnitude",
+    "explore_agent57_lifelong_eligible",
+    "explore_agent57_episodic_include_turn",
+    "explore_agent57_episodic_turn_mode_code",
     "explore_post_norm_bonus_raw",
     "explore_post_norm_bonus",
+    "explore_post_norm_bonus_base_coef",
+    "explore_post_norm_bonus_coef",
+    "explore_post_norm_bonus_schedule_multiplier",
+    "explore_post_norm_bonus_clip",
+    "explore_post_norm_base_reward",
+    "explore_post_norm_intrinsic_value",
+    "explore_post_norm_intrinsic_advantage",
+    "explore_post_norm_arm_weight",
+    "explore_post_norm_trust",
+    "explore_post_norm_status_intrinsic_scale",
+    "explore_post_norm_effective_gate",
+    "explore_post_norm_quality_gate",
+    "explore_post_norm_outcome_score",
+    "explore_post_norm_status_floor",
+    "explore_post_norm_adjusted_reward",
+    "postprocess_total_reward",
+    "explore_truncation_penalty",
+    "explore_truncation_penalty_coef",
+    "explore_truncation_penalty_applied",
+    "explore_truncation_penalty_outcome_score",
+    "explore_truncation_penalty_multiplier",
     "explore_total_bonus",
     "explore_all_bonus",
     "explore_score_bonus",
-    "explore_base_score_before_bonus",
-    "explore_bonus_to_base_abs_ratio",
-    "explore_curiosity_pressure",
-    "explore_tool_intrinsic_pressure",
     "explore_safety_pressure",
-    "explore_mood_code",
-    "explore_turn_count",
-    "explore_tool_call_count",
-    "explore_action_count",
-    "explore_danger_command_count",
     "explore_parse_error_count",
 )
 _REWARD_DETAIL_NUMERIC_KEYS = (
@@ -119,7 +86,7 @@ _REWARD_DETAIL_NUMERIC_KEYS = (
 )
 _STRUCTURED_LOG_PREFIX = "TERMINAL_RL_METRIC_JSON"
 _STRUCTURED_SCHEMA = "terminal_rl.per_dataset_metrics.v1"
-_STRUCTURED_SCHEMA_VERSION = 7
+_STRUCTURED_SCHEMA_VERSION = 8
 _LAST_EVAL_BY_DATASET: dict[str, dict[str, Any]] = {}
 _METRIC_SEMANTICS_LOGGED = False
 _COMPACT_EXACT_KEYS = {
@@ -150,34 +117,33 @@ _COMPACT_EXACT_KEYS = {
     "terminal/trajectory/save_rate",
     "terminal/trajectory/considered_unique_tasks",
     "terminal/trajectory/saved_unique_tasks",
-    "terminal/explore/explore_intrinsic/mean",
-    "terminal/explore/explore_intrinsic/p90",
     "terminal/explore/explore_intrinsic_scaled/mean",
-    "terminal/explore/explore_intrinsic_scaled/p90",
     "terminal/explore/explore_total_bonus/mean",
-    "terminal/explore/explore_bonus_to_base_abs_ratio/mean",
-    "terminal/explore/explore_curiosity_pressure/mean",
     "terminal/explore/explore_safety_pressure/mean",
-    "terminal/explore/explore_reward_hacking_risk_rate",
-    "terminal/explore/explore_over_exploration_risk_rate",
-    "terminal/explore/explore_safety_tension_rate",
     "terminal/explore/agent57/active_rate",
-    "terminal/explore/agent57/lifelong_enabled_rate",
     "terminal/explore/agent57/lifelong_eligible_rate",
     "terminal/explore/agent57/lifelong_state_error_rate",
     "terminal/explore/agent57/arm_count",
     "terminal/explore/agent57/top_arm",
     "terminal/explore/agent57/top_arm_ratio",
+    "terminal/explore/agent57/top_suppressed_ratio",
+    "terminal/explore/agent57/trust/mean",
+    "terminal/explore/agent57/trust/min",
+    "terminal/explore/agent57/trust/p50",
+    "terminal/explore/agent57/trust/p90",
+    "terminal/explore/agent57/trust_zero_rate",
+    "terminal/explore/explore_post_norm_effective_gate/mean",
+    "terminal/explore/explore_post_norm_quality_gate/mean",
+    "terminal/explore/explore_post_norm_outcome_score/mean",
+    "terminal/explore/explore_post_norm_status_floor/mean",
     "terminal/explore/agent57/lifelong_raw/mean",
     "terminal/explore/agent57/lifelong_bonus/mean",
     "terminal/explore/agent57/ngu_episodic/mean",
     "terminal/explore/agent57/ngu_life_mod/mean",
     "terminal/explore/agent57/intrinsic_signal/mean",
-    "terminal/explore/agent57/intrinsic_signal/p90",
-    "terminal/explore/agent57/episodic_empty_bucket_rate/mean",
-    "terminal/explore/agent57/episodic_exact_repeat_count/mean",
     "terminal/explore/agent57/ngu_bonus/mean",
-    "terminal/explore/agent57/bonus_clipped/mean",
+    "terminal/explore/agent57/episodic_include_turn/mean",
+    "terminal/explore/agent57/episodic_turn_mode_code/mean",
     "terminal/turn_uncertainty/mean_neg_logprob/mean",
     "terminal/turn_uncertainty/mean_score/mean",
     "terminal/turn_uncertainty/low_progress_turn_ratio",
@@ -194,6 +160,31 @@ _COMPACT_PER_DATASET_SUFFIXES = {
     "reward/exploration_signal",
     "reward/exploration_post_norm",
     "reward/exploration_post_norm_abs",
+    "reward/intrinsic_episodic",
+    "reward/intrinsic_lifelong",
+    "reward/intrinsic_lifelong_raw",
+    "reward/intrinsic_life_mod",
+    "reward/intrinsic_signal",
+    "reward/adv_intrinsic",
+    "reward/adv_intrinsic_abs",
+    "reward/adv_penalty",
+    "reward/adv_penalty_abs",
+    "intrinsic/intra",
+    "intrinsic/inter",
+    "intrinsic/inter_raw",
+    "intrinsic/life_mod",
+    "intrinsic/fused",
+    "adv/task",
+    "adv/intrinsic",
+    "adv/intrinsic_abs",
+    "adv/final_penalty",
+    "adv/final_penalty_abs",
+    "adv/exploration_delta",
+    "adv/with_penalty",
+    "reward/outcome_score",
+    "reward/quality_gate",
+    "reward/quality_gate_truncated",
+    "reward/truncated_outcome_score",
     "reward/exploration_ratio",
     "reward/exploration_abs_to_task_ratio",
     "total_reward",
@@ -229,10 +220,24 @@ _COMPACT_PER_DATASET_SUFFIXES = {
     "agent57/intrinsic_signal",
     "agent57/episodic_empty_bucket_rate",
     "agent57/episodic_exact_repeat_count",
+    "agent57/episodic_include_turn",
+    "agent57/episodic_turn_mode_code",
     "agent57/arm_count",
     "agent57/top_arm",
     "agent57/top_arm_ratio",
     "agent57/top_suppressed_ratio",
+    "agent57/trust_mean",
+    "agent57/trust_min",
+    "agent57/trust_p50",
+    "agent57/trust_p90",
+    "agent57/trust_zero_rate",
+    "agent57/trust_completed_mean",
+    "agent57/trust_truncated_mean",
+    "agent57/trust_failed_mean",
+    "quality_gate_mean",
+    "quality_gate_truncated_mean",
+    "outcome_score_mean",
+    "truncated_outcome_score_mean",
     "task/unique_count",
     "task/top_ratio",
     "trajectory/considered_count",
@@ -241,12 +246,32 @@ _COMPACT_PER_DATASET_SUFFIXES = {
     "trajectory/considered_unique_tasks",
     "trajectory/saved_unique_tasks",
 }
+_COMPACT_PREFIXES = (
+    "axis/",
+    "reward/",
+    "intrinsic/",
+    "adv/",
+    "rollout_axis/reward/",
+    "rollout_axis/intrinsic/",
+    "rollout_axis/adv/",
+    "train_axis/reward/",
+    "train_axis/intrinsic/",
+    "train_axis/adv/",
+)
 
 
 def _ensure_terminal_step_metric(args) -> None:
     if not getattr(args, "use_wandb", False):
         return
     try:
+        wandb.define_metric("axis/rollout_step")
+        wandb.define_metric("axis/train_step")
+        wandb.define_metric("axis/steps_per_rollout", step_metric="axis/rollout_step")
+        wandb.define_metric("axis/legacy_rollout_step", step_metric="axis/rollout_step")
+        for prefix in ("reward", "intrinsic", "adv"):
+            wandb.define_metric(f"{prefix}/*", step_metric="axis/rollout_step")
+        wandb.define_metric("rollout_axis/*", step_metric="axis/rollout_step")
+        wandb.define_metric("train_axis/*", step_metric="axis/train_step")
         wandb.define_metric("terminal/*", step_metric="rollout/step")
         wandb.define_metric("per_dataset/*", step_metric="rollout/step")
     except Exception as e:
@@ -284,6 +309,9 @@ def _filter_wandb_metrics(log_dict: Dict[str, Any]) -> Dict[str, Any]:
 
     filtered: Dict[str, Any] = {}
     for key, value in log_dict.items():
+        if key.startswith(_COMPACT_PREFIXES):
+            filtered[key] = value
+            continue
         if key in _COMPACT_EXACT_KEYS:
             filtered[key] = value
             continue
@@ -454,6 +482,36 @@ def _env_str(name: str, default: str = "") -> str:
     return default if value is None else value.strip()
 
 
+def _env_int(name: str, default: int) -> int:
+    raw = os.getenv(name)
+    if raw is None or raw == "":
+        return default
+    try:
+        return int(raw)
+    except ValueError:
+        logger.warning("Invalid %s=%r; using %d", name, raw, default)
+        return default
+
+
+def _schedule_multiplier(schedule: str, train_step: Any, decay_steps: int) -> float:
+    schedule = str(schedule or "constant").strip().lower()
+    if schedule in {"", "constant", "none", "off"}:
+        return 1.0
+    if decay_steps <= 0 or train_step is None:
+        return 1.0
+    try:
+        step = max(0.0, float(train_step))
+    except (TypeError, ValueError):
+        return 1.0
+    progress = min(1.0, step / float(decay_steps))
+    if schedule == "linear":
+        return max(0.0, 1.0 - progress)
+    if schedule == "cosine":
+        return 0.5 * (1.0 + math.cos(math.pi * progress))
+    logger.warning("Unknown EXPLORE_ADVANTAGE_LAMBDA_SCHEDULE=%r; using constant", schedule)
+    return 1.0
+
+
 def _advantage_bonus_enabled() -> bool:
     return _env_enabled(
         "EXPLORE_ADVANTAGE_BONUS_ENABLED",
@@ -464,6 +522,123 @@ def _advantage_bonus_enabled() -> bool:
 def _component_value(sample: Sample, key: str) -> float:
     value = _reward_value(sample, key)
     return 0.0 if value is None else float(value)
+
+
+def _clamp01(value: float) -> float:
+    return max(0.0, min(1.0, float(value)))
+
+
+def _sample_train_step(sample: Sample) -> Any:
+    metadata = getattr(sample, "metadata", None)
+    if isinstance(metadata, dict):
+        for key in ("train_step", "rollout_step", "rollout_id"):
+            if metadata.get(key) is not None:
+                return metadata.get(key)
+    reward = getattr(sample, "reward", None)
+    if isinstance(reward, dict):
+        for key in ("train_step", "rollout_step", "rollout_id"):
+            if reward.get(key) is not None:
+                return reward.get(key)
+    return None
+
+
+def _batch_train_step(samples: list[Sample]) -> Any:
+    values = [_sample_train_step(sample) for sample in samples]
+    numeric: list[float] = []
+    for value in values:
+        if value is None:
+            continue
+        try:
+            numeric.append(float(value))
+        except (TypeError, ValueError):
+            continue
+    if numeric:
+        return max(numeric)
+    return next((value for value in values if value is not None), None)
+
+
+def _status_intrinsic_scale(sample: Sample) -> float:
+    status = _status_name(sample)
+    if "truncated" in status:
+        return max(0.0, _env_float("EXPLORE_ADVANTAGE_TRUNCATED_INTRINSIC_SCALE", 1.0))
+    if any(part in status for part in ("failed", "aborted")):
+        return max(0.0, _env_float("EXPLORE_ADVANTAGE_FAILED_INTRINSIC_SCALE", 1.0))
+    return 1.0
+
+
+def _advantage_gate_mode() -> str:
+    return _env_str("EXPLORE_ADVANTAGE_GATE_MODE", "legacy").lower()
+
+
+def _uses_outcome_status_gate(gate_mode: str | None = None) -> bool:
+    mode = _advantage_gate_mode() if gate_mode is None else str(gate_mode or "").lower()
+    return mode in {"outcome", "outcome_status", "quality", "quality_gate", "status_quality"}
+
+
+def _outcome_candidate_keys() -> list[str]:
+    configured = _env_str("EXPLORE_ADVANTAGE_OUTCOME_KEY", "raw_score")
+    keys = [configured] if configured else []
+    keys.extend(
+        [
+            "raw_score",
+            "accuracy",
+            "success_score",
+            "unit_test_pass_rate",
+            "test_acc",
+            "pass_rate",
+            "base_score",
+            "score",
+        ]
+    )
+    out: list[str] = []
+    for key in keys:
+        if key and key not in out:
+            out.append(key)
+    return out
+
+
+def _normalize_outcome_value(key: str, value: float) -> float:
+    if key in {"score", "base_score", "task_reward", "raw_reward"} and value < 0.0:
+        return _clamp01(0.5 * (value + 1.0))
+    return _clamp01(value)
+
+
+def _outcome_score(sample: Sample) -> float:
+    for key in _outcome_candidate_keys():
+        value = _reward_value(sample, key)
+        if value is not None:
+            return _normalize_outcome_value(key, value)
+    status = _status_name(sample)
+    return 1.0 if "completed" in status else 0.0
+
+
+def _status_quality_floor(sample: Sample) -> float:
+    status = _status_name(sample)
+    if "truncated" in status:
+        return _clamp01(_env_float("EXPLORE_ADVANTAGE_TRUNCATED_FLOOR", 0.15))
+    if "aborted" in status:
+        return _clamp01(_env_float("EXPLORE_ADVANTAGE_ABORTED_FLOOR", 0.0))
+    if "failed" in status:
+        return _clamp01(_env_float("EXPLORE_ADVANTAGE_FAILED_FLOOR", 0.0))
+    return _clamp01(_env_float("EXPLORE_ADVANTAGE_COMPLETED_FLOOR", 0.5))
+
+
+def _quality_gate(sample: Sample) -> tuple[float, float, float]:
+    outcome = _outcome_score(sample)
+    floor = _status_quality_floor(sample)
+    return _clamp01(floor + (1.0 - floor) * outcome), outcome, floor
+
+
+def _truncation_penalty(sample: Sample) -> float:
+    penalty_value = _env_float(
+        "EXPLORE_TRUNCATION_PENALTY",
+        _env_float("EXPLORE_ADVANTAGE_TRUNCATION_PENALTY", 0.0),
+    )
+    if "truncated" not in _status_name(sample):
+        return 0.0
+    if _env_enabled("EXPLORE_TRUNCATION_PENALTY_OUTCOME_AWARE", "0"):
+        return float(penalty_value * (1.0 - _outcome_score(sample)))
+    return float(penalty_value)
 
 
 def _sample_group_key(sample: Sample) -> int:
@@ -531,7 +706,7 @@ def _group_normalize_values_for_log(
     return normalized
 
 
-def _expected_post_norm_exploration_values(args: Any, samples: list[Sample]) -> list[float]:
+def _expected_post_norm_intrinsic_values(args: Any, samples: list[Sample]) -> list[float]:
     if not samples or not _advantage_bonus_enabled():
         return [0.0 for _ in samples]
 
@@ -547,8 +722,17 @@ def _expected_post_norm_exploration_values(args: Any, samples: list[Sample]) -> 
             "EXPLORE_ADVANTAGE_LAMBDA",
             _env_float("EXPLORE_ADVANTAGE_BONUS_COEF", 0.1),
         )
+        lambda_schedule = _env_str("EXPLORE_ADVANTAGE_LAMBDA_SCHEDULE", "constant")
+        lambda_decay_steps = max(0, _env_int("EXPLORE_ADVANTAGE_LAMBDA_DECAY_STEPS", 0))
+        lambda_multiplier = _schedule_multiplier(
+            lambda_schedule,
+            _batch_train_step(samples),
+            lambda_decay_steps,
+        )
+        effective_lambda = lambda_coef * lambda_multiplier
         arm_weight_mode = _env_str("EXPLORE_ADVANTAGE_ARM_WEIGHT_MODE", "normalized_beta").lower()
         trust_key = _env_str("EXPLORE_ADVANTAGE_TRUST_KEY", "explore_agent57_trust")
+        gate_mode = _advantage_gate_mode()
         clip = _env_float("EXPLORE_ADVANTAGE_BONUS_CLIP", 0.0)
         betas = [_component_value(sample, "explore_agent57_beta") for sample in samples]
         max_beta = max([abs(beta) for beta in betas if beta > 0.0] or [1.0])
@@ -565,8 +749,12 @@ def _expected_post_norm_exploration_values(args: Any, samples: list[Sample]) -> 
             trust = _component_value(sample, trust_key)
             if trust_missing and trust_key == "explore_agent57_trust":
                 trust = 1.0
-            raw_bonus = float(lambda_coef * arm_weight * trust * intrinsic_adv[i])
-            bonuses.append(max(-clip, min(clip, raw_bonus)) if clip > 0 else raw_bonus)
+            status_scale = _status_intrinsic_scale(sample)
+            quality_gate, _, _ = _quality_gate(sample)
+            gate = quality_gate if _uses_outcome_status_gate(gate_mode) else trust * status_scale
+            raw_bonus = float(effective_lambda * arm_weight * gate * intrinsic_adv[i])
+            bonus = max(-clip, min(clip, raw_bonus)) if clip > 0 else raw_bonus
+            bonuses.append(bonus)
         return bonuses
 
     component_names = [
@@ -584,6 +772,19 @@ def _expected_post_norm_exploration_values(args: Any, samples: list[Sample]) -> 
     return bonuses
 
 
+def _expected_post_norm_penalty_values(samples: list[Sample]) -> list[float]:
+    return [_truncation_penalty(sample) for sample in samples]
+
+
+def _expected_post_norm_exploration_values(args: Any, samples: list[Sample]) -> list[float]:
+    intrinsic_values = _expected_post_norm_intrinsic_values(args, samples)
+    penalty_values = _expected_post_norm_penalty_values(samples)
+    return [
+        float(intrinsic_values[i]) + float(penalty_values[i])
+        for i in range(len(samples))
+    ]
+
+
 def _exploration_reward_components(
     args: Any,
     samples: list[Sample],
@@ -591,29 +792,179 @@ def _exploration_reward_components(
     score_raw = [_reward_value(sample, "explore_total_bonus") for sample in samples]
     signal_raw = [_reward_value(sample, "explore_all_bonus") for sample in samples]
     explicit_raw = [_reward_value(sample, "exploration_reward") for sample in samples]
+    explicit_post_intrinsic_raw = [
+        _reward_value(sample, "explore_post_norm_bonus") for sample in samples
+    ]
+    explicit_penalty_raw = [
+        _reward_value(sample, "explore_truncation_penalty") for sample in samples
+    ]
     has_score = any(value is not None for value in score_raw)
     has_signal = any(value is not None for value in signal_raw)
     has_explicit = any(value is not None for value in explicit_raw)
+    has_explicit_post_intrinsic = any(value is not None for value in explicit_post_intrinsic_raw)
+    has_explicit_penalty = any(value is not None for value in explicit_penalty_raw)
     score_values = [float(value or 0.0) for value in score_raw]
     signal_values = [float(value or 0.0) for value in signal_raw] if has_signal else list(score_values)
 
-    post_values = _expected_post_norm_exploration_values(args, samples)
+    post_intrinsic_values = (
+        [float(value or 0.0) for value in explicit_post_intrinsic_raw]
+        if has_explicit_post_intrinsic
+        else _expected_post_norm_intrinsic_values(args, samples)
+    )
+    post_penalty_values = (
+        [float(value or 0.0) for value in explicit_penalty_raw]
+        if has_explicit_penalty
+        else _expected_post_norm_penalty_values(samples)
+    )
+    post_values = [
+        post_intrinsic_values[i] + post_penalty_values[i]
+        for i in range(len(samples))
+    ]
     if has_explicit:
         explicit_values = [float(value or 0.0) for value in explicit_raw]
         explicit_delta = [explicit_values[i] - score_values[i] for i in range(len(samples))]
         if any(abs(value) > 1e-12 for value in explicit_delta):
             post_values = explicit_delta
+            if not has_explicit_post_intrinsic:
+                post_intrinsic_values = [
+                    post_values[i] - post_penalty_values[i]
+                    for i in range(len(samples))
+                ]
 
     has_post = _advantage_bonus_enabled() or any(abs(value) > 1e-12 for value in post_values)
     if not has_score and not has_signal and not has_post and not has_explicit:
-        return {"score": [], "signal": [], "post_norm": [], "effective": []}
+        return {
+            "score": [],
+            "signal": [],
+            "post_norm": [],
+            "post_norm_intrinsic": [],
+            "post_norm_penalty": [],
+            "effective": [],
+        }
     effective = [signal_values[i] + post_values[i] for i in range(len(samples))]
     return {
         "score": score_values,
         "signal": signal_values,
         "post_norm": post_values,
+        "post_norm_intrinsic": post_intrinsic_values,
+        "post_norm_penalty": post_penalty_values,
         "effective": effective,
     }
+
+
+def _first_reward_value(sample: Sample, keys: tuple[str, ...]) -> float | None:
+    for key in keys:
+        value = _reward_value(sample, key)
+        if value is not None:
+            return value
+    return None
+
+
+def _reward_values(samples: list[Sample], keys: tuple[str, ...]) -> list[float]:
+    values: list[float] = []
+    for sample in samples:
+        value = _first_reward_value(sample, keys)
+        if value is not None:
+            values.append(float(value))
+    return values
+
+
+def _mean_reward_value(samples: list[Sample], keys: tuple[str, ...]) -> float | None:
+    return _stats_mean(_stats(_reward_values(samples, keys)))
+
+
+def _expected_task_advantage_values(args: Any, samples: list[Sample]) -> list[float]:
+    """Return the task stream value before post-norm intrinsic/penalty is added."""
+    if not samples:
+        return []
+    explicit = [_reward_value(sample, "explore_post_norm_base_reward") for sample in samples]
+    if any(value is not None for value in explicit):
+        return [float(value or 0.0) for value in explicit]
+
+    reward_key = str(getattr(args, "reward_key", None) or "score")
+    raw_rewards = [
+        float(_reward_value(sample, reward_key) or 0.0)
+        for sample in samples
+    ]
+    if (
+        getattr(args, "advantage_estimator", None) in ["grpo", "gspo"]
+        and getattr(args, "rewards_normalization", False)
+    ):
+        return _group_normalize_values_for_log(args, samples, raw_rewards)
+    return raw_rewards
+
+
+def _advantage_with_penalty_values(
+    args: Any,
+    samples: list[Sample],
+    components: dict[str, list[float]],
+) -> list[float]:
+    explicit = [
+        _reward_value(sample, "explore_post_norm_adjusted_reward")
+        for sample in samples
+    ]
+    if any(value is not None for value in explicit):
+        return [float(value or 0.0) for value in explicit]
+    task_values = _expected_task_advantage_values(args, samples)
+    intrinsic = components.get("post_norm_intrinsic", []) or [0.0 for _ in task_values]
+    penalty = components.get("post_norm_penalty", []) or [0.0 for _ in task_values]
+    return [
+        float(task_values[i]) + float(intrinsic[i]) + float(penalty[i])
+        for i in range(min(len(task_values), len(intrinsic), len(penalty)))
+    ]
+
+
+def _reward_fusion_axis_metrics(args: Any, samples: list[Sample]) -> dict[str, float | None]:
+    """Canonical reward/intrinsic/adv metrics shared by wandb, text logs and JSONL."""
+    if not samples:
+        return {}
+
+    components = _exploration_reward_components(args, samples)
+    task_adv_values = _expected_task_advantage_values(args, samples)
+    post_intrinsic_values = components.get("post_norm_intrinsic", []) or [
+        0.0 for _ in samples
+    ]
+    post_penalty_values = components.get("post_norm_penalty", []) or [
+        0.0 for _ in samples
+    ]
+    post_delta_values = components.get("post_norm", []) or [
+        post_intrinsic_values[i] + post_penalty_values[i]
+        for i in range(min(len(post_intrinsic_values), len(post_penalty_values)))
+    ]
+    adv_with_penalty_values = _advantage_with_penalty_values(args, samples, components)
+
+    def mean(values: list[float]) -> float | None:
+        return _stats_mean(_stats(values))
+
+    return {
+        "reward/task": _mean_reward_value(samples, ("base_score", "raw_score", "score")),
+        "reward/raw": _mean_reward_value(samples, ("raw_score", "base_score", "score")),
+        "reward/total": _mean_reward_value(samples, ("postprocess_total_reward", "score")),
+        "intrinsic/intra": _mean_reward_value(samples, ("explore_agent57_ngu_episodic",)),
+        "intrinsic/inter": _mean_reward_value(samples, ("explore_agent57_lifelong_bonus",)),
+        "intrinsic/inter_raw": _mean_reward_value(samples, ("explore_agent57_lifelong_raw",)),
+        "intrinsic/life_mod": _mean_reward_value(samples, ("explore_agent57_ngu_life_mod",)),
+        "intrinsic/fused": _mean_reward_value(samples, ("explore_agent57_intrinsic_signal",)),
+        "adv/task": mean(task_adv_values),
+        "adv/intrinsic": mean(post_intrinsic_values),
+        "adv/intrinsic_abs": mean([abs(v) for v in post_intrinsic_values]),
+        "adv/final_penalty": mean(post_penalty_values),
+        "adv/final_penalty_abs": mean([abs(v) for v in post_penalty_values]),
+        "adv/exploration_delta": mean(post_delta_values),
+        "adv/with_penalty": mean(adv_with_penalty_values),
+    }
+
+
+def _add_axis_metric_views(
+    log_dict: dict[str, Any],
+    metrics: dict[str, float | None],
+) -> None:
+    for key, value in metrics.items():
+        if value is None:
+            continue
+        log_dict[key] = value
+        log_dict[f"rollout_axis/{key}"] = value
+        log_dict[f"train_axis/{key}"] = value
 
 
 def _reward_raw(sample: Sample, key: str) -> Any:
@@ -1033,6 +1384,24 @@ def _agent57_summary(samples: List[Sample]) -> dict[str, Any]:
         if eligible_values
         else None
     )
+    trust_values = [
+        v for v in (
+            _reward_value(s, "explore_agent57_trust")
+            for s in agent_samples
+        )
+        if v is not None
+    ]
+    trust_stats = _stats(trust_values)
+
+    def status_trust_mean(status_part: str) -> float | None:
+        values = [
+            value
+            for sample in agent_samples
+            if status_part in _status_name(sample)
+            for value in [_reward_value(sample, "explore_agent57_trust")]
+            if value is not None
+        ]
+        return _stats_mean(_stats(values))
 
     return {
         "agent57/active": active_count / count if count else None,
@@ -1049,6 +1418,12 @@ def _agent57_summary(samples: List[Sample]) -> dict[str, Any]:
         ),
         "agent57/episodic_exact_repeat_count": mean(
             "explore_agent57_episodic_exact_repeat_count"
+        ),
+        "agent57/episodic_include_turn": mean(
+            "explore_agent57_episodic_include_turn"
+        ),
+        "agent57/episodic_turn_mode_code": mean(
+            "explore_agent57_episodic_turn_mode_code"
         ),
         "agent57/bonus_clipped": mean("explore_agent57_bonus_clipped"),
         "agent57/lifelong_raw": mean("explore_agent57_lifelong_raw"),
@@ -1070,6 +1445,18 @@ def _agent57_summary(samples: List[Sample]) -> dict[str, Any]:
         "agent57/top_arm_ratio": top_arm_ratio,
         "agent57/top_suppressed_reason": top_reason,
         "agent57/top_suppressed_ratio": top_reason_ratio,
+        "agent57/trust_mean": trust_stats["mean"] if trust_stats else None,
+        "agent57/trust_min": trust_stats["min"] if trust_stats else None,
+        "agent57/trust_p50": trust_stats["p50"] if trust_stats else None,
+        "agent57/trust_p90": trust_stats["p90"] if trust_stats else None,
+        "agent57/trust_zero_rate": (
+            sum(1 for value in trust_values if value <= 0.0) / len(trust_values)
+            if trust_values else None
+        ),
+        "agent57/trust_completed_mean": status_trust_mean("completed"),
+        "agent57/trust_truncated_mean": status_trust_mean("truncated"),
+        "agent57/trust_failed_mean": status_trust_mean("failed"),
+        "agent57/trust_aborted_mean": status_trust_mean("aborted"),
     }
 
 
@@ -1087,15 +1474,22 @@ def _add_agent57_debug_metrics(
     log_dict[f"{prefix}/explore/agent57/sample_count"] = total
     for record_key, metric_name in (
         ("agent57/active", "active_rate"),
-        ("agent57/lifelong_enabled", "lifelong_enabled_rate"),
         ("agent57/lifelong_eligible_rate", "lifelong_eligible_rate"),
         ("agent57/lifelong_state_error_rate", "lifelong_state_error_rate"),
         ("agent57/arm_count", "arm_count"),
         ("agent57/top_arm", "top_arm"),
         ("agent57/top_arm_ratio", "top_arm_ratio"),
         ("agent57/top_suppressed_ratio", "top_suppressed_ratio"),
-        ("agent57/episodic_empty_bucket_rate", "episodic_empty_bucket_rate"),
-        ("agent57/episodic_exact_repeat_count", "episodic_exact_repeat_count"),
+        ("agent57/trust_mean", "trust/mean"),
+        ("agent57/trust_min", "trust/min"),
+        ("agent57/trust_p50", "trust/p50"),
+        ("agent57/trust_p90", "trust/p90"),
+        ("agent57/trust_zero_rate", "trust_zero_rate"),
+        ("agent57/trust_completed_mean", "trust/completed_mean"),
+        ("agent57/trust_truncated_mean", "trust/truncated_mean"),
+        ("agent57/trust_failed_mean", "trust/failed_mean"),
+        ("agent57/episodic_include_turn", "episodic_include_turn/mean"),
+        ("agent57/episodic_turn_mode_code", "episodic_turn_mode_code/mean"),
     ):
         value = summary.get(record_key)
         if value is not None:
@@ -1103,28 +1497,17 @@ def _add_agent57_debug_metrics(
 
     for reward_key, metric_name in (
         ("explore_agent57_beta", "beta"),
-        ("explore_agent57_max_bonus", "max_bonus"),
-        ("explore_agent57_ucb_epsilon", "ucb_epsilon"),
-        ("explore_agent57_ucb_min_per_arm", "ucb_min_per_arm"),
-        ("explore_agent57_ucb_random_seed", "ucb_random_seed"),
+        ("explore_agent57_trust", "trust"),
         ("explore_agent57_lifelong_raw", "lifelong_raw"),
         ("explore_agent57_lifelong_bonus", "lifelong_bonus"),
-        ("explore_agent57_lifelong_bonus_unclipped", "lifelong_bonus_unclipped"),
         ("explore_agent57_ngu_episodic", "ngu_episodic"),
         ("explore_agent57_ngu_life_mod", "ngu_life_mod"),
         ("explore_agent57_intrinsic_signal", "intrinsic_signal"),
         ("explore_agent57_ngu_bonus", "ngu_bonus"),
-        ("explore_agent57_ngu_bonus_unclipped", "ngu_bonus_unclipped"),
-        ("explore_agent57_bonus_clipped", "bonus_clipped"),
+        ("explore_agent57_episodic_include_turn", "episodic_include_turn"),
+        ("explore_agent57_episodic_turn_mode_code", "episodic_turn_mode_code"),
         ("explore_agent57_lifelong_unique_keys", "lifelong_unique_keys"),
         ("explore_agent57_lifelong_seen_before", "lifelong_seen_before"),
-        ("explore_agent57_lifelong_warmup_remaining", "lifelong_warmup_remaining"),
-        ("explore_agent57_episodic_action_count", "episodic_action_count"),
-        ("explore_agent57_episodic_empty_bucket_count", "episodic_empty_bucket_count"),
-        ("explore_agent57_episodic_empty_bucket_rate", "episodic_empty_bucket_rate"),
-        ("explore_agent57_episodic_exact_repeat_count", "episodic_exact_repeat_count"),
-        ("explore_agent57_episodic_candidate_count_mean", "episodic_candidate_count_mean"),
-        ("explore_agent57_episodic_probe_count_mean", "episodic_probe_count_mean"),
     ):
         values = [
             v for v in (_reward_value(s, reward_key) for s in agent_samples)
@@ -1141,9 +1524,12 @@ def _add_agent57_debug_metrics(
                     "lifelong_bonus",
                     "ngu_episodic",
                     "ngu_bonus",
-                    "bonus_clipped",
+                    "trust",
                 },
             )
+
+    if not _env_enabled("TERMINAL_AGENT57_VERBOSE_METRICS", "0"):
+        return summary
 
     suppressed_counts: dict[str, int] = defaultdict(int)
     by_arm: dict[int, list[Sample]] = defaultdict(list)
@@ -1206,49 +1592,27 @@ def _add_exploration_debug_metrics(
         return summary
 
     numeric_keys = (
-        "explore_intrinsic",
         "explore_intrinsic_scaled",
         "explore_total_bonus",
-        "explore_base_score_before_bonus",
-        "explore_bonus_to_base_abs_ratio",
-        "explore_curiosity_pressure",
-        "explore_tool_intrinsic_pressure",
         "explore_intrinsic_in_total",
         "explore_safety_pressure",
-        "explore_action_count",
-        "explore_tool_call_count",
-        "explore_danger_command_count",
         "explore_parse_error_count",
-        "explore_cde_actor_log_ppl",
-        "explore_lprnd_raw",
-        "explore_agent57_beta",
-        "explore_agent57_lifelong_raw",
-        "explore_agent57_lifelong_bonus",
-        "explore_agent57_ngu_bonus",
-        "explore_agent57_ngu_episodic",
-        "explore_agent57_ngu_life_mod",
-        "explore_agent57_intrinsic_signal",
-        "explore_agent57_bonus_clipped",
-        "explore_agent57_lifelong_unique_keys",
-        "explore_agent57_lifelong_seen_before",
-        "explore_agent57_lifelong_warmup_remaining",
-        "explore_agent57_lifelong_eligible",
-        "explore_agent57_episodic_action_count",
-        "explore_agent57_episodic_empty_bucket_rate",
-        "explore_agent57_episodic_exact_repeat_count",
-        "explore_agent57_episodic_candidate_count_mean",
-        "explore_agent57_episodic_probe_count_mean",
+        "explore_post_norm_bonus",
+        "explore_post_norm_effective_gate",
+        "explore_post_norm_quality_gate",
+        "explore_post_norm_outcome_score",
+        "explore_post_norm_status_floor",
+        "explore_truncation_penalty",
+        "explore_truncation_penalty_outcome_score",
+        "explore_truncation_penalty_multiplier",
     )
     percentile_keys = {
-        "explore_intrinsic",
         "explore_intrinsic_scaled",
         "explore_intrinsic_in_total",
         "explore_total_bonus",
-        "explore_agent57_intrinsic_signal",
-        "explore_agent57_lifelong_raw",
-        "explore_agent57_lifelong_bonus",
-        "explore_agent57_ngu_bonus",
-        "explore_agent57_ngu_episodic",
+        "explore_post_norm_bonus",
+        "explore_post_norm_effective_gate",
+        "explore_post_norm_quality_gate",
     }
     for key in numeric_keys:
         values = [v for v in (_reward_value(s, key) for s in source) if v is not None]
@@ -1261,11 +1625,13 @@ def _add_exploration_debug_metrics(
             )
             if stats and key in {
                 "explore_total_bonus",
-                "explore_intrinsic",
                 "explore_intrinsic_scaled",
-                "explore_bonus_to_base_abs_ratio",
-                "explore_curiosity_pressure",
                 "explore_safety_pressure",
+                "explore_post_norm_bonus",
+                "explore_truncation_penalty",
+                "explore_post_norm_effective_gate",
+                "explore_post_norm_quality_gate",
+                "explore_post_norm_outcome_score",
             }:
                 summary[f"{key}_mean"] = stats["mean"]
 
@@ -1366,6 +1732,51 @@ def _epoch(args: Any) -> int | float | None:
     return None
 
 
+def _positive_int(value: Any, default: int = 1) -> int:
+    try:
+        result = int(value)
+    except (TypeError, ValueError):
+        return default
+    return result if result > 0 else default
+
+
+def _steps_per_rollout(args: Any) -> int:
+    configured = getattr(args, "num_steps_per_rollout", None)
+    if configured is not None:
+        return _positive_int(configured, 1)
+
+    rollout_batch_size = getattr(args, "rollout_batch_size", None)
+    n_samples = getattr(args, "n_samples_per_prompt", None)
+    global_batch_size = getattr(args, "global_batch_size", None)
+    if rollout_batch_size is None or n_samples is None or global_batch_size is None:
+        return 1
+    numerator = _positive_int(rollout_batch_size, 1) * _positive_int(n_samples, 1)
+    denominator = _positive_int(global_batch_size, 1)
+    return max(1, numerator // denominator)
+
+
+def _step_context(
+    args: Any,
+    rollout_id: int,
+    *,
+    rollout_step: int | None = None,
+) -> dict[str, int]:
+    rollout_id_int = _positive_int(rollout_id, 0)
+    steps_per_rollout = _steps_per_rollout(args)
+    legacy_rollout_step = (
+        int(rollout_step)
+        if rollout_step is not None
+        else int(compute_rollout_step(args, rollout_id_int))
+    )
+    return {
+        "rollout_id": rollout_id_int,
+        "rollout_step": rollout_id_int,
+        "train_step": rollout_id_int * steps_per_rollout,
+        "steps_per_rollout": steps_per_rollout,
+        "legacy_rollout_step": legacy_rollout_step,
+    }
+
+
 def _analysis_dataset_name_from_raw(raw_name: Any) -> str:
     name = _sanitize_metric_part(raw_name)
     if name in {"terminal_bench", "seta", "seta_env"}:
@@ -1400,10 +1811,12 @@ def _metric_record_from_samples(
     rollout_id: int,
     step: int,
     samples: list[Sample],
+    step_context: dict[str, int] | None = None,
     rollout_time: float | None = None,
     kl: float | None = None,
     entropy: float | None = None,
 ) -> dict[str, Any]:
+    axis_context = step_context or _step_context(args, rollout_id, rollout_step=step)
     trainable = [s for s in samples if not getattr(s, "remove_sample", False)]
     reward_source = trainable or samples
     total_values = [v for v in (_reward_value(s, "score") for s in reward_source) if v is not None]
@@ -1419,6 +1832,14 @@ def _metric_record_from_samples(
     exploration_score_stats = _stats(exploration_components["score"])
     exploration_signal_stats = _stats(exploration_components["signal"])
     exploration_post_norm_stats = _stats(exploration_components["post_norm"])
+    exploration_adv_intrinsic_stats = _stats(exploration_components["post_norm_intrinsic"])
+    exploration_adv_intrinsic_abs_stats = _stats(
+        [abs(v) for v in exploration_components["post_norm_intrinsic"]]
+    )
+    exploration_adv_penalty_stats = _stats(exploration_components["post_norm_penalty"])
+    exploration_adv_penalty_abs_stats = _stats(
+        [abs(v) for v in exploration_components["post_norm_penalty"]]
+    )
     exploration_stats = _stats(exploration_components["effective"])
     exploration_abs_stats = _stats([abs(v) for v in exploration_components["effective"]])
     exploration_post_norm_abs_stats = _stats([abs(v) for v in exploration_components["post_norm"]])
@@ -1486,6 +1907,53 @@ def _metric_record_from_samples(
         samples, "low_progress_fraction"
     )
     agent57_fields = _agent57_summary(reward_source)
+    intrinsic_episodic = _mean_from_samples(reward_source, "explore_agent57_ngu_episodic")
+    intrinsic_lifelong = _mean_from_samples(reward_source, "explore_agent57_lifelong_bonus")
+    intrinsic_lifelong_raw = _mean_from_samples(reward_source, "explore_agent57_lifelong_raw")
+    intrinsic_life_mod = _mean_from_samples(reward_source, "explore_agent57_ngu_life_mod")
+    intrinsic_signal = _mean_from_samples(reward_source, "explore_agent57_intrinsic_signal")
+    adv_intrinsic = _stats_mean(exploration_adv_intrinsic_stats)
+    adv_intrinsic_abs = _stats_mean(exploration_adv_intrinsic_abs_stats)
+    adv_penalty = _stats_mean(exploration_adv_penalty_stats)
+    adv_penalty_abs = _stats_mean(exploration_adv_penalty_abs_stats)
+    fusion_axis_metrics = _reward_fusion_axis_metrics(args, reward_source)
+    outcome_values = [
+        (
+            value
+            if (value := _reward_value(sample, "explore_post_norm_outcome_score")) is not None
+            else _outcome_score(sample)
+        )
+        for sample in reward_source
+    ]
+    quality_gate_values = [
+        (
+            value
+            if (value := _reward_value(sample, "explore_post_norm_quality_gate")) is not None
+            else _quality_gate(sample)[0]
+        )
+        for sample in reward_source
+    ]
+    truncated_source = [s for s in reward_source if "truncated" in _status_name(s)]
+    truncated_outcome_values = [
+        (
+            value
+            if (value := _reward_value(sample, "explore_post_norm_outcome_score")) is not None
+            else _outcome_score(sample)
+        )
+        for sample in truncated_source
+    ]
+    truncated_quality_gate_values = [
+        (
+            value
+            if (value := _reward_value(sample, "explore_post_norm_quality_gate")) is not None
+            else _quality_gate(sample)[0]
+        )
+        for sample in truncated_source
+    ]
+    outcome_score = _stats_mean(_stats(outcome_values))
+    quality_gate = _stats_mean(_stats(quality_gate_values))
+    truncated_outcome_score = _stats_mean(_stats(truncated_outcome_values))
+    quality_gate_truncated = _stats_mean(_stats(truncated_quality_gate_values))
     task_fields = _task_coverage_summary(samples)
     trajectory_fields = _trajectory_save_summary(samples)
 
@@ -1501,6 +1969,10 @@ def _metric_record_from_samples(
         "dataset": dataset_name,
         "source_datasets": sorted(set(source_datasets)),
         "global_step": int(step),
+        "rollout_step": axis_context["rollout_step"],
+        "train_step": axis_context["train_step"],
+        "steps_per_rollout": axis_context["steps_per_rollout"],
+        "wandb_rollout_step": axis_context["legacy_rollout_step"],
         "epoch": _epoch(args),
         "rollout_id": int(rollout_id),
         "sample_count": sample_count,
@@ -1521,10 +1993,35 @@ def _metric_record_from_samples(
         "reward/exploration_signal": exploration_reward_signal,
         "reward/exploration_post_norm": exploration_reward_post_norm,
         "reward/exploration_post_norm_abs": exploration_reward_post_norm_abs,
+        "reward/intrinsic_episodic": intrinsic_episodic,
+        "reward/intrinsic_lifelong": intrinsic_lifelong,
+        "reward/intrinsic_lifelong_raw": intrinsic_lifelong_raw,
+        "reward/intrinsic_life_mod": intrinsic_life_mod,
+        "reward/intrinsic_signal": intrinsic_signal,
+        "reward/adv_intrinsic": adv_intrinsic,
+        "reward/adv_intrinsic_abs": adv_intrinsic_abs,
+        "reward/adv_penalty": adv_penalty,
+        "reward/adv_penalty_abs": adv_penalty_abs,
+        "reward/outcome_score": outcome_score,
+        "reward/quality_gate": quality_gate,
+        "reward/quality_gate_truncated": quality_gate_truncated,
+        "reward/truncated_outcome_score": truncated_outcome_score,
         "reward/exploration_ratio": (
             exploration_reward / denom if denom and abs(denom) > 1e-12 else None
         ),
         "reward/exploration_abs_to_task_ratio": exploration_abs_to_task_ratio,
+        "intrinsic/intra": fusion_axis_metrics.get("intrinsic/intra"),
+        "intrinsic/inter": fusion_axis_metrics.get("intrinsic/inter"),
+        "intrinsic/inter_raw": fusion_axis_metrics.get("intrinsic/inter_raw"),
+        "intrinsic/life_mod": fusion_axis_metrics.get("intrinsic/life_mod"),
+        "intrinsic/fused": fusion_axis_metrics.get("intrinsic/fused"),
+        "adv/task": fusion_axis_metrics.get("adv/task"),
+        "adv/intrinsic": fusion_axis_metrics.get("adv/intrinsic"),
+        "adv/intrinsic_abs": fusion_axis_metrics.get("adv/intrinsic_abs"),
+        "adv/final_penalty": fusion_axis_metrics.get("adv/final_penalty"),
+        "adv/final_penalty_abs": fusion_axis_metrics.get("adv/final_penalty_abs"),
+        "adv/exploration_delta": fusion_axis_metrics.get("adv/exploration_delta"),
+        "adv/with_penalty": fusion_axis_metrics.get("adv/with_penalty"),
         "total_reward": _stats_mean(total_stats),
         "task_reward": task_reward,
         "raw_reward": raw_score,
@@ -1534,6 +2031,18 @@ def _metric_record_from_samples(
         "exploration_reward_signal": exploration_reward_signal,
         "exploration_reward_post_norm": exploration_reward_post_norm,
         "exploration_reward_post_norm_abs": exploration_reward_post_norm_abs,
+        "intrinsic_episodic_reward": intrinsic_episodic,
+        "intrinsic_lifelong_reward": intrinsic_lifelong,
+        "intrinsic_lifelong_raw": intrinsic_lifelong_raw,
+        "intrinsic_signal": intrinsic_signal,
+        "adv_intrinsic_reward": adv_intrinsic,
+        "adv_intrinsic_reward_abs": adv_intrinsic_abs,
+        "adv_penalty": adv_penalty,
+        "adv_penalty_abs": adv_penalty_abs,
+        "outcome_score_mean": outcome_score,
+        "quality_gate_mean": quality_gate,
+        "quality_gate_truncated_mean": quality_gate_truncated,
+        "truncated_outcome_score_mean": truncated_outcome_score,
         "raw_reward_scale": raw_reward_scale,
         "raw_reward_semantics": raw_reward_semantics,
         "raw_reward_min": raw_reward_min,
@@ -1568,9 +2077,11 @@ def _metric_record_from_rewards(
     rollout_id: int,
     step: int,
     rewards: list[Any],
+    step_context: dict[str, int] | None = None,
     kl: float | None = None,
     entropy: float | None = None,
 ) -> dict[str, Any]:
+    axis_context = step_context or _step_context(args, rollout_id, rollout_step=step)
     reward_values = [_to_float(v) for v in rewards]
     reward_values = [v for v in reward_values if v is not None]
     stats = _stats(reward_values)
@@ -1582,6 +2093,10 @@ def _metric_record_from_rewards(
         "dataset": dataset_name,
         "source_datasets": [dataset_name],
         "global_step": int(step),
+        "rollout_step": axis_context["rollout_step"],
+        "train_step": axis_context["train_step"],
+        "steps_per_rollout": axis_context["steps_per_rollout"],
+        "wandb_rollout_step": axis_context["legacy_rollout_step"],
         "epoch": _epoch(args),
         "rollout_id": int(rollout_id),
         "sample_count": len(rewards),
@@ -1600,8 +2115,33 @@ def _metric_record_from_rewards(
         "reward/exploration_signal": None,
         "reward/exploration_post_norm": None,
         "reward/exploration_post_norm_abs": None,
+        "reward/intrinsic_episodic": None,
+        "reward/intrinsic_lifelong": None,
+        "reward/intrinsic_lifelong_raw": None,
+        "reward/intrinsic_life_mod": None,
+        "reward/intrinsic_signal": None,
+        "reward/adv_intrinsic": None,
+        "reward/adv_intrinsic_abs": None,
+        "reward/adv_penalty": None,
+        "reward/adv_penalty_abs": None,
+        "reward/outcome_score": None,
+        "reward/quality_gate": None,
+        "reward/quality_gate_truncated": None,
+        "reward/truncated_outcome_score": None,
         "reward/exploration_ratio": None,
         "reward/exploration_abs_to_task_ratio": None,
+        "intrinsic/intra": None,
+        "intrinsic/inter": None,
+        "intrinsic/inter_raw": None,
+        "intrinsic/life_mod": None,
+        "intrinsic/fused": None,
+        "adv/task": None,
+        "adv/intrinsic": None,
+        "adv/intrinsic_abs": None,
+        "adv/final_penalty": None,
+        "adv/final_penalty_abs": None,
+        "adv/exploration_delta": None,
+        "adv/with_penalty": None,
         "total_reward": _stats_mean(stats),
         "task_reward": _stats_mean(stats),
         "raw_reward": _stats_mean(stats),
@@ -1611,6 +2151,18 @@ def _metric_record_from_rewards(
         "exploration_reward_signal": None,
         "exploration_reward_post_norm": None,
         "exploration_reward_post_norm_abs": None,
+        "intrinsic_episodic_reward": None,
+        "intrinsic_lifelong_reward": None,
+        "intrinsic_lifelong_raw": None,
+        "intrinsic_signal": None,
+        "adv_intrinsic_reward": None,
+        "adv_intrinsic_reward_abs": None,
+        "adv_penalty": None,
+        "adv_penalty_abs": None,
+        "outcome_score_mean": None,
+        "quality_gate_mean": None,
+        "quality_gate_truncated_mean": None,
+        "truncated_outcome_score_mean": None,
         "raw_reward_scale": "eval_reward_values",
         "raw_reward_semantics": "aggregate eval reward values without sample-level reward components",
         "raw_reward_min": None,
@@ -1637,10 +2189,12 @@ def _aggregate_metric_records(
     rollout_id: int,
     step: int,
     samples: list[Sample],
+    step_context: dict[str, int] | None = None,
     rollout_time: float | None = None,
     kl: float | None = None,
     entropy: float | None = None,
 ) -> list[dict[str, Any]]:
+    axis_context = step_context or _step_context(args, rollout_id, rollout_step=step)
     by_dataset: dict[str, list[Sample]] = defaultdict(list)
     source_by_dataset: dict[str, set[str]] = defaultdict(set)
     for sample in samples:
@@ -1658,6 +2212,7 @@ def _aggregate_metric_records(
             rollout_id=rollout_id,
             step=step,
             samples=by_dataset[dataset_name],
+            step_context=axis_context,
             rollout_time=rollout_time,
             kl=kl,
             entropy=entropy,
@@ -1675,6 +2230,7 @@ def _aggregate_metric_records(
                 rollout_id=rollout_id,
                 step=step,
                 samples=samples,
+                step_context=axis_context,
                 rollout_time=rollout_time,
                 kl=kl,
                 entropy=entropy,
@@ -1696,6 +2252,31 @@ def _add_per_dataset_log_dict(log_dict: Dict[str, Any], records: list[dict[str, 
             "reward/exploration_signal",
             "reward/exploration_post_norm",
             "reward/exploration_post_norm_abs",
+            "reward/intrinsic_episodic",
+            "reward/intrinsic_lifelong",
+            "reward/intrinsic_lifelong_raw",
+            "reward/intrinsic_life_mod",
+            "reward/intrinsic_signal",
+            "reward/adv_intrinsic",
+            "reward/adv_intrinsic_abs",
+            "reward/adv_penalty",
+            "reward/adv_penalty_abs",
+            "intrinsic/intra",
+            "intrinsic/inter",
+            "intrinsic/inter_raw",
+            "intrinsic/life_mod",
+            "intrinsic/fused",
+            "adv/task",
+            "adv/intrinsic",
+            "adv/intrinsic_abs",
+            "adv/final_penalty",
+            "adv/final_penalty_abs",
+            "adv/exploration_delta",
+            "adv/with_penalty",
+            "reward/outcome_score",
+            "reward/quality_gate",
+            "reward/quality_gate_truncated",
+            "reward/truncated_outcome_score",
             "reward/exploration_ratio",
             "reward/exploration_abs_to_task_ratio",
             "total_reward",
@@ -1731,10 +2312,20 @@ def _add_per_dataset_log_dict(log_dict: Dict[str, Any], records: list[dict[str, 
             "agent57/intrinsic_signal",
             "agent57/episodic_empty_bucket_rate",
             "agent57/episodic_exact_repeat_count",
+            "agent57/episodic_include_turn",
+            "agent57/episodic_turn_mode_code",
             "agent57/arm_count",
             "agent57/top_arm",
             "agent57/top_arm_ratio",
             "agent57/top_suppressed_ratio",
+            "agent57/trust_mean",
+            "agent57/trust_min",
+            "agent57/trust_p50",
+            "agent57/trust_p90",
+            "agent57/trust_zero_rate",
+            "agent57/trust_completed_mean",
+            "agent57/trust_truncated_mean",
+            "agent57/trust_failed_mean",
             "task/unique_count",
             "task/trajectory_count",
             "task/top_ratio",
@@ -1757,32 +2348,76 @@ def _format_per_dataset_table(
     *,
     phase: str,
     step: int,
+    step_context: dict[str, int] | None = None,
 ) -> str:
     if not records:
         return ""
     run = _run_name() or "-"
     epoch = records[0].get("epoch")
-    title = f"========== step {step} | epoch {epoch if epoch is not None else '-'} | phase: {phase} | run: {run} =========="
-    header = (
-        "dataset          | reward/total | reward/task | reward/explore | a57_life | a57_elg | pass_rate | "
-        "resp_len | kl     | entropy"
+    ctx = step_context or {
+        "rollout_step": records[0].get("rollout_step", step),
+        "train_step": records[0].get("train_step", "-"),
+        "steps_per_rollout": records[0].get("steps_per_rollout", "-"),
+        "legacy_rollout_step": step,
+    }
+    title = (
+        f"========== rollout-step {ctx.get('rollout_step')} | "
+        f"train-step {ctx.get('train_step')} | "
+        f"legacy rollout/step {ctx.get('legacy_rollout_step', step)} | "
+        f"steps/rollout {ctx.get('steps_per_rollout')} | "
+        f"epoch {epoch if epoch is not None else '-'} | phase: {phase} | run: {run} =========="
     )
-    sep = "-----------------+--------------+-------------+----------------+----------+---------+----------+----------+--------+--------"
+    header = (
+        "dataset          | task_reward | total_reward | intra | inter | fused | adv_task | adv_intr | penalty | adv_final | pass | trunc"
+    )
+    sep = "-----------------+-------------+--------------+-------+-------+-------+----------+----------+---------+-----------+------+------"
     body = []
     for record in records:
         body.append(
             f"{str(record['dataset'])[:16]:16} | "
-            f"{_format_float(record.get('reward/total'), width=12)} | "
             f"{_format_float(record.get('reward/task'), width=11)} | "
-            f"{_format_float(record.get('reward/exploration'), width=14)} | "
-            f"{_format_float(record.get('agent57/lifelong_bonus'), width=8)} | "
-            f"{_format_float(record.get('agent57/lifelong_eligible_rate'), width=7)} | "
-            f"{_format_float(record.get('pass_rate'), width=9)} | "
-            f"{_format_float(record.get('response_length'), width=8)} | "
-            f"{_format_float(record.get('kl'), width=6)} | "
-            f"{_format_float(record.get('entropy'), width=6)}"
+            f"{_format_float(record.get('reward/total'), width=12)} | "
+            f"{_format_float(record.get('intrinsic/intra'), width=5)} | "
+            f"{_format_float(record.get('intrinsic/inter'), width=5)} | "
+            f"{_format_float(record.get('intrinsic/fused'), width=5)} | "
+            f"{_format_float(record.get('adv/task'), width=8)} | "
+            f"{_format_float(record.get('adv/intrinsic'), width=8)} | "
+            f"{_format_float(record.get('adv/final_penalty'), width=7)} | "
+            f"{_format_float(record.get('adv/with_penalty'), width=9)} | "
+            f"{_format_float(record.get('pass_rate'), width=4)} | "
+            f"{_format_float(record.get('truncated_fraction'), width=4)}"
         )
     return "\n".join([title, header, sep, *body, "=" * len(title)])
+
+
+def _format_reward_axis_table(
+    metrics: dict[str, float | None],
+    step_context: dict[str, int],
+) -> str:
+    if not metrics:
+        return ""
+    title = (
+        f"========== reward fusion | rollout-step {step_context['rollout_step']} | "
+        f"train-step {step_context['train_step']} | "
+        f"legacy rollout/step {step_context['legacy_rollout_step']} | "
+        f"steps/rollout {step_context['steps_per_rollout']} =========="
+    )
+    header = (
+        "task_reward | total_reward | intra | inter | fused | adv_task | adv_intr | penalty | adv_final"
+    )
+    sep = "------------+--------------+-------+-------+-------+----------+----------+---------+----------"
+    body = (
+        f"{_format_float(metrics.get('reward/task'), width=10)} | "
+        f"{_format_float(metrics.get('reward/total'), width=12)} | "
+        f"{_format_float(metrics.get('intrinsic/intra'), width=5)} | "
+        f"{_format_float(metrics.get('intrinsic/inter'), width=5)} | "
+        f"{_format_float(metrics.get('intrinsic/fused'), width=5)} | "
+        f"{_format_float(metrics.get('adv/task'), width=8)} | "
+        f"{_format_float(metrics.get('adv/intrinsic'), width=8)} | "
+        f"{_format_float(metrics.get('adv/final_penalty'), width=7)} | "
+        f"{_format_float(metrics.get('adv/with_penalty'), width=8)}"
+    )
+    return "\n".join([title, header, sep, body, "=" * len(title)])
 
 
 def _format_eval_diag(records: list[dict[str, Any]]) -> str:
@@ -1959,6 +2594,14 @@ def _dataset_metrics(
         exploration_score_stats = _stats(exploration_components["score"])
         exploration_signal_stats = _stats(exploration_components["signal"])
         exploration_post_norm_stats = _stats(exploration_components["post_norm"])
+        exploration_adv_intrinsic_stats = _stats(exploration_components["post_norm_intrinsic"])
+        exploration_adv_intrinsic_abs_stats = _stats(
+            [abs(v) for v in exploration_components["post_norm_intrinsic"]]
+        )
+        exploration_adv_penalty_stats = _stats(exploration_components["post_norm_penalty"])
+        exploration_adv_penalty_abs_stats = _stats(
+            [abs(v) for v in exploration_components["post_norm_penalty"]]
+        )
         exploration_post_norm_abs_stats = _stats([abs(v) for v in exploration_components["post_norm"]])
 
         explore_summary = _add_exploration_debug_metrics(log_dict, prefix, dataset_samples)
@@ -2050,6 +2693,12 @@ def _dataset_metrics(
             split_exploration_score_stats = _stats(split_exploration_components["score"])
             split_exploration_signal_stats = _stats(split_exploration_components["signal"])
             split_exploration_post_norm_stats = _stats(split_exploration_components["post_norm"])
+            split_exploration_adv_intrinsic_stats = _stats(
+                split_exploration_components["post_norm_intrinsic"]
+            )
+            split_exploration_adv_penalty_stats = _stats(
+                split_exploration_components["post_norm_penalty"]
+            )
             split_exploration_post_norm_abs_stats = _stats(
                 [abs(v) for v in split_exploration_components["post_norm"]]
             )
@@ -2128,6 +2777,8 @@ def _dataset_metrics(
                     "exploration_reward_signal_mean": _stats_mean(split_exploration_signal_stats),
                     "exploration_reward_post_norm_mean": _stats_mean(split_exploration_post_norm_stats),
                     "exploration_reward_post_norm_abs_mean": _stats_mean(split_exploration_post_norm_abs_stats),
+                    "adv_intrinsic_reward_mean": _stats_mean(split_exploration_adv_intrinsic_stats),
+                    "adv_penalty_mean": _stats_mean(split_exploration_adv_penalty_stats),
                     "explore_intrinsic_scaled_mean": _stats_mean(
                         split_component_stats.get("explore_intrinsic_scaled")
                     ),
@@ -2168,6 +2819,22 @@ def _dataset_metrics(
                 "exploration_reward_signal_mean": _stats_mean(exploration_signal_stats),
                 "exploration_reward_post_norm_mean": _stats_mean(exploration_post_norm_stats),
                 "exploration_reward_post_norm_abs_mean": _stats_mean(exploration_post_norm_abs_stats),
+                "intrinsic_episodic_reward_mean": _stats_mean(
+                    component_stats.get("explore_agent57_ngu_episodic")
+                ),
+                "intrinsic_lifelong_reward_mean": _stats_mean(
+                    component_stats.get("explore_agent57_lifelong_bonus")
+                ),
+                "intrinsic_lifelong_raw_mean": _stats_mean(
+                    component_stats.get("explore_agent57_lifelong_raw")
+                ),
+                "intrinsic_signal_mean": _stats_mean(
+                    component_stats.get("explore_agent57_intrinsic_signal")
+                ),
+                "adv_intrinsic_reward_mean": _stats_mean(exploration_adv_intrinsic_stats),
+                "adv_intrinsic_reward_abs_mean": _stats_mean(exploration_adv_intrinsic_abs_stats),
+                "adv_penalty_mean": _stats_mean(exploration_adv_penalty_stats),
+                "adv_penalty_abs_mean": _stats_mean(exploration_adv_penalty_abs_stats),
                 "explore_intrinsic_scaled_mean": _stats_mean(
                     component_stats.get("explore_intrinsic_scaled")
                 ),
@@ -2196,6 +2863,20 @@ def _dataset_metrics(
                 "agent57_top_suppressed_ratio": explore_summary.get(
                     "agent57/top_suppressed_ratio"
                 ),
+                "agent57_trust_mean": explore_summary.get("agent57/trust_mean"),
+                "agent57_trust_min": explore_summary.get("agent57/trust_min"),
+                "agent57_trust_p50": explore_summary.get("agent57/trust_p50"),
+                "agent57_trust_p90": explore_summary.get("agent57/trust_p90"),
+                "agent57_trust_zero_rate": explore_summary.get("agent57/trust_zero_rate"),
+                "agent57_trust_completed_mean": explore_summary.get(
+                    "agent57/trust_completed_mean"
+                ),
+                "agent57_trust_truncated_mean": explore_summary.get(
+                    "agent57/trust_truncated_mean"
+                ),
+                "agent57_trust_failed_mean": explore_summary.get(
+                    "agent57/trust_failed_mean"
+                ),
                 "explore_cde_actor_bonus_mean": _stats_mean(
                     component_stats.get("explore_cde_actor_bonus")
                 ),
@@ -2217,8 +2898,7 @@ def _format_dataset_table(rows: List[dict[str, Any]]) -> str:
     if not rows:
         return ""
     header = (
-        "dataset                 n  ratio train  rew_mean  rew_std     pass resp_len  "
-        "comp trunc fail abort mood              xpress rhack"
+        "dataset                 n  ratio train  reward    pass resp_len  comp trunc fail abort"
     )
     line = "-" * len(header)
     body = []
@@ -2229,16 +2909,12 @@ def _format_dataset_table(rows: List[dict[str, Any]]) -> str:
             f"{row['ratio']:6.2%} "
             f"{int(row['trainable']):5d} "
             f"{_format_float(row['reward_mean'])} "
-            f"{_format_float(row['reward_std'])} "
             f"{_format_float(row['acc_mean'])} "
             f"{_format_float(row['response_mean'])} "
             f"{int(row['completed']):5d} "
             f"{int(row['truncated']):5d} "
             f"{int(row['failed']):4d} "
-            f"{int(row['aborted']):5d} "
-            f"{str(row.get('explore_mood') or '-')[:16]:16} "
-            f"{_format_float(row.get('explore_pressure'), width=6)} "
-            f"{_format_float(row.get('reward_hack_risk'), width=5)}"
+            f"{int(row['aborted']):5d}"
         )
     return "\n".join([header, line, *body])
 
@@ -2247,8 +2923,7 @@ def _format_reward_breakdown_table(rows: List[dict[str, Any]]) -> str:
     if not rows:
         return ""
     header = (
-        "dataset                 n train final_reward pass_rate raw_score base_reward "
-        "safety explore_reward postabs intrinsic safepen   a57   cde lprnd"
+        "dataset                 n train task_reward total_reward score_bonus adv_intr penalty episodic lifelong signal trust trustT arms"
     )
     line = "-" * len(header)
     body = []
@@ -2257,23 +2932,24 @@ def _format_reward_breakdown_table(rows: List[dict[str, Any]]) -> str:
             f"{str(row['dataset'])[:22]:22} "
             f"{int(row['count']):4d} "
             f"{int(row['trainable']):5d} "
-            f"{_format_float(row.get('reward_mean'), width=12)} "
-            f"{_format_float(row.get('pass_rate_mean'), width=9)} "
-            f"{_format_float(row.get('raw_score_mean'), width=9)} "
             f"{_format_float(row.get('base_reward_mean'), width=11)} "
-            f"{_format_float(row.get('safety_score_mean'), width=6)} "
-            f"{_format_float(row.get('exploration_reward_mean'), width=14)} "
-            f"{_format_float(row.get('exploration_reward_post_norm_abs_mean'), width=7)} "
-            f"{_format_float(row.get('explore_intrinsic_scaled_mean'), width=9)} "
-            f"{_format_float(row.get('explore_safety_penalty_mean'), width=7)} "
-            f"{_format_float(row.get('explore_agent57_lifelong_bonus_mean'), width=5)} "
-            f"{_format_float(row.get('explore_cde_actor_bonus_mean'), width=5)} "
-            f"{_format_float(row.get('explore_lprnd_mean'), width=5)}"
+            f"{_format_float(row.get('reward_mean'), width=12)} "
+            f"{_format_float(row.get('exploration_reward_score_mean'), width=10)} "
+            f"{_format_float(row.get('adv_intrinsic_reward_mean'), width=8)} "
+            f"{_format_float(row.get('adv_penalty_mean'), width=7)} "
+            f"{_format_float(row.get('intrinsic_episodic_reward_mean'), width=8)} "
+            f"{_format_float(row.get('intrinsic_lifelong_reward_mean'), width=8)} "
+            f"{_format_float(row.get('intrinsic_signal_mean'), width=6)} "
+            f"{_format_float(row.get('agent57_trust_mean'), width=5)} "
+            f"{_format_float(row.get('agent57_trust_truncated_mean'), width=6)} "
+            f"{_format_float(row.get('agent57_arm_count'), width=4)}"
         )
     return "\n".join([header, line, *body])
 
 
 def _format_agent57_table(rows: List[dict[str, Any]]) -> str:
+    if not _env_enabled("TERMINAL_AGENT57_VERBOSE_METRICS", "0"):
+        return ""
     agent_rows = [
         row for row in rows
         if row.get("explore_agent57_lifelong_bonus_mean") is not None
@@ -2444,7 +3120,28 @@ def rollout_log(rollout_id, args, samples, rollout_extra_metrics, rollout_time):
     log_dict["terminal/rollout_time"] = rollout_time
 
     step = compute_rollout_step(args, rollout_id)
+    step_context = _step_context(args, rollout_id, rollout_step=step)
     log_dict["rollout/step"] = step
+    log_dict["axis/rollout_step"] = step_context["rollout_step"]
+    log_dict["axis/train_step"] = step_context["train_step"]
+    log_dict["axis/steps_per_rollout"] = step_context["steps_per_rollout"]
+    log_dict["axis/legacy_rollout_step"] = step_context["legacy_rollout_step"]
+    reward_axis_metrics = _reward_fusion_axis_metrics(args, trainable or samples)
+    _add_axis_metric_views(log_dict, reward_axis_metrics)
+    if reward_axis_metrics:
+        for source_key, terminal_key in (
+            ("reward/task", "terminal/task_reward_mean"),
+            ("reward/total", "terminal/postprocess_reward_mean"),
+            ("intrinsic/intra", "terminal/intrinsic/intra_mean"),
+            ("intrinsic/inter", "terminal/intrinsic/inter_mean"),
+            ("intrinsic/fused", "terminal/intrinsic/fused_mean"),
+            ("adv/intrinsic", "terminal/adv/intrinsic_mean"),
+            ("adv/final_penalty", "terminal/adv/final_penalty_mean"),
+            ("adv/with_penalty", "terminal/adv/with_penalty_mean"),
+        ):
+            value = reward_axis_metrics.get(source_key)
+            if value is not None:
+                log_dict[terminal_key] = value
     _log_metric_semantics_once()
     metric_records = _aggregate_metric_records(
         args=args,
@@ -2452,10 +3149,19 @@ def rollout_log(rollout_id, args, samples, rollout_extra_metrics, rollout_time):
         rollout_id=rollout_id,
         step=step,
         samples=samples,
+        step_context=step_context,
         rollout_time=rollout_time,
     )
     _add_per_dataset_log_dict(log_dict, metric_records)
-    per_dataset_table = _format_per_dataset_table(metric_records, phase="train", step=step)
+    reward_axis_table = _format_reward_axis_table(reward_axis_metrics, step_context)
+    if reward_axis_table:
+        logger.info("reward fusion metrics\n%s", reward_axis_table)
+    per_dataset_table = _format_per_dataset_table(
+        metric_records,
+        phase="train",
+        step=step,
+        step_context=step_context,
+    )
     if per_dataset_table:
         logger.info("per-dataset metrics\n%s", per_dataset_table)
     table = _format_dataset_table(dataset_rows)
@@ -2489,6 +3195,7 @@ def eval_rollout_log(rollout_id, args, data, extra_metrics=None):
     False so slime's default eval logger still emits its legacy metrics.
     """
     step = compute_rollout_step(args, rollout_id)
+    step_context = _step_context(args, rollout_id, rollout_step=step)
     records: list[dict[str, Any]] = []
     all_samples: list[Sample] = []
     all_rewards: list[Any] = []
@@ -2507,6 +3214,7 @@ def eval_rollout_log(rollout_id, args, data, extra_metrics=None):
                     rollout_id=rollout_id,
                     step=step,
                     samples=samples,
+                    step_context=step_context,
                 )
             )
             continue
@@ -2521,6 +3229,7 @@ def eval_rollout_log(rollout_id, args, data, extra_metrics=None):
                 rollout_id=rollout_id,
                 step=step,
                 rewards=rewards,
+                step_context=step_context,
             )
         )
 
@@ -2535,6 +3244,7 @@ def eval_rollout_log(rollout_id, args, data, extra_metrics=None):
                     rollout_id=rollout_id,
                     step=step,
                     samples=all_samples,
+                    step_context=step_context,
                 )
             )
         else:
@@ -2546,6 +3256,7 @@ def eval_rollout_log(rollout_id, args, data, extra_metrics=None):
                     rollout_id=rollout_id,
                     step=step,
                     rewards=all_rewards,
+                    step_context=step_context,
                 )
             )
 
@@ -2554,9 +3265,18 @@ def eval_rollout_log(rollout_id, args, data, extra_metrics=None):
     # `per_dataset/*` is defined on rollout/step so train/eval points share the
     # same x-axis when inspecting dataset-specific curves in wandb.
     log_dict["rollout/step"] = step
+    log_dict["axis/rollout_step"] = step_context["rollout_step"]
+    log_dict["axis/train_step"] = step_context["train_step"]
+    log_dict["axis/steps_per_rollout"] = step_context["steps_per_rollout"]
+    log_dict["axis/legacy_rollout_step"] = step_context["legacy_rollout_step"]
     _add_per_dataset_log_dict(log_dict, records)
 
-    table = _format_per_dataset_table(records, phase="eval", step=step)
+    table = _format_per_dataset_table(
+        records,
+        phase="eval",
+        step=step,
+        step_context=step_context,
+    )
     if table:
         logger.info("per-dataset eval metrics\n%s", table)
     diag = _format_eval_diag(records)

@@ -31,6 +31,29 @@ from .update_weight_utils import UpdateWeightFromDistributed, UpdateWeightFromTe
 logger = logging.getLogger(__name__)
 
 
+def _skip_zero_trainable_enabled() -> bool:
+    return os.getenv("SLIME_SKIP_ZERO_TRAINABLE_TRAIN", "1").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+
+
+def _trainable_token_count(rollout_data) -> float:
+    masks = rollout_data.get("loss_masks") or []
+    total = 0.0
+    for mask in masks:
+        if isinstance(mask, torch.Tensor):
+            total += float(mask.sum().item())
+        else:
+            try:
+                total += float(sum(mask))
+            except TypeError:
+                total += float(mask or 0.0)
+    return total
+
+
 class FSDPTrainRayActor(TrainRayActor):
     """Simplified TrainRayActor for pure HF+FSDP training.
 
@@ -530,6 +553,14 @@ class FSDPTrainRayActor(TrainRayActor):
             )
 
     def _train_core(self, rollout_id: int, rollout_data) -> None:
+        if _skip_zero_trainable_enabled() and _trainable_token_count(rollout_data) <= 0.0:
+            if dist.get_rank() == 0:
+                logger.warning(
+                    "Skipping actor train for rollout_id=%s because all loss_masks are zero",
+                    rollout_id,
+                )
+            return
+
         if self.args.advantage_estimator in ["grpo", "gspo"]:
             rollout_data["advantages"] = rollout_data["returns"] = [
                 torch.tensor([rollout_data["rewards"][i]] * rollout_data["response_lengths"][i])
@@ -760,9 +791,8 @@ class FSDPTrainRayActor(TrainRayActor):
                 if self.args.use_kl_loss and "kl_loss" in aggregated:
                     kl_info = f", kl_loss: {aggregated['kl_loss']:.4f}, kl_penalty: {aggregated['kl_loss'] * self.args.kl_loss_coef:.4f}"
                     logger.info(kl_info)
-                logger.info(f"step {self.global_step}: {log_dict}")
-
                 log_dict["train/step"] = self.global_step
+                logger.info(f"train-step {self.global_step}: {log_dict}")
                 logging_utils.log(self.args, log_dict, step_key="train/step")
             self.global_step += 1
 

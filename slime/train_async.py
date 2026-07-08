@@ -8,6 +8,7 @@ from slime.ray.placement_group import create_placement_groups, create_rollout_ma
 from slime.utils.arguments import parse_args
 from slime.utils.logging_utils import configure_logger, init_tracking
 from slime.utils.misc import should_run_periodic_action
+from slime.utils.rollout_skip import is_skip_train_result
 
 logger = logging.getLogger(__name__)
 _SKIPPED_ROLLOUT = object()
@@ -40,6 +41,19 @@ def _relay_pending_metrics(result):
                     wandb.log(m)
         elif isinstance(item, dict):
             wandb.log(item)
+
+
+def _resolve_generation_result(gen_result):
+    pending = None
+    if gen_result is _SKIPPED_ROLLOUT:
+        return _SKIPPED_ROLLOUT, pending
+    if isinstance(gen_result, tuple):
+        rollout_data_ref, pending = gen_result
+    else:
+        rollout_data_ref = gen_result
+    if is_skip_train_result(rollout_data_ref):
+        return _SKIPPED_ROLLOUT, pending
+    return rollout_data_ref, pending
 
 
 def _get_rollout_generation_result(args, rollout_manager, rollout_id, future):
@@ -137,20 +151,18 @@ def train(args):
         # Sync the last generation
         if rollout_data_next_future is not None:
             gen_result = _get_rollout_generation_result(args, rollout_manager, rollout_id, rollout_data_next_future)
-            if gen_result is _SKIPPED_ROLLOUT:
-                logger.warning("Skipping training for failed rollout_id=%s", rollout_id)
+            rollout_data_curr_ref, pending = _resolve_generation_result(gen_result)
+            if pending:
+                _relay_pending_metrics(pending)
+            if rollout_data_curr_ref is _SKIPPED_ROLLOUT:
+                logger.warning("Skipping training for rollout_id=%s", rollout_id)
                 if rollout_id + 1 < args.num_rollout:
                     rollout_data_next_future = rollout_manager.generate.remote(rollout_id + 1)
                 else:
                     rollout_data_next_future = None
                 continue
-            if isinstance(gen_result, tuple):
-                rollout_data_curr_ref, pending = gen_result
-                _relay_pending_metrics(pending)
-            else:
-                rollout_data_curr_ref = gen_result
         elif rollout_data_curr_ref is _SKIPPED_ROLLOUT:
-            logger.warning("Skipping training for failed rollout_id=%s", rollout_id)
+            logger.warning("Skipping training for rollout_id=%s", rollout_id)
             if rollout_id + 1 < args.num_rollout:
                 rollout_data_next_future = rollout_manager.generate.remote(rollout_id + 1)
             else:
@@ -187,13 +199,9 @@ def train(args):
             # sync generate before update weights to prevent update weight in the middle of generation
             if (x := rollout_data_next_future) is not None:
                 gen_result = _get_rollout_generation_result(args, rollout_manager, rollout_id + 1, x)
-                if gen_result is _SKIPPED_ROLLOUT:
-                    rollout_data_curr_ref = _SKIPPED_ROLLOUT
-                elif isinstance(gen_result, tuple):
-                    rollout_data_curr_ref, pending = gen_result
+                rollout_data_curr_ref, pending = _resolve_generation_result(gen_result)
+                if pending:
                     _relay_pending_metrics(pending)
-                else:
-                    rollout_data_curr_ref = gen_result
             else:
                 rollout_data_curr_ref = None
             rollout_data_next_future = None

@@ -340,8 +340,26 @@ _EXPLORE_AGENT57_EPISODIC_INCLUDE_TURN = _env_bool(
     "EXPLORE_AGENT57_EPISODIC_INCLUDE_TURN",
     True,
 )
+_EXPLORE_AGENT57_EPISODIC_TURN_MODE = (
+    os.getenv("EXPLORE_AGENT57_EPISODIC_TURN_MODE", "bucket").strip().lower()
+)
+if _EXPLORE_AGENT57_EPISODIC_TURN_MODE in {"", "1", "true", "yes", "on", "coarse"}:
+    _EXPLORE_AGENT57_EPISODIC_TURN_MODE = "bucket"
+elif _EXPLORE_AGENT57_EPISODIC_TURN_MODE in {"0", "false", "no", "off"}:
+    _EXPLORE_AGENT57_EPISODIC_TURN_MODE = "none"
+elif _EXPLORE_AGENT57_EPISODIC_TURN_MODE in {"stage"}:
+    _EXPLORE_AGENT57_EPISODIC_TURN_MODE = "phase"
+elif _EXPLORE_AGENT57_EPISODIC_TURN_MODE not in {"none", "bucket", "phase"}:
+    logger.warning(
+        "Invalid EXPLORE_AGENT57_EPISODIC_TURN_MODE=%r; using bucket",
+        _EXPLORE_AGENT57_EPISODIC_TURN_MODE,
+    )
+    _EXPLORE_AGENT57_EPISODIC_TURN_MODE = "bucket"
+if not _EXPLORE_AGENT57_EPISODIC_INCLUDE_TURN:
+    _EXPLORE_AGENT57_EPISODIC_TURN_MODE = "none"
 _CMD_COUNTER: Dict[str, int] = {}  # process-level counter for command novelty
 _AGENT57_LAST_EPISODIC_STATS: Dict[str, float] = {}
+_AGENT57_LAST_EPISODIC_BY_TURN: Dict[int, float] = {}
 
 # ── Exploration: LP-RND lifelong novelty (草案 C, zero-extra-param) ───────────
 # Reuses the rollout_log_probs already computed by slime (no extra forward pass).
@@ -524,10 +542,20 @@ def _explore_structured_tool_signature(
 
 
 def _explore_turn_bucket(turn_idx: Any) -> str:
+    if _EXPLORE_AGENT57_EPISODIC_TURN_MODE == "none":
+        return "turn_ignored"
     try:
         idx = int(turn_idx)
     except (TypeError, ValueError):
         return "turn_unknown"
+    if _EXPLORE_AGENT57_EPISODIC_TURN_MODE == "phase":
+        if idx <= 0:
+            return "phase_open"
+        if idx <= 2:
+            return "phase_probe"
+        if idx <= 5:
+            return "phase_work"
+        return "phase_late"
     if idx <= 0:
         return "turn0"
     if idx <= 2:
@@ -633,7 +661,8 @@ def _explore_agent57_episodic_state(action: Dict[str, Any]) -> Dict[str, Any]:
     if _EXPLORE_AGENT57_EPISODIC_OBS_MODE != "none":
         state["observation"] = str(action.get("obs_bucket") or "no_result")
         state["exit"] = str(action.get("exit_bucket") or "exit_unknown")
-    if _EXPLORE_AGENT57_EPISODIC_INCLUDE_TURN:
+    if _EXPLORE_AGENT57_EPISODIC_TURN_MODE != "none":
+        state["turn_mode"] = _EXPLORE_AGENT57_EPISODIC_TURN_MODE
         state["turn"] = str(action.get("turn_bucket") or "turn_unknown")
     return state
 
@@ -681,13 +710,16 @@ def _explore_episode_signature_novelty(
     reducer: str = "sum",
 ) -> float:
     """Episode-local novelty used by Agent57 NGU-lite product mode."""
-    global _AGENT57_LAST_EPISODIC_STATS
+    global _AGENT57_LAST_EPISODIC_STATS, _AGENT57_LAST_EPISODIC_BY_TURN
     _AGENT57_LAST_EPISODIC_STATS = {}
+    _AGENT57_LAST_EPISODIC_BY_TURN = {}
     if not turn_records:
         return 0.0
     total = 0.0
     action_count = 0
     episode_counter: Dict[str, int] = {}
+    turn_total: Dict[int, float] = {}
+    turn_count: Dict[int, int] = {}
     episodic_memory = create_episodic_memory_backend(_AGENT57_CONFIG.episodic_backend)
     empty_bucket_count = 0.0
     exact_repeat_count = 0.0
@@ -695,9 +727,16 @@ def _explore_episode_signature_novelty(
     probe_count_total = 0.0
     for action in _iter_explore_actions(turn_records):
         action_count += 1
+        try:
+            turn_idx = int(action.get("turn_idx", -1))
+        except (TypeError, ValueError):
+            turn_idx = -1
         if episodic_memory is not None:
             state = _explore_agent57_episodic_state(action)
-            total += float(episodic_memory.compute_novelty(state))
+            novelty = float(episodic_memory.compute_novelty(state))
+            total += novelty
+            turn_total[turn_idx] = turn_total.get(turn_idx, 0.0) + novelty
+            turn_count[turn_idx] = turn_count.get(turn_idx, 0) + 1
             query_stats_fn = getattr(episodic_memory, "last_query_stats", None)
             query_stats = query_stats_fn() if callable(query_stats_fn) else {}
             empty_bucket_count += float(query_stats.get("empty_bucket", 0.0) or 0.0)
@@ -706,12 +745,27 @@ def _explore_episode_signature_novelty(
             probe_count_total += float(query_stats.get("probe_count", 0.0) or 0.0)
             episodic_memory.add(state)
             continue
-        key_src = action["signature"]
+        key_src = _stable_json(_explore_agent57_episodic_state(action))
         key = hashlib.md5(key_src.encode()).hexdigest()[:10]
         episode_counter[key] = episode_counter.get(key, 0) + 1
-        total += 1.0 / math.sqrt(episode_counter[key])
+        novelty = 1.0 / math.sqrt(episode_counter[key])
+        total += novelty
+        turn_total[turn_idx] = turn_total.get(turn_idx, 0.0) + novelty
+        turn_count[turn_idx] = turn_count.get(turn_idx, 0) + 1
     value = total / action_count if reducer == "mean" and action_count > 0 else total
     if action_count > 0:
+        if reducer == "mean":
+            _AGENT57_LAST_EPISODIC_BY_TURN = {
+                idx: turn_total[idx] / max(1, turn_count.get(idx, 0))
+                for idx in turn_total
+                if idx >= 0
+            }
+        else:
+            _AGENT57_LAST_EPISODIC_BY_TURN = {
+                idx: turn_total[idx]
+                for idx in turn_total
+                if idx >= 0
+            }
         _AGENT57_LAST_EPISODIC_STATS = {
             "explore_agent57_episodic_action_count": float(action_count),
             "explore_agent57_episodic_empty_bucket_count": float(empty_bucket_count),
@@ -719,6 +773,15 @@ def _explore_episode_signature_novelty(
             "explore_agent57_episodic_exact_repeat_count": float(exact_repeat_count),
             "explore_agent57_episodic_candidate_count_mean": float(candidate_count_total / action_count),
             "explore_agent57_episodic_probe_count_mean": float(probe_count_total / action_count),
+            "explore_agent57_episodic_include_turn": float(
+                _EXPLORE_AGENT57_EPISODIC_TURN_MODE != "none"
+            ),
+            "explore_agent57_episodic_turn_mode_code": float(
+                {"none": 0, "bucket": 1, "phase": 2}.get(
+                    _EXPLORE_AGENT57_EPISODIC_TURN_MODE,
+                    1,
+                )
+            ),
         }
     return value
 
@@ -1834,6 +1897,8 @@ def _exploration_audit_from_reward(reward: Dict[str, Any]) -> Dict[str, Any]:
         "explore_agent57_episodic_exact_repeat_count",
         "explore_agent57_episodic_candidate_count_mean",
         "explore_agent57_episodic_probe_count_mean",
+        "explore_agent57_episodic_include_turn",
+        "explore_agent57_episodic_turn_mode_code",
         "explore_agent57_lifelong_raw",
         "explore_agent57_lifelong_z",
         "explore_agent57_lifelong_stat_n",
@@ -1860,6 +1925,8 @@ def _exploration_audit_from_reward(reward: Dict[str, Any]) -> Dict[str, Any]:
         "explore_cde_actor_log_ppl",
         "explore_cde_actor_reward_gate",
         "explore_cde_actor_eligible",
+        "exploration_reward_save_stage",
+        "explore_post_norm_bonus_available_at_save",
     )
     return {key: reward[key] for key in keys if key in reward}
 
@@ -1981,6 +2048,8 @@ def _save_rollout_artifacts(
                 "explore_agent57_episodic_exact_repeat_count",
                 "explore_agent57_episodic_candidate_count_mean",
                 "explore_agent57_episodic_probe_count_mean",
+                "explore_agent57_episodic_include_turn",
+                "explore_agent57_episodic_turn_mode_code",
                 "explore_agent57_lifelong_raw",
                 "explore_agent57_lifelong_z",
                 "explore_agent57_lifelong_stat_n",
@@ -2040,6 +2109,14 @@ def _save_rollout_artifacts(
             )
             if reward_details:
                 reward_breakdown["details"] = reward_details
+            if (
+                reward_breakdown.get("explore_agent57_enabled")
+                and "explore_post_norm_bonus" not in reward_breakdown
+            ):
+                reward_breakdown["exploration_reward_save_stage"] = (
+                    "generate_pre_reward_postprocess"
+                )
+                reward_breakdown["explore_post_norm_bonus_available_at_save"] = False
             reward_breakdown["per_turn_scores"] = [
                 {
                     "turn_idx": s.metadata.get("turn_idx"),
@@ -3650,6 +3727,26 @@ async def generate(
                 if _base_score_values
                 else 0.0
             )
+            _agent57_dataset_name = str(data_source or "").strip().lower()
+            _agent57_normalized_score_values = []
+            if _agent57_dataset_name == "seta":
+                for _sample in samples:
+                    if not isinstance(_sample.reward, dict):
+                        continue
+                    _raw_score = _sample.reward.get(
+                        "raw_score",
+                        _sample.reward.get("accuracy"),
+                    )
+                    try:
+                        _agent57_normalized_score_values.append(float(_raw_score))
+                    except (TypeError, ValueError):
+                        pass
+            _agent57_normalized_score_mean = (
+                sum(_agent57_normalized_score_values)
+                / len(_agent57_normalized_score_values)
+                if _agent57_normalized_score_values
+                else None
+            )
             _cde_actor = _explore_cde_actor_metrics(
                 interactions,
                 _base_score_mean,
@@ -3700,6 +3797,8 @@ async def generate(
                 parse_error_count=agent_runner.parse_error_count,
                 bonus=_agent57_bonus,
                 dataset=data_source,
+                normalized_base_score=_agent57_normalized_score_mean,
+                success_score=_agent57_normalized_score_mean,
             )
             for s in samples:
                 if isinstance(s.reward, dict) and "score" in s.reward:
@@ -3727,6 +3826,21 @@ async def generate(
                         if not isinstance(s.metadata, dict):
                             s.metadata = {}
                         s.reward.update(_agent57_metrics)
+                        try:
+                            _turn_idx = int(s.metadata.get("turn_idx", -1))
+                        except (TypeError, ValueError):
+                            _turn_idx = -1
+                        _turn_episodic = float(
+                            _AGENT57_LAST_EPISODIC_BY_TURN.get(_turn_idx, 0.0)
+                        )
+                        _turn_life_mod = float(
+                            _agent57_metrics.get("explore_agent57_ngu_life_mod", 1.0)
+                            or 1.0
+                        )
+                        s.reward["explore_agent57_turn_episodic"] = _turn_episodic
+                        s.reward["explore_agent57_turn_intrinsic_signal"] = (
+                            _turn_episodic * _turn_life_mod
+                        )
                         s.metadata["agent57"] = {
                             "enabled": bool(_AGENT57_CONFIG.enabled),
                             "arm_id": _agent57_arm_id,
@@ -3778,10 +3892,32 @@ async def generate(
             if isinstance(r, dict) and r.get("turn_idx") is not None
         }
         for s in samples:
+            s.metadata["train_step"] = run_ctx.train_step
+            s.metadata["rollout_step"] = run_ctx.rollout_step
+            s.metadata["rollout_id"] = run_ctx.rollout_id
+            s.metadata["uid"] = run_ctx.uid
             s.metadata["model_turn_count"] = agent_runner.model_turn_count
             s.metadata["parse_error_count"] = agent_runner.parse_error_count
             s.metadata["data_source"] = data_source or s.metadata.get("data_source")
             s.metadata["safety_split"] = _safety_split_from_meta(task_meta)
+            claude_backend = str(os.getenv("CLAUDE_CODE_LLM_BACKEND", "sglang")).strip().lower()
+            claude_sglang_backend = claude_backend.replace("_", "-") in {
+                "sglang",
+                "qwen",
+                "qwen-sglang",
+                "local",
+                "local-sglang",
+            }
+            if agent_type == "claude-code" and _env_flag(
+                "CLAUDE_CODE_MARK_NON_TRAINABLE",
+                not claude_sglang_backend,
+            ):
+                s.remove_sample = True
+                s.metadata["non_trainable"] = True
+                s.metadata["non_trainable_reason"] = (
+                    "claude-code CLI uses an external model path without "
+                    "terminal-rl policy logprobs"
+                )
             if trajectory_uncertainty:
                 s.metadata["trajectory_uncertainty"] = trajectory_uncertainty
             turn_uncertainty = turn_uncertainty_by_idx.get(

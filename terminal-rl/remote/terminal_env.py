@@ -7,6 +7,7 @@ import os
 import re
 import subprocess
 import inspect
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from functools import partial
@@ -1057,6 +1058,7 @@ class TerminalEnv:
                 run_ctx=run_ctx,
             )
 
+        cancel_event = threading.Event()
         reset_started = time.monotonic()
         image_prepare_started = time.monotonic()
         logger.info(
@@ -1070,7 +1072,19 @@ class TerminalEnv:
                 prepare_task_docker_image,
                 task=task_meta,
                 timeout=self._timeouts.ensure_image,
+                cancel_event=cancel_event,
             )
+        except asyncio.CancelledError:
+            cancel_event.set()
+            logger.warning(
+                "TerminalEnv reset cancelled during image prepare task=%s uid=%s "
+                "elapsed=%.1fs total_elapsed=%.1fs",
+                self._task_spec.task_name,
+                self._run_ctx.uid,
+                time.monotonic() - image_prepare_started,
+                time.monotonic() - reset_started,
+            )
+            raise
         except Exception:
             logger.exception(
                 "TerminalEnv reset image prepare failed task=%s uid=%s elapsed=%.1fs "
@@ -1099,7 +1113,15 @@ class TerminalEnv:
         output_path = Path(self._run_ctx.log_dir).resolve()
         output_path.mkdir(parents=True, exist_ok=True)
 
+        def _raise_if_cancelled(stage: str) -> None:
+            if cancel_event.is_set():
+                raise RuntimeError(
+                    f"TERMINAL_ENV_RESET_CANCELLED task={self._task_spec.task_name} "
+                    f"uid={self._run_ctx.uid} stage={stage}"
+                )
+
         def _sync_reset() -> tuple[str, list[dict[str, Any]]]:
+            _raise_if_cancelled("before_docker_cleanup")
             # P0 FIX: Force recreate container to avoid Docker daemon API slowdown
             # Root cause: containers.get() HTTP call hangs 360s when container runs >1h
             # Docker daemon state accumulation causes API performance degradation
@@ -1134,6 +1156,7 @@ class TerminalEnv:
             self._last_docker_compose_path = str(
                 self._trial_handler.task_paths.docker_compose_path
             )
+            _raise_if_cancelled("before_terminal_create")
             task_config = self._trial_handler.task
             self._parser = ParserFactory.get_parser(task_config.parser_name)
             client_image_name = (
@@ -1161,6 +1184,7 @@ class TerminalEnv:
                 self._timeouts.reset_session,
             )
             try:
+                _raise_if_cancelled("before_docker_start")
                 if image_prep.mode == "pull":
                     compose_up_no_build(
                         self._terminal,
@@ -1217,6 +1241,26 @@ class TerminalEnv:
                 time.monotonic() - reset_started,
             )
 
+            try:
+                _raise_if_cancelled("after_docker_start")
+            except Exception:
+                logger.warning(
+                    "TerminalEnv reset cancelled after docker start task=%s uid=%s; "
+                    "cleaning up container=%s",
+                    self._task_spec.task_name,
+                    self._run_ctx.uid,
+                    self._trial_handler.client_container_name,
+                )
+                _force_remove_docker_objects(
+                    trial_name=self._trial_handler.trial_name,
+                    client_container_name=self._trial_handler.client_container_name,
+                    docker_image_name_prefix=self._trial_handler.docker_image_name_prefix,
+                    docker_compose_path=str(
+                        self._trial_handler.task_paths.docker_compose_path
+                    ),
+                    reason="reset_cancelled_after_start",
+                )
+                raise
             session_logs_dir = (
                 self._trial_handler.trial_paths.sessions_path
                 / "terminal_toolkit_session_logs"
@@ -1254,7 +1298,18 @@ class TerminalEnv:
                 asyncio.to_thread(_sync_reset),
                 timeout=reset_thread_timeout,
             )
+        except asyncio.CancelledError:
+            cancel_event.set()
+            logger.warning(
+                "TerminalEnv reset cancelled during docker/session startup task=%s "
+                "uid=%s total_elapsed=%.1fs",
+                self._task_spec.task_name,
+                self._run_ctx.uid,
+                time.monotonic() - reset_started,
+            )
+            raise
         except asyncio.TimeoutError:
+            cancel_event.set()
             logger.error(
                 "CRITICAL: reset operation hung beyond internal timeout "
                 f"(timeout={reset_thread_timeout}s, reset_session={self._timeouts.reset_session}s). "
