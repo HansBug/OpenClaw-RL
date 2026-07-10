@@ -95,7 +95,7 @@ CUSTOM_CONFIG_PATH="${CUSTOM_CONFIG_PATH:-${SCRIPT_DIR}/configs/rollout_qwen3_th
 HF_CKPT="${HF_CKPT:-/mnt/shared-storage-user/puyuan/code/slime/Qwen3-8B/}"
 REF_LOAD="${REF_LOAD:-/mnt/shared-storage-user/puyuan/code/slime/Qwen3-8B_torch_dist/}"
 
-EXPORT_ROOT="${EXPORT_ROOT:-/mnt/shared-storage-user/narmodel/agenticrl}"
+EXPORT_ROOT="${EXPORT_ROOT:-/mnt/shared-storage-gpfs2/narmodel/agenticrl}"
 RUN_TIMESTAMP="${RUN_TIMESTAMP:-$(date +%F_%H%M%S)}"
 DEBUG_MODE="${DEBUG_MODE:-0}"
 # Defaults needed early so the run directory name carries the key experiment
@@ -1424,6 +1424,7 @@ fi
 TRAIN_ARGS=(
   --actor-num-nodes 1
   --actor-num-gpus-per-node "${ACTOR_GPUS}"
+  --num-gpus-per-node "${NUM_GPUS}"
   --rollout-num-gpus "${ROLLOUT_GPUS}"
   "${MODEL_ARGS[@]}"
   "${CKPT_ARGS[@]}"
@@ -1587,7 +1588,9 @@ if [[ "${NVLINK_COUNT:-0}" -gt 0 ]]; then
 else
   HAS_NVLINK=0
 fi
-log "HAS_NVLINK=${HAS_NVLINK}"
+NCCL_NVLS_ENABLE="${NCCL_NVLS_ENABLE:-${HAS_NVLINK}}"
+NCCL_P2P_DISABLE="${NCCL_P2P_DISABLE:-0}"
+log "HAS_NVLINK=${HAS_NVLINK} NCCL_NVLS_ENABLE=${NCCL_NVLS_ENABLE} NCCL_P2P_DISABLE=${NCCL_P2P_DISABLE}"
 
 # ── Dump run config ──────────────────────────────────────────────────
 cat > "${RUN_DIR}/config/run_config.json" <<CFGEOF
@@ -1923,7 +1926,8 @@ RUNTIME_ENV_JSON="{
     \"PYTHONUNBUFFERED\": \"1\",
     \"PYTHONFAULTHANDLER\": \"1\",
     \"CUDA_DEVICE_MAX_CONNECTIONS\": \"1\",
-    \"NCCL_NVLS_ENABLE\": \"${HAS_NVLINK}\",
+    \"NCCL_NVLS_ENABLE\": \"${NCCL_NVLS_ENABLE}\",
+    \"NCCL_P2P_DISABLE\": \"${NCCL_P2P_DISABLE}\",
     \"SLIME_RAY_PLACEMENT_GPU_PROBE\": \"${SLIME_RAY_PLACEMENT_GPU_PROBE}\",
     \"SLIME_SKIP_ZERO_TRAINABLE_ROLLOUT\": \"${SLIME_SKIP_ZERO_TRAINABLE_ROLLOUT}\",
     \"SLIME_SKIP_ZERO_TRAINABLE_TRAIN\": \"${SLIME_SKIP_ZERO_TRAINABLE_TRAIN}\",

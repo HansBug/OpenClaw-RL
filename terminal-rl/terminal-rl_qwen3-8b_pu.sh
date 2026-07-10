@@ -976,6 +976,7 @@ fi
 TRAIN_ARGS=(
   --actor-num-nodes 1
   --actor-num-gpus-per-node "${ACTOR_GPUS}"
+  --num-gpus-per-node "${NUM_GPUS}"
   --rollout-num-gpus "${ROLLOUT_GPUS}"
   "${MODEL_ARGS[@]}"
   "${CKPT_ARGS[@]}"
@@ -1105,7 +1106,9 @@ if [[ "${NVLINK_COUNT:-0}" -gt 0 ]]; then
 else
   HAS_NVLINK=0
 fi
-log "HAS_NVLINK=${HAS_NVLINK}"
+NCCL_NVLS_ENABLE="${NCCL_NVLS_ENABLE:-${HAS_NVLINK}}"
+NCCL_P2P_DISABLE="${NCCL_P2P_DISABLE:-0}"
+log "HAS_NVLINK=${HAS_NVLINK} NCCL_NVLS_ENABLE=${NCCL_NVLS_ENABLE} NCCL_P2P_DISABLE=${NCCL_P2P_DISABLE}"
 
 # ── Dump run config ──────────────────────────────────────────────────
 cat > "${RUN_DIR}/config/run_config.json" <<CFGEOF
@@ -1239,7 +1242,8 @@ RUNTIME_ENV_JSON="{
     \"PYTHONUNBUFFERED\": \"1\",
     \"PYTHONFAULTHANDLER\": \"1\",
     \"CUDA_DEVICE_MAX_CONNECTIONS\": \"1\",
-    \"NCCL_NVLS_ENABLE\": \"${HAS_NVLINK}\",
+    \"NCCL_NVLS_ENABLE\": \"${NCCL_NVLS_ENABLE}\",
+    \"NCCL_P2P_DISABLE\": \"${NCCL_P2P_DISABLE}\",
     \"MASTER_ADDR\": \"${MASTER_ADDR}\",
     \"PYTORCH_CUDA_ALLOC_CONF\": \"${PYTORCH_CUDA_ALLOC_CONF}\",
     \"LD_LIBRARY_PATH\": \"${LD_LIBRARY_PATH:-}\",
