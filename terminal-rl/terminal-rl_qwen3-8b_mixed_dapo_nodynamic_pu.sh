@@ -59,7 +59,7 @@ export PYTHONFAULTHANDLER=1
 
 # ── GPU allocation (auto-split: half actor, half rollout) ────────────
 if command -v nvidia-smi >/dev/null 2>&1; then
-  DETECTED_GPUS=$(nvidia-smi -L 2>/dev/null | wc -l || echo 0)
+  DETECTED_GPUS="$(nvidia-smi -L 2>/dev/null | grep -c '^GPU ' || true)"
 else
   DETECTED_GPUS=0
 fi
@@ -95,7 +95,7 @@ CUSTOM_CONFIG_PATH="${CUSTOM_CONFIG_PATH:-${SCRIPT_DIR}/configs/rollout_qwen3_th
 HF_CKPT="${HF_CKPT:-/mnt/shared-storage-user/puyuan/code/slime/Qwen3-8B/}"
 REF_LOAD="${REF_LOAD:-/mnt/shared-storage-user/puyuan/code/slime/Qwen3-8B_torch_dist/}"
 
-EXPORT_ROOT="${EXPORT_ROOT:-/mnt/shared-storage-user/narmodel/agenticrl}"
+EXPORT_ROOT="${EXPORT_ROOT:-/mnt/shared-storage-gpfs2/narmodel/lixueyan/agenticrl}"
 RUN_TIMESTAMP="${RUN_TIMESTAMP:-$(date +%F_%H%M%S)}"
 DEBUG_MODE="${DEBUG_MODE:-0}"
 # Defaults needed early so the run directory name carries the key experiment
@@ -357,7 +357,7 @@ RUN_DIR="${RUNS_ROOT}/${RUN_ID}"
 MAX_CKPT_KEEP="${MAX_CKPT_KEEP}" python3 "${SCRIPT_DIR}/run_paths.py" init \
   --runs-root "${RUNS_ROOT}" \
   --ckpt-root "${CKPT_ROOT}" \
-  --run-id "${RUN_ID}" > /dev/null 2>&1
+  --run-id "${RUN_ID}" > /dev/null
 
 # Derive all paths from RUN_DIR
 RUN_LOG_DIR="${RUN_DIR}/logs"
@@ -968,8 +968,19 @@ export PROVIDER_NAME="${PROVIDER_NAME:-build}"
 export ENV_SERVER_BIND_HOST="${ENV_SERVER_BIND_HOST:-0.0.0.0}"
 export ENV_SERVER_PORT="${ENV_SERVER_PORT:-18080}"
 export ENV_SERVER_HOST="${ENV_SERVER_HOST:-${MASTER_ADDR}}"
-export ENV_SERVER_URL="${ENV_SERVER_URL:-http://${ENV_SERVER_HOST}:${ENV_SERVER_PORT}}"
-export START_ENV_POOL_SERVER="${START_ENV_POOL_SERVER:-${NEEDS_ENV_ROUTER}}"
+FIRST_WORKER_URL=""
+if [[ -n "${WORKER_URLS}" ]]; then
+  FIRST_WORKER_URL="${WORKER_URLS%%,*}"
+fi
+if [[ "${NEEDS_ENV_ROUTER}" == "1" && -n "${FIRST_WORKER_URL}" ]]; then
+  # When explicit remote workers are provided, use them directly by default.
+  # Set START_ENV_POOL_SERVER=1 to force launching a local fan-out router.
+  export ENV_SERVER_URL="${ENV_SERVER_URL:-${FIRST_WORKER_URL}}"
+  export START_ENV_POOL_SERVER="${START_ENV_POOL_SERVER:-0}"
+else
+  export ENV_SERVER_URL="${ENV_SERVER_URL:-http://${ENV_SERVER_HOST}:${ENV_SERVER_PORT}}"
+  export START_ENV_POOL_SERVER="${START_ENV_POOL_SERVER:-${NEEDS_ENV_ROUTER}}"
+fi
 export AGENT_SAFETYBENCH_REMOTE_ENV
 export AGENTHARM_REMOTE_ENV
 export AGENTHARM_ROOT
@@ -1452,6 +1463,7 @@ fi
 
 TRAIN_ARGS=(
   --actor-num-nodes 1
+  --num-gpus-per-node "${NUM_GPUS}"
   --actor-num-gpus-per-node "${ACTOR_GPUS}"
   --rollout-num-gpus "${ROLLOUT_GPUS}"
   "${MODEL_ARGS[@]}"
@@ -1495,7 +1507,7 @@ trap cleanup EXIT INT TERM
 
 ROUTER_LOG="${RUN_LOG_DIR}/router.log"
 require_cmd curl
-if [[ "${NEEDS_ENV_ROUTER}" == "1" ]]; then
+if [[ "${NEEDS_ENV_ROUTER}" == "1" && "${START_ENV_POOL_SERVER}" == "1" ]]; then
   if [[ "${AUTO_CLOSE_STALE_WORKER_RUNS}" == "1" ]]; then
     log "Pre-cleaning stale worker runs before router readiness check..."
     close_stale_runs_for_all_workers "pre_router_start" || true
@@ -1547,7 +1559,11 @@ if [[ "${NEEDS_ENV_ROUTER}" == "1" ]]; then
   curl -fsS "http://${CHECK_HOST}:${ROUTER_PORT}/status" || true
   echo
 else
-  log "Skipping terminal env router; Agent-SafetyBench uses local env backend"
+  if [[ "${NEEDS_ENV_ROUTER}" == "1" ]]; then
+    log "Skipping local terminal env router; using ENV_SERVER_URL=${ENV_SERVER_URL} WORKER_URLS=${WORKER_URLS}"
+  else
+    log "Skipping terminal env router; Agent-SafetyBench uses local env backend"
+  fi
 fi
 
 # ── Start ClawSentry gateway (L1-only, reward-only) ──────────────────
@@ -1616,7 +1632,11 @@ if [[ "${NVLINK_COUNT:-0}" -gt 0 ]]; then
 else
   HAS_NVLINK=0
 fi
-log "HAS_NVLINK=${HAS_NVLINK}"
+NCCL_NVLS_ENABLE="${NCCL_NVLS_ENABLE:-${HAS_NVLINK}}"
+NCCL_P2P_DISABLE="${NCCL_P2P_DISABLE:-0}"
+NCCL_IB_DISABLE="${NCCL_IB_DISABLE:-1}"
+export NCCL_NVLS_ENABLE NCCL_P2P_DISABLE NCCL_IB_DISABLE
+log "HAS_NVLINK=${HAS_NVLINK} NCCL_NVLS_ENABLE=${NCCL_NVLS_ENABLE} NCCL_P2P_DISABLE=${NCCL_P2P_DISABLE} NCCL_IB_DISABLE=${NCCL_IB_DISABLE}"
 
 # ── Dump run config ──────────────────────────────────────────────────
 cat > "${RUN_DIR}/config/run_config.json" <<CFGEOF
@@ -1967,7 +1987,9 @@ RUNTIME_ENV_JSON="{
     \"PYTHONUNBUFFERED\": \"1\",
     \"PYTHONFAULTHANDLER\": \"1\",
     \"CUDA_DEVICE_MAX_CONNECTIONS\": \"1\",
-    \"NCCL_NVLS_ENABLE\": \"${HAS_NVLINK}\",
+    \"NCCL_NVLS_ENABLE\": \"${NCCL_NVLS_ENABLE}\",
+    \"NCCL_P2P_DISABLE\": \"${NCCL_P2P_DISABLE}\",
+    \"NCCL_IB_DISABLE\": \"${NCCL_IB_DISABLE}\",
     \"SLIME_RAY_PLACEMENT_GPU_PROBE\": \"${SLIME_RAY_PLACEMENT_GPU_PROBE}\",
     \"SLIME_SKIP_ZERO_TRAINABLE_ROLLOUT\": \"${SLIME_SKIP_ZERO_TRAINABLE_ROLLOUT}\",
     \"SLIME_SKIP_ZERO_TRAINABLE_TRAIN\": \"${SLIME_SKIP_ZERO_TRAINABLE_TRAIN}\",
