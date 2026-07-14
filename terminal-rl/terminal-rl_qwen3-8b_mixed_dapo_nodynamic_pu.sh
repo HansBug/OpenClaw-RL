@@ -458,6 +458,10 @@ ENV_CLOSE_MAX_RETRIES="${ENV_CLOSE_MAX_RETRIES:-3}"
 ENV_EXEC_TOOL_MAX_RETRIES="${ENV_EXEC_TOOL_MAX_RETRIES:-3}"
 ENV_ALLOCATE_HTTP_TIMEOUT="${ENV_ALLOCATE_HTTP_TIMEOUT:-300}"
 ENV_RESET_HTTP_TIMEOUT="${ENV_RESET_HTTP_TIMEOUT:-2100}"
+ENV_RESET_MAX_RETRIES="${ENV_RESET_MAX_RETRIES:-1}"
+ENV_RESET_LEASE_MAX_ATTEMPTS="${ENV_RESET_LEASE_MAX_ATTEMPTS:-30}"
+ENV_RESET_LEASE_RETRY_BASE_SLEEP="${ENV_RESET_LEASE_RETRY_BASE_SLEEP:-15}"
+ENV_RESET_LEASE_RETRY_MAX_SLEEP="${ENV_RESET_LEASE_RETRY_MAX_SLEEP:-60}"
 ENV_CLOSE_HTTP_TIMEOUT="${ENV_CLOSE_HTTP_TIMEOUT:-90}"
 ENV_REMOTE_MAX_ACTIVE_TASKS="${ENV_REMOTE_MAX_ACTIVE_TASKS:-12}"
 ENV_REMOTE_MAX_ACTIVE_RUNS="${ENV_REMOTE_MAX_ACTIVE_RUNS:-0}"
@@ -465,6 +469,7 @@ ENV_REMOTE_MAX_RUNS_PER_TASK="${ENV_REMOTE_MAX_RUNS_PER_TASK:-8}"
 ENV_REMOTE_ADMISSION_TIMEOUT="${ENV_REMOTE_ADMISSION_TIMEOUT:-900}"
 ENV_REMOTE_ADMISSION_LOG_INTERVAL="${ENV_REMOTE_ADMISSION_LOG_INTERVAL:-30}"
 ENV_REMOTE_MAX_CONCURRENT_CLOSES="${ENV_REMOTE_MAX_CONCURRENT_CLOSES:-8}"
+EVAL_ROLLOUT_MAX_CONCURRENCY="${EVAL_ROLLOUT_MAX_CONCURRENCY:-0}"
 
 a3s_code_import_check() {
   mkdir -p "${RUN_LOG_DIR}"
@@ -1210,7 +1215,13 @@ if [[ -n "${WORKER_URLS}" ]]; then
   ALL_WORKER_HOSTS="$(echo "${WORKER_URLS}" | tr ',' '\n' \
     | sed -E 's#https?://([^:/]+).*#\1#' | tr '\n' ',' | sed 's/,$//')"
 fi
-export NO_PROXY="${NO_PROXY:-localhost,127.0.0.1,${MASTER_ADDR}${ALL_WORKER_HOSTS:+,${ALL_WORKER_HOSTS}}}"
+NO_PROXY_REQUIRED="localhost,127.0.0.1,${MASTER_ADDR}${ALL_WORKER_HOSTS:+,${ALL_WORKER_HOSTS}}"
+NO_PROXY_EXISTING="${NO_PROXY:-${no_proxy:-}}"
+if [[ -n "${NO_PROXY_EXISTING}" ]]; then
+  export NO_PROXY="${NO_PROXY_EXISTING},${NO_PROXY_REQUIRED}"
+else
+  export NO_PROXY="${NO_PROXY_REQUIRED}"
+fi
 export no_proxy="${NO_PROXY}"
 
 # Router uses `python3` which, after the PATH export above, resolves to
@@ -1281,11 +1292,30 @@ if [[ "${ROLLOUT_GENERATION_SKIP_ON_FAILURE}" == "1" ]]; then
   ROLLOUT_ARGS+=(--rollout-generation-skip-on-failure)
 fi
 
+EVAL_N_SAMPLES="${EVAL_N_SAMPLES:-16}"
+EVAL_MAX_RESPONSE_LEN="${EVAL_MAX_RESPONSE_LEN:-16384}"
+EVAL_TOP_P="${EVAL_TOP_P:-1}"
 EVAL_ARGS=(
-  --n-samples-per-eval-prompt 16
-  --eval-max-response-len 16384
-  --eval-top-p 1
+  --n-samples-per-eval-prompt "${EVAL_N_SAMPLES}"
+  --eval-max-response-len "${EVAL_MAX_RESPONSE_LEN}"
+  --eval-top-p "${EVAL_TOP_P}"
 )
+if [[ -n "${EVAL_PROMPT_DATA:-}" ]]; then
+  EVAL_DATASET_NAME="${EVAL_DATASET_NAME:-seta}"
+  EVAL_ARGS+=(--eval-prompt-data "${EVAL_DATASET_NAME}" "${EVAL_PROMPT_DATA}")
+fi
+if [[ -n "${EVAL_FUNCTION_PATH:-}" ]]; then
+  EVAL_ARGS+=(--eval-function-path "${EVAL_FUNCTION_PATH}")
+fi
+if [[ -n "${EVAL_TEMPERATURE:-}" ]]; then
+  EVAL_ARGS+=(--eval-temperature "${EVAL_TEMPERATURE}")
+fi
+if [[ -n "${EVAL_TOP_K:-}" ]]; then
+  EVAL_ARGS+=(--eval-top-k "${EVAL_TOP_K}")
+fi
+if [[ -n "${EVAL_MAX_CONTEXT_LEN:-}" ]]; then
+  EVAL_ARGS+=(--eval-max-context-len "${EVAL_MAX_CONTEXT_LEN}")
+fi
 
 PERF_ARGS=(
   --tensor-model-parallel-size "${TP_SIZE}"
@@ -1677,10 +1707,15 @@ cat > "${RUN_DIR}/config/run_config.json" <<CFGEOF
   "http_retry_log_response_chars": "${HTTP_RETRY_LOG_RESPONSE_CHARS}",
   "terminal_rl_generate_failure_traceback": "${TERMINAL_RL_GENERATE_FAILURE_TRACEBACK}",
   "env_reset_http_timeout": "${ENV_RESET_HTTP_TIMEOUT}",
+  "env_reset_max_retries": "${ENV_RESET_MAX_RETRIES}",
+  "env_reset_lease_max_attempts": "${ENV_RESET_LEASE_MAX_ATTEMPTS}",
+  "env_reset_lease_retry_base_sleep": "${ENV_RESET_LEASE_RETRY_BASE_SLEEP}",
+  "env_reset_lease_retry_max_sleep": "${ENV_RESET_LEASE_RETRY_MAX_SLEEP}",
   "env_close_http_timeout": "${ENV_CLOSE_HTTP_TIMEOUT}",
   "env_remote_max_active_tasks": "${ENV_REMOTE_MAX_ACTIVE_TASKS}",
   "env_remote_max_active_runs": "${ENV_REMOTE_MAX_ACTIVE_RUNS}",
   "env_remote_max_runs_per_task": "${ENV_REMOTE_MAX_RUNS_PER_TASK}",
+  "eval_rollout_max_concurrency": "${EVAL_ROLLOUT_MAX_CONCURRENCY}",
   "agent_safetybench_remote_env": "${AGENT_SAFETYBENCH_REMOTE_ENV}",
   "agentharm_remote_env": "${AGENTHARM_REMOTE_ENV}",
   "safety_reward_enable": "${CLAWSENTRY_NEEDED}",
@@ -1989,6 +2024,10 @@ RUNTIME_ENV_JSON="{
     \"ENV_EXEC_TOOL_MAX_RETRIES\": \"${ENV_EXEC_TOOL_MAX_RETRIES}\",
     \"ENV_ALLOCATE_HTTP_TIMEOUT\": \"${ENV_ALLOCATE_HTTP_TIMEOUT}\",
     \"ENV_RESET_HTTP_TIMEOUT\": \"${ENV_RESET_HTTP_TIMEOUT}\",
+    \"ENV_RESET_MAX_RETRIES\": \"${ENV_RESET_MAX_RETRIES}\",
+    \"ENV_RESET_LEASE_MAX_ATTEMPTS\": \"${ENV_RESET_LEASE_MAX_ATTEMPTS}\",
+    \"ENV_RESET_LEASE_RETRY_BASE_SLEEP\": \"${ENV_RESET_LEASE_RETRY_BASE_SLEEP}\",
+    \"ENV_RESET_LEASE_RETRY_MAX_SLEEP\": \"${ENV_RESET_LEASE_RETRY_MAX_SLEEP}\",
     \"ENV_CLOSE_HTTP_TIMEOUT\": \"${ENV_CLOSE_HTTP_TIMEOUT}\",
     \"ENV_REMOTE_MAX_ACTIVE_TASKS\": \"${ENV_REMOTE_MAX_ACTIVE_TASKS}\",
     \"ENV_REMOTE_MAX_ACTIVE_RUNS\": \"${ENV_REMOTE_MAX_ACTIVE_RUNS}\",
@@ -1996,6 +2035,7 @@ RUNTIME_ENV_JSON="{
     \"ENV_REMOTE_ADMISSION_TIMEOUT\": \"${ENV_REMOTE_ADMISSION_TIMEOUT}\",
     \"ENV_REMOTE_ADMISSION_LOG_INTERVAL\": \"${ENV_REMOTE_ADMISSION_LOG_INTERVAL}\",
     \"ENV_REMOTE_MAX_CONCURRENT_CLOSES\": \"${ENV_REMOTE_MAX_CONCURRENT_CLOSES}\",
+    \"EVAL_ROLLOUT_MAX_CONCURRENCY\": \"${EVAL_ROLLOUT_MAX_CONCURRENCY}\",
     \"AGENT_SAFETYBENCH_REMOTE_ENV\": \"${AGENT_SAFETYBENCH_REMOTE_ENV}\",
     \"AGENTHARM_REMOTE_ENV\": \"${AGENTHARM_REMOTE_ENV}\",
     \"NO_PROXY\": \"${NO_PROXY}\",
@@ -2172,6 +2212,7 @@ if [[ "${RUNTIME_ENV_XTRACE_WAS_ON}" == "1" ]]; then
 fi
 
 RAY_JOB_SUBMISSION_ID="${RAY_JOB_SUBMISSION_ID:-terminal_rl_8b_${NUM_GPUS}gpu_$(date +%Y%m%d_%H%M%S)}"
+SLIME_ENTRYPOINT="${SLIME_ENTRYPOINT:-${SLIME_DIR}/train_async.py}"
 CASE_STUDY_ON_EXIT="${CASE_STUDY_ON_EXIT:-0}"
 CASE_STUDY_ON_FAILURE="${CASE_STUDY_ON_FAILURE:-0}"
 CASE_STUDY_CONFIG="${CASE_STUDY_CONFIG:-${SCRIPT_DIR}/scripts/case_study_samples.yaml}"
@@ -2205,7 +2246,7 @@ ray job submit --address="http://${MASTER_ADDR}:8265" \
   --submission-id "${RAY_JOB_SUBMISSION_ID}" \
   --no-wait \
   --runtime-env-json="${RUNTIME_ENV_JSON}" \
-  -- "${TRAIN_PYTHON}" -u "${SLIME_DIR}/train_async.py" \
+  -- "${TRAIN_PYTHON}" -u "${SLIME_ENTRYPOINT}" \
   "${TRAIN_ARGS[@]}"
 if [[ "${RAY_SUBMIT_XTRACE_WAS_ON}" == "1" ]]; then
   set -x

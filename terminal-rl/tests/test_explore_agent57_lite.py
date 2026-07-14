@@ -255,6 +255,59 @@ def test_ucb_seta_can_use_raw_accuracy_for_normalized_base(monkeypatch):
     assert a57.assign_group_arms(1, dataset="seta") == [0]
 
 
+def test_ucb_quality_value_uses_outcome_aware_trunc_penalty(monkeypatch):
+    _reset_local_agent57_state()
+    monkeypatch.setenv("EXPLORE_AGENT57_LITE", "1")
+    monkeypatch.setenv("EXPLORE_AGENT57_CONTROLLER", "ucb")
+    monkeypatch.setenv("EXPLORE_AGENT57_K", "3")
+    monkeypatch.setenv("EXPLORE_AGENT57_LIFELONG_BACKEND", "local")
+    monkeypatch.setenv("EXPLORE_AGENT57_UCB_C", "0")
+    monkeypatch.setenv("EXPLORE_AGENT57_UCB_VALUE", "quality")
+    monkeypatch.setenv("EXPLORE_AGENT57_UCB_PARSE_PENALTY", "0.5")
+    monkeypatch.setenv("EXPLORE_AGENT57_UCB_TRUNC_PENALTY", "0.5")
+    monkeypatch.setenv("EXPLORE_AGENT57_KEEP_BASELINE", "0")
+    config = a57.config_from_env()
+
+    for arm_id, score, status in (
+        (0, 0.90, "truncated"),
+        (1, 0.60, "completed"),
+        (2, 0.40, "truncated"),
+    ):
+        a57.record_arm_event(
+            config=config,
+            arm_id=arm_id,
+            base_score=score,
+            final_score=score,
+            status=status,
+            parse_error_count=0,
+            bonus=0.0,
+            dataset="seta",
+            normalized_base_score=score,
+            success_score=score,
+        )
+
+    assert a57.assign_group_arms(3, dataset="seta") == [0, 1, 2]
+
+
+def test_ucb_can_skip_infra_failure_arm_events(monkeypatch):
+    _reset_local_agent57_state()
+    monkeypatch.setenv("EXPLORE_AGENT57_UCB_SKIP_INFRA_FAILURES", "1")
+
+    events = [
+        {"arm_id": 0, "normalized_base_score": 1.0, "infra_failure": 1.0, "dataset": "seta"},
+        {"arm_id": 1, "normalized_base_score": 0.5, "infra_failure": 0.0, "dataset": "seta"},
+    ]
+    stats = a57._aggregate_arm_stats(
+        2,
+        events,
+        dataset="seta",
+        skip_infra_failures=True,
+    )
+
+    assert stats[0]["n"] == 0.0
+    assert stats[1]["n"] == 1.0
+
+
 def test_ucb_random_seed_reproduces_tie_break_and_epsilon(monkeypatch):
     _reset_local_agent57_state()
     monkeypatch.setenv("EXPLORE_AGENT57_LITE", "1")
@@ -674,16 +727,17 @@ def test_sqlite_arm_event_schema_migration(tmp_path, monkeypatch):
         parse_error_count=0,
         bonus=0.0,
         dataset="seta",
+        infra_failure=True,
     )
 
     conn = sqlite3.connect(db_path)
     try:
         columns = {row[1] for row in conn.execute("PRAGMA table_info(arm_events)")}
         row = conn.execute(
-            "SELECT dataset, normalized_base_score FROM arm_events ORDER BY id DESC LIMIT 1"
+            "SELECT dataset, normalized_base_score, infra_failure FROM arm_events ORDER BY id DESC LIMIT 1"
         ).fetchone()
     finally:
         conn.close()
 
-    assert {"dataset", "normalized_base_score"}.issubset(columns)
-    assert row == ("seta", 1.0)
+    assert {"dataset", "normalized_base_score", "infra_failure"}.issubset(columns)
+    assert row == ("seta", 1.0, 1)

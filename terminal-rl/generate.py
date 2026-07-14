@@ -85,6 +85,11 @@ def _env_float(name: str, default: float) -> float:
         return default
 
 
+def _env_csv_set(name: str, default: str) -> set[str]:
+    raw = os.getenv(name, default)
+    return {part.strip() for part in raw.split(",") if part.strip()}
+
+
 async def _await_with_optional_timeout(awaitable, timeout: float, *, op_name: str):
     if timeout <= 0:
         return await awaitable
@@ -123,6 +128,71 @@ def _uses_remote_terminal_env(task_meta: Dict[str, Any] | None) -> bool:
         _uses_local_agent_safetybench_env(task_meta)
         or _uses_local_agentharm_env(task_meta)
     )
+
+
+def _http_exception_info(exc: BaseException) -> tuple[int | None, str | None, str, float | None]:
+    response = getattr(exc, "response", None)
+    status_code = getattr(response, "status_code", None)
+    text = ""
+    retry_after: float | None = None
+    if response is not None:
+        try:
+            text = str(getattr(response, "text", "") or "")
+        except Exception:
+            text = ""
+        try:
+            raw_retry_after = response.headers.get("Retry-After")
+            retry_after = float(raw_retry_after) if raw_retry_after else None
+        except Exception:
+            retry_after = None
+
+    code: str | None = None
+    if text:
+        try:
+            parsed = json.loads(text)
+            if isinstance(parsed, dict):
+                raw_code = parsed.get("code")
+                code = str(raw_code) if raw_code is not None else None
+        except Exception:
+            code = None
+    return status_code, code, text, retry_after
+
+
+def _reset_should_retry_with_new_lease(exc: BaseException) -> bool:
+    status_code, code, text, _ = _http_exception_info(exc)
+    combined = f"{code or ''} {text} {exc}"
+    non_retry_codes = _env_csv_set(
+        "ENV_RESET_LEASE_NON_RETRY_CODES",
+        "TASK_IMAGE_BLACKLISTED,TASK_BUILD_FAILED",
+    )
+    if code in non_retry_codes:
+        return False
+    if "TASK_IMAGE_BLACKLISTED" in combined or "TASK_BUILD_FAILED" in combined:
+        return False
+
+    retry_codes = _env_csv_set(
+        "ENV_RESET_LEASE_RETRY_CODES",
+        "DOCKER_IMAGE_PREP_BACKLOG,WORKER_RESET_ADMISSION_BACKLOG",
+    )
+    if code in retry_codes or any(marker in combined for marker in retry_codes):
+        return True
+
+    retry_statuses = set()
+    for item in _env_csv_set("ENV_RESET_LEASE_RETRY_STATUSES", "410,500,502,503,504"):
+        try:
+            retry_statuses.add(int(item))
+        except ValueError:
+            continue
+    return status_code in retry_statuses
+
+
+def _reset_retry_sleep_seconds(exc: BaseException, attempt: int) -> float:
+    _, _, _, retry_after = _http_exception_info(exc)
+    if retry_after is not None and retry_after >= 0:
+        return min(retry_after, _env_float("ENV_RESET_LEASE_RETRY_MAX_SLEEP", 60.0))
+    base = max(0.0, _env_float("ENV_RESET_LEASE_RETRY_BASE_SLEEP", 15.0))
+    max_sleep = max(base, _env_float("ENV_RESET_LEASE_RETRY_MAX_SLEEP", 60.0))
+    return min(max_sleep, base * max(1, attempt))
 
 
 _TASK_CIRCUIT: dict[str, dict[str, Any]] = {}
@@ -3032,9 +3102,6 @@ async def generate(
                 task_key,
                 log_tag=_log_tag,
             )
-        env_client, lease_id = await _create_env_client(
-            task_spec, run_ctx, task_meta=task_meta
-        )
         default_reset_http_timeout = (
             float(timeouts.ensure_image) + float(timeouts.reset_session) + 300.0
         )
@@ -3042,47 +3109,78 @@ async def generate(
             "ENV_RESET_HTTP_TIMEOUT",
             default_reset_http_timeout,
         )
-        reset_kwargs = {
-            "lease_id": lease_id,
-            "task_meta": task_meta,
-            "run_ctx": run_ctx_payload,
-            "task_timeouts": timeouts_payload,
-        }
-        if remote_env_admission_key is not None:
-            reset_kwargs["request_id"] = (
-                f"{task_key}:{run_ctx.uid}:{run_ctx.group_index}:"
-                f"{run_ctx.sample_index}:reset"
-            )
+        max_reset_lease_attempts = max(1, _env_int("ENV_RESET_LEASE_MAX_ATTEMPTS", 1))
+        reset_payload: dict[str, Any] | None = None
+        last_reset_exc: BaseException | None = None
 
-        # P0 FIX (corrected): Do NOT retry reset with same lease_id
-        # First principles: lease_id is a handle to server-side resource.
-        # After timeout, server has cleaned up the lease, making it invalid.
-        # Retrying with same lease_id causes "Unknown run_lease_id" errors.
-        # Correct approach: Fail fast, let outer retry loop allocate new lease.
-        reset_coro = env_client.reset(**reset_kwargs)
-        try:
-            reset_payload = await _await_with_optional_timeout(
-                reset_coro,
-                reset_http_timeout,
-                op_name=f"{_log_tag} env reset",
+        for reset_attempt in range(1, max_reset_lease_attempts + 1):
+            env_client, lease_id = await _create_env_client(
+                task_spec, run_ctx, task_meta=task_meta
             )
-        except (TimeoutError, asyncio.TimeoutError) as reset_exc:
-            # Reset failed: proactively close lease to prevent slot leak
-            logger.error(
-                "%s Reset failed after %.1fs, closing lease %s to prevent slot leak",
-                _log_tag,
-                reset_http_timeout,
-                lease_id,
-            )
-            try:
-                await env_client.close(lease_id)
-            except Exception as close_exc:
-                logger.debug(
-                    "%s Best-effort close after reset failure: %s",
-                    _log_tag,
-                    close_exc,
+            reset_kwargs = {
+                "lease_id": lease_id,
+                "task_meta": task_meta,
+                "run_ctx": run_ctx_payload,
+                "task_timeouts": timeouts_payload,
+            }
+            if remote_env_admission_key is not None:
+                reset_kwargs["request_id"] = (
+                    f"{task_key}:{run_ctx.uid}:{run_ctx.group_index}:"
+                    f"{run_ctx.sample_index}:reset:{reset_attempt}"
                 )
-            raise reset_exc
+
+            # Do not retry reset with the same lease_id. If the worker reports a
+            # transient backlog, it may already have closed that lease; retry by
+            # allocating a fresh lease while keeping this sample's local admission.
+            try:
+                reset_payload = await _await_with_optional_timeout(
+                    env_client.reset(**reset_kwargs),
+                    reset_http_timeout,
+                    op_name=f"{_log_tag} env reset",
+                )
+                break
+            except Exception as reset_exc:
+                last_reset_exc = reset_exc
+                should_retry = (
+                    _uses_remote_terminal_env(task_meta)
+                    and reset_attempt < max_reset_lease_attempts
+                    and not isinstance(reset_exc, (TimeoutError, asyncio.TimeoutError))
+                    and _reset_should_retry_with_new_lease(reset_exc)
+                )
+                logger.warning(
+                    "%s Reset attempt %d/%d failed for lease %s (%s: %s); retry_new_lease=%s",
+                    _log_tag,
+                    reset_attempt,
+                    max_reset_lease_attempts,
+                    lease_id,
+                    type(reset_exc).__name__,
+                    str(reset_exc)[:500],
+                    should_retry,
+                )
+                try:
+                    await env_client.close(lease_id)
+                except Exception as close_exc:
+                    logger.debug(
+                        "%s Best-effort close after reset failure lease=%s: %s",
+                        _log_tag,
+                        lease_id,
+                        close_exc,
+                    )
+                if not should_retry:
+                    raise
+                sleep_seconds = _reset_retry_sleep_seconds(reset_exc, reset_attempt)
+                logger.info(
+                    "%s Retrying reset with a fresh lease after %.1fs",
+                    _log_tag,
+                    sleep_seconds,
+                )
+                await asyncio.sleep(sleep_seconds)
+                env_client = None
+                lease_id = None
+
+        if reset_payload is None:
+            assert last_reset_exc is not None
+            raise last_reset_exc
         user_msg = str(reset_payload.get("user_msg", ""))
         raw_tools = list(reset_payload.get("tool_schemas", []))
         logger.info("%s Start terminal rollout", _log_tag)
@@ -3799,6 +3897,7 @@ async def generate(
                 dataset=data_source,
                 normalized_base_score=_agent57_normalized_score_mean,
                 success_score=_agent57_normalized_score_mean,
+                infra_failure=eval_error is not None,
             )
             for s in samples:
                 if isinstance(s.reward, dict) and "score" in s.reward:

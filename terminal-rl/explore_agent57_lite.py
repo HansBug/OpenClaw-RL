@@ -113,6 +113,9 @@ class Agent57LiteConfig:
     ucb_epsilon: float
     ucb_min_per_arm: int
     ucb_value: str
+    ucb_parse_penalty: float
+    ucb_trunc_penalty: float
+    ucb_skip_infra_failures: bool
     ucb_dataset_aware: bool
     ucb_random_seed: int | None
     ucb_seed_salt: str
@@ -202,7 +205,7 @@ def config_from_env() -> Agent57LiteConfig:
     if ngu_life_mod_mode not in {"linear", "standardized_softplus"}:
         ngu_life_mod_mode = "linear"
     ucb_value = os.getenv("EXPLORE_AGENT57_UCB_VALUE", "legacy").strip().lower()
-    if ucb_value not in {"legacy", "success", "base", "normalized_base"}:
+    if ucb_value not in {"legacy", "success", "base", "normalized_base", "quality", "quality_gate"}:
         ucb_value = "legacy"
     key_version = (
         os.getenv("EXPLORE_AGENT57_LIFELONG_KEY_VERSION", "v1").strip().lower()
@@ -240,6 +243,9 @@ def config_from_env() -> Agent57LiteConfig:
         ),
         ucb_min_per_arm=max(0, _env_int("EXPLORE_AGENT57_UCB_MIN_PER_ARM", 0)),
         ucb_value=ucb_value,
+        ucb_parse_penalty=max(0.0, _env_float("EXPLORE_AGENT57_UCB_PARSE_PENALTY", 0.5)),
+        ucb_trunc_penalty=max(0.0, _env_float("EXPLORE_AGENT57_UCB_TRUNC_PENALTY", 0.5)),
+        ucb_skip_infra_failures=_env_bool("EXPLORE_AGENT57_UCB_SKIP_INFRA_FAILURES", True),
         ucb_dataset_aware=_env_bool("EXPLORE_AGENT57_UCB_DATASET_AWARE", False),
         ucb_random_seed=(
             _env_optional_int("EXPLORE_AGENT57_UCB_RANDOM_SEED")
@@ -397,6 +403,12 @@ def _connect(
                     "arm_events",
                     "normalized_base_score",
                     "normalized_base_score REAL NOT NULL DEFAULT 0.0",
+                )
+                _ensure_column(
+                    conn,
+                    "arm_events",
+                    "infra_failure",
+                    "infra_failure INTEGER NOT NULL DEFAULT 0",
                 )
                 _SQLITE_SCHEMA_INITIALIZED.add(path_key)
     return conn
@@ -1330,6 +1342,9 @@ def compute_lifelong_bonus(
         "explore_agent57_ucb_epsilon": float(config.ucb_epsilon),
         "explore_agent57_ucb_min_per_arm": int(config.ucb_min_per_arm),
         "explore_agent57_ucb_value": config.ucb_value,
+        "explore_agent57_ucb_parse_penalty": float(config.ucb_parse_penalty),
+        "explore_agent57_ucb_trunc_penalty": float(config.ucb_trunc_penalty),
+        "explore_agent57_ucb_skip_infra_failures": bool(config.ucb_skip_infra_failures),
         "explore_agent57_ucb_dataset_aware": bool(config.ucb_dataset_aware),
         "explore_agent57_ucb_random_seed": (
             -1 if config.ucb_random_seed is None else int(config.ucb_random_seed)
@@ -1538,14 +1553,18 @@ def compute_ngu_lite_bonus(
 
 
 def _local_arm_stats(
-    k: int,
-    window: int,
+    config: Agent57LiteConfig,
     *,
     dataset: str | None = None,
 ) -> list[dict[str, float]]:
     with _LOCAL_LOCK:
-        events = list(_LOCAL_ARM_EVENTS[-window:])
-    return _aggregate_arm_stats(k, events, dataset=dataset)
+        events = list(_LOCAL_ARM_EVENTS[-config.ucb_window:])
+    return _aggregate_arm_stats(
+        config.k,
+        events,
+        dataset=dataset,
+        skip_infra_failures=config.ucb_skip_infra_failures,
+    )
 
 
 def _sqlite_arm_stats(
@@ -1562,14 +1581,14 @@ def _sqlite_arm_stats(
         if dataset:
             rows = conn.execute(
                 "SELECT arm_id, base_score, normalized_base_score, success, "
-                "parse_error, truncated, dataset FROM arm_events "
+                "parse_error, truncated, dataset, infra_failure FROM arm_events "
                 "WHERE dataset=? ORDER BY id DESC LIMIT ?",
                 (_normalize_dataset(dataset), config.ucb_window),
             ).fetchall()
         else:
             rows = conn.execute(
                 "SELECT arm_id, base_score, normalized_base_score, success, "
-                "parse_error, truncated, dataset FROM arm_events "
+                "parse_error, truncated, dataset, infra_failure FROM arm_events "
                 "ORDER BY id DESC LIMIT ?",
                 (config.ucb_window,),
             ).fetchall()
@@ -1584,10 +1603,16 @@ def _sqlite_arm_stats(
             "parse_error": float(row[4]),
             "truncated": float(row[5]),
             "dataset": str(row[6] or ""),
+            "infra_failure": float(row[7] or 0.0),
         }
         for row in rows
     ]
-    return _aggregate_arm_stats(config.k, events, dataset=dataset)
+    return _aggregate_arm_stats(
+        config.k,
+        events,
+        dataset=dataset,
+        skip_infra_failures=config.ucb_skip_infra_failures,
+    )
 
 
 def _aggregate_arm_stats(
@@ -1595,6 +1620,7 @@ def _aggregate_arm_stats(
     events: list[dict[str, Any]],
     *,
     dataset: str | None = None,
+    skip_infra_failures: bool = False,
 ) -> list[dict[str, float]]:
     target_dataset = _normalize_dataset(dataset) if dataset else ""
     stats = [
@@ -1605,11 +1631,15 @@ def _aggregate_arm_stats(
             "success_sum": 0.0,
             "parse_sum": 0.0,
             "trunc_sum": 0.0,
+            "infra_sum": 0.0,
         }
         for _ in range(k)
     ]
     for event in events:
         if target_dataset and _normalize_dataset(event.get("dataset")) != target_dataset:
+            continue
+        infra_failure = _finite_float(event.get("infra_failure", 0.0))
+        if skip_infra_failures and infra_failure > 0.0:
             continue
         arm_id = int(event.get("arm_id", 0)) % k
         row = stats[arm_id]
@@ -1621,6 +1651,7 @@ def _aggregate_arm_stats(
         row["success_sum"] += _finite_float(event.get("success", 0.0))
         row["parse_sum"] += _finite_float(event.get("parse_error", 0.0))
         row["trunc_sum"] += _finite_float(event.get("truncated", 0.0))
+        row["infra_sum"] += infra_failure
     return stats
 
 
@@ -1702,7 +1733,7 @@ def _ucb_scores(
         stats = (
             _sqlite_arm_stats(config, dataset=target_dataset)
             if config.lifelong_backend == "sqlite"
-            else _local_arm_stats(config.k, config.ucb_window, dataset=target_dataset)
+            else _local_arm_stats(config, dataset=target_dataset)
         )
     except Exception:
         stats = _aggregate_arm_stats(config.k, [], dataset=target_dataset)
@@ -1718,14 +1749,19 @@ def _ucb_scores(
             mean_normalized_base = row["normalized_base_sum"] / n
             parse_rate = row["parse_sum"] / n
             trunc_rate = row["trunc_sum"] / n
+            parse_penalty = config.ucb_parse_penalty * parse_rate
+            trunc_penalty = config.ucb_trunc_penalty * trunc_rate
             if config.ucb_value == "success":
-                value = mean_success - 0.5 * parse_rate - 0.5 * trunc_rate
+                value = mean_success - parse_penalty - trunc_penalty
             elif config.ucb_value == "base":
-                value = mean_base - 0.5 * parse_rate - 0.5 * trunc_rate
+                value = mean_base - parse_penalty - trunc_penalty
             elif config.ucb_value == "normalized_base":
-                value = mean_normalized_base - 0.5 * parse_rate - 0.5 * trunc_rate
+                value = mean_normalized_base - parse_penalty - trunc_penalty
+            elif config.ucb_value in {"quality", "quality_gate"}:
+                outcome_aware_trunc_penalty = trunc_penalty * (1.0 - mean_normalized_base)
+                value = mean_normalized_base - parse_penalty - outcome_aware_trunc_penalty
             else:
-                value = mean_success + 0.25 * mean_base - 0.5 * parse_rate - 0.5 * trunc_rate
+                value = mean_success + 0.25 * mean_base - parse_penalty - trunc_penalty
             score = value + config.ucb_c * math.sqrt(math.log(total + 1.0) / n)
         scored.append((score, arm_id))
     return _rank_ucb_scores(config, scored)
@@ -1778,6 +1814,7 @@ def record_arm_event(
     dataset: str | None = None,
     normalized_base_score: float | None = None,
     success_score: float | None = None,
+    infra_failure: bool = False,
 ) -> None:
     if not config.active:
         return
@@ -1810,6 +1847,7 @@ def record_arm_event(
         "success": float(success),
         "parse_error": float(1 if parse_error_count > 0 else 0),
         "truncated": float(truncated),
+        "infra_failure": float(1 if infra_failure else 0),
         "bonus": shaped_bonus,
         "dataset": dataset_name,
     }
@@ -1824,8 +1862,8 @@ def record_arm_event(
                 conn.execute(
                     "INSERT INTO arm_events"
                     "(ts, arm_id, base_score, normalized_base_score, final_score, "
-                    "success, parse_error, truncated, bonus, dataset) "
-                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    "success, parse_error, truncated, infra_failure, bonus, dataset) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                     (
                         time.time(),
                         int(event["arm_id"]),
@@ -1835,6 +1873,7 @@ def record_arm_event(
                         int(event["success"]),
                         int(event["parse_error"]),
                         int(event["truncated"]),
+                        int(event["infra_failure"]),
                         event["bonus"],
                         event["dataset"],
                     ),
