@@ -17,7 +17,6 @@ for path in (str(TERMINAL_RL_ROOT), str(REPO_ROOT), str(SLIME_ROOT)):
 from agent_runner import AgentRunner
 from env_client import TerminalEnvClient
 from remote.tau2_env import Tau2Env
-from tau2_debug import forced_text_first_message
 
 
 class DummyRolloutAgent:
@@ -164,43 +163,6 @@ def test_tau2_env_recognizes_hash_stop_message():
     )
 
     assert Tau2Env._is_stop_message(message) is True
-
-
-def test_forced_text_first_message_only_applies_to_tau2_non_solo_turn_zero(monkeypatch):
-    monkeypatch.setenv("TAU2_FORCE_TEXT_FIRST", "1")
-
-    assert forced_text_first_message(
-        data_source="tau2",
-        conversation_mode="non_solo",
-        turn_idx=0,
-    )
-    assert forced_text_first_message(
-        data_source="tau2",
-        conversation_mode="solo",
-        turn_idx=0,
-    ) is None
-    assert forced_text_first_message(
-        data_source="agentharm",
-        conversation_mode="non_solo",
-        turn_idx=0,
-    ) is None
-    assert forced_text_first_message(
-        data_source="tau2",
-        conversation_mode="non_solo",
-        turn_idx=1,
-    ) is None
-
-
-def test_forced_text_first_message_honors_custom_prompt(monkeypatch):
-    monkeypatch.setenv("TAU2_FORCE_TEXT_FIRST", "1")
-    monkeypatch.setenv("TAU2_FORCE_TEXT_FIRST_MESSAGE", "Please hold on while I confirm one detail.")
-
-    assert forced_text_first_message(
-        data_source="tau2",
-        conversation_mode="non_solo",
-        turn_idx=0,
-    ) == "Please hold on while I confirm one detail."
-
 
 def test_tau2_env_uses_local_openai_compatible_user_llm_defaults(monkeypatch):
     monkeypatch.delenv("TAU2_USER_LLM", raising=False)

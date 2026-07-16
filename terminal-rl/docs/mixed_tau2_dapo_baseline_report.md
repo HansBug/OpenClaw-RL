@@ -32,7 +32,7 @@ runs/terminal-rl_qwen3-8b_2gpu_mixed_tau2_dapo_nodynamic_think_s7_tau21_ah1_asb1
 | `seta` | Terminal-Bench / SETA capability tasks | Docker terminal env + task tests / shaped reward |
 | `safety` | Agent-SafetyBench tasks | ASB mock env + safety reward |
 | `agentharm` | AgentHarm safety tasks | AgentHarm adapter + direct score |
-| `tau2` | tau2-bench solo-compatible tasks | tau2 env + tau2 evaluator |
+| `tau2` | tau2-bench tasks，支持 solo / non-solo 两种交互模式 | tau2 env + tau2 evaluator / user simulator |
 | `mixed` | 多数据源混合训练 | 按比例拼接上述数据源 |
 
 当前 mixed baseline 的默认比例是：
@@ -78,7 +78,26 @@ tau2_solo_mode
 terminal-rl/dataset/tau2_telecom_train_solo
 ```
 
-### 3.2 AgentHarm 数据转换
+### 3.2 tau2 两种交互模式
+
+tau2 在当前接入中支持两种模式：
+
+| 模式 | 交互方式 | 是否使用用户模拟器 | 适用场景 |
+|---|---|---|---|
+| `solo` | ticket / instruction 一次性给到 agent，agent 只能通过工具和最终回复完成任务 | 否 | 更接近单轮 benchmark / 训练数据构造，链路简单、速度更稳定 |
+| `non_solo` | agent 的普通文本回复会传回 tau2 `UserSimulator`，由模拟用户继续生成下一轮 user message | 是 | 更接近真实客服 / 助手交互，可测试澄清、追问和多轮用户反馈 |
+
+本次 mixed DAPO baseline 使用的数据目录名仍是 `tau2_telecom_train_solo`，含义是这些样本是按 solo-compatible 的方式转换成 Terminal-RL JSONL；训练 run 中实际交互模式由 `TAU2_MODE` 或样本 metadata 中的 `tau2_mode` 决定。
+
+当前 PR 已经接入 non-solo 所需的用户模拟链路：
+
+```text
+assistant text reply -> /agent_reply -> Tau2Env.handle_agent_reply -> UserSimulator -> env_user_message
+```
+
+也就是说，`TAU2_MODE=non_solo` 时会用到 tau2 的用户模拟器；`TAU2_MODE=solo` 时不会调用用户模拟器。本报告对应的 mixed baseline 主要关注训练数据和 reward 结果，数据构造仍以 solo-compatible JSONL 为基础。
+
+### 3.3 AgentHarm 数据转换
 
 AgentHarm 数据由脚本在需要时自动检查 / 转换，转换后的目录为：
 
@@ -88,7 +107,7 @@ terminal-rl/dataset/agentharm_convert
 
 其中包含 train / validation / test_public 的 harmful、benign 和 chat 格式数据。
 
-### 3.3 mixed 数据拼接
+### 3.4 mixed 数据拼接
 
 当 `DATASET=mixed` 时，脚本会按配置比例组合以下数据源：
 

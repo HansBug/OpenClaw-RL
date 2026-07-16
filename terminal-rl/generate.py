@@ -33,7 +33,6 @@ from custom_types import (
 from inference_client import SGLangTurnClient
 from agent_runner import create_agent_runner, normalize_harness_option
 from env_client import TerminalEnvClient
-from tau2_debug import forced_text_first_message
 from agent57_episodic_memory import create_episodic_memory_backend
 from explore_agent57_lite import (
     coarse_observation_fingerprint as _agent57_coarse_observation_fingerprint,
@@ -3236,52 +3235,6 @@ async def generate(
                 logger.warning("%s Rollout context is empty; aborting loop.", _log_tag)
                 break
 
-            debug_forced_text = forced_text_first_message(
-                data_source=task_meta.get("data_source"),
-                conversation_mode=tau2_conversation_mode,
-                turn_idx=len(turn_records),
-            )
-            if (
-                debug_forced_text
-                and env_client is not None
-                and lease_id is not None
-            ):
-                follow_up = await env_client.agent_reply(
-                    lease_id,
-                    debug_forced_text,
-                )
-                follow_up_message = str(follow_up.get("user_message", "") or "").strip()
-                current_turn_record: dict[str, Any] = {
-                    "turn_idx": len(turn_records),
-                    "harness_option": agent_type,
-                    "context_messages": context_result.context_messages,
-                    "assistant_output": debug_forced_text,
-                    "forced_assistant_text": debug_forced_text,
-                    "finish_reason": "forced_debug_follow_up",
-                    "latency_ms": 0.0,
-                    "n_input_tokens": 0,
-                    "n_output_tokens": 0,
-                    "parse_error_recorded": False,
-                    "tool_calls": [],
-                }
-                if follow_up.get("continue") and follow_up_message:
-                    logger.info(
-                        "%s Turn %d: forced tau2 non-solo pre-turn debug path.",
-                        _log_tag,
-                        len(turn_records),
-                    )
-                    current_turn_record["env_user_message"] = follow_up_message
-                    turn_records.append(current_turn_record)
-                    agent_runner.record_user_message(follow_up_message)
-                    if agent_runner.reached_iteration_limit():
-                        logger.warning(
-                            "%s Max iterations (%d) reached after forced non-solo follow-up.",
-                            _log_tag,
-                            agent_runner.max_iterations,
-                        )
-                        reached_iteration_limit = True
-                        break
-                    continue
 
             turn_state: TurnResult = await agent_runner.run_model_turn(
                 context_result.context_messages

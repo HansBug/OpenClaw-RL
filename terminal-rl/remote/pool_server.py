@@ -3511,6 +3511,15 @@ async def exec_tool(request: Request) -> JSONResponse:
 
 @app.post("/agent_reply")
 async def agent_reply(request: Request) -> JSONResponse:
+    """Handle a non-tool assistant reply for an active environment lease.
+
+    Args:
+        request: FastAPI request containing ``lease_id`` and ``assistant_text``.
+
+    Returns:
+        JSON response with ``ok=True`` and the environment follow-up payload, or
+        an error response when the pool is unavailable or the payload is invalid.
+    """
     if POOL is None:
         return JSONResponse(
             {"ok": False, "error": "Pool is not initialized"}, status_code=500
