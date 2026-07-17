@@ -52,7 +52,7 @@ from safety_reward import (
 
 logger = logging.getLogger(__name__)
 
-_DIRECT_SCORE_DATA_SOURCES = {"agent_safetybench", "agentharm"}
+_DIRECT_SCORE_DATA_SOURCES = {"agent_safetybench", "agentharm", "tau2"}
 _AGENT57_CONFIG = _agent57_config_from_env()
 
 
@@ -118,10 +118,19 @@ def _uses_local_agentharm_env(task_meta: Dict[str, Any] | None) -> bool:
     )
 
 
+def _uses_local_tau2_env(task_meta: Dict[str, Any] | None) -> bool:
+    return (
+        isinstance(task_meta, dict)
+        and task_meta.get("data_source") == "tau2"
+        and os.getenv("TAU2_REMOTE_ENV", "0") != "1"
+    )
+
+
 def _uses_remote_terminal_env(task_meta: Dict[str, Any] | None) -> bool:
     return not (
         _uses_local_agent_safetybench_env(task_meta)
         or _uses_local_agentharm_env(task_meta)
+        or _uses_local_tau2_env(task_meta)
     )
 
 
@@ -2676,6 +2685,13 @@ def _normalize_tool_schemas(raw_tools: List[Any]) -> List[Dict[str, Any]]:
     return schemas
 
 
+def _normalize_tau2_conversation_mode(raw_mode: Any) -> str:
+    mode = str(raw_mode or "solo").strip().lower()
+    if mode in {"non_solo", "nonsolo", "non-solo"}:
+        return "non_solo"
+    return "solo"
+
+
 class _LocalAgentSafetyBenchClient:
     def __init__(self) -> None:
         from remote.agent_safetybench_env import AgentSafetyBenchEnv
@@ -2776,6 +2792,66 @@ class _LocalAgentHarmClient:
         await self._env.close()
 
 
+class _LocalTau2Client:
+    def __init__(self) -> None:
+        from remote.tau2_env import Tau2Env
+
+        self._env = Tau2Env()
+        self.last_evaluate_details: dict[str, Any] | None = None
+
+    async def reset(
+        self,
+        lease_id: str,
+        task_meta: dict[str, Any],
+        run_ctx: dict[str, Any],
+        task_timeouts: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        _ = (lease_id, task_timeouts)
+        local_run_ctx = RunContext(
+            uid=str(run_ctx.get("uid", "local")),
+            group_index=int(run_ctx.get("group_index", 0) or 0),
+            sample_index=int(run_ctx.get("sample_index", 0) or 0),
+            log_dir=Path(str(run_ctx.get("log_dir", "build_outputs"))),
+        )
+        user_msg, tool_schemas = await self._env.reset(
+            task_meta=task_meta,
+            task_spec=_make_task_spec(task_meta),
+            run_ctx=local_run_ctx,
+        )
+        return {
+            "user_msg": user_msg,
+            "tool_schemas": tool_schemas,
+            "conversation_mode": _normalize_tau2_conversation_mode(
+                task_meta.get("tau2_mode")
+            ),
+        }
+
+    async def heartbeat(self, lease_id: str) -> None:
+        _ = lease_id
+
+    async def exec_tool(
+        self, lease_id: str, tool_name: str, arguments: dict[str, Any]
+    ) -> str:
+        _ = lease_id
+        return await self._env.exec_tool(tool_name, arguments)
+
+    async def agent_reply(self, lease_id: str, assistant_text: str) -> dict[str, Any]:
+        _ = lease_id
+        return await self._env.handle_agent_reply(assistant_text)
+
+    async def evaluate(
+        self, lease_id: str, trajectory: dict[str, Any] | None = None
+    ) -> float:
+        _ = lease_id
+        score = await self._env.evaluate(trajectory)
+        self.last_evaluate_details = getattr(self._env, "_last_eval", None)
+        return score
+
+    async def close(self, lease_id: str) -> None:
+        _ = lease_id
+        await self._env.close()
+
+
 async def _create_env_client(
     task_spec: TaskSpec,
     run_ctx: RunContext,
@@ -2796,6 +2872,14 @@ async def _create_env_client(
             task_spec.task_path,
         )
         return _LocalAgentHarmClient(), "local-agentharm"
+
+    if _uses_local_tau2_env(task_meta):
+        logger.info(
+            "Using local tau2 env backend for task=%s path=%s",
+            task_spec.task_name,
+            task_spec.task_path,
+        )
+        return _LocalTau2Client(), "local-tau2"
 
     env_server_url = os.getenv("ENV_SERVER_URL", "")
     if not env_server_url:
@@ -3088,6 +3172,9 @@ async def generate(
         logger.info("%s Start terminal rollout", _log_tag)
 
         tool_schemas = _normalize_tool_schemas(raw_tools)
+        tau2_conversation_mode = _normalize_tau2_conversation_mode(
+            task_meta.get("tau2_mode") or os.getenv("TAU2_MODE", "solo")
+        )
         agent_type = normalize_harness_option(
             getattr(args, "harness_option", None)
             or getattr(args, "terminal_agent_type", None)
@@ -3214,6 +3301,7 @@ async def generate(
             if context_result.context_messages is None:
                 logger.warning("%s Rollout context is empty; aborting loop.", _log_tag)
                 break
+
 
             turn_state: TurnResult = await agent_runner.run_model_turn(
                 context_result.context_messages
@@ -3403,6 +3491,31 @@ async def generate(
                     final_model_response = turn_state.model_response
                     break
                 continue
+
+            if (
+                task_meta.get("data_source") == "tau2"
+                and tau2_conversation_mode == "non_solo"
+                and env_client is not None
+                and lease_id is not None
+            ):
+                follow_up = await env_client.agent_reply(
+                    lease_id,
+                    interaction.output_text or "",
+                )
+                follow_up_message = str(follow_up.get("user_message", "") or "").strip()
+                if follow_up.get("continue") and follow_up_message:
+                    agent_runner.record_user_message(follow_up_message)
+                    current_turn_record["env_user_message"] = follow_up_message
+                    if agent_runner.reached_iteration_limit():
+                        logger.warning(
+                            "%s Max iterations (%d) reached after non-solo follow-up.",
+                            _log_tag,
+                            agent_runner.max_iterations,
+                        )
+                        reached_iteration_limit = True
+                        final_model_response = turn_state.model_response
+                        break
+                    continue
 
             final_model_response = turn_state.model_response
             break

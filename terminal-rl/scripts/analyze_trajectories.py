@@ -103,6 +103,72 @@ def build_record(sub_dir: Path, d: dict[str, Any], cls: str) -> dict[str, Any]:
     }
 
 
+def detect_tau2_conversation_mode(d: dict[str, Any]) -> str | None:
+    turns = d.get("turns") or []
+    for turn in turns:
+        for msg in turn.get("context_messages") or []:
+            if msg.get("role") != "user":
+                continue
+            content = str(msg.get("content") or "")
+            if "tau2-bench task in non-solo mode" in content:
+                return "non_solo"
+            if "tau2-bench task in solo mode" in content:
+                return "solo"
+    return None
+
+
+def build_tau2_non_solo_record(sub_dir: Path, d: dict[str, Any], cls: str) -> dict[str, Any] | None:
+    info = d.get("info", {})
+    task_name = str(info.get("task_name") or "")
+    if not task_name.startswith("tau2_"):
+        return None
+
+    conversation_mode = detect_tau2_conversation_mode(d)
+    turns = d.get("turns") or []
+    env_user_message_turns = [
+        turn.get("turn_idx")
+        for turn in turns
+        if turn.get("env_user_message")
+    ]
+    tool_name_sequence = [
+        tool_call.get("tool_name")
+        for turn in turns
+        for tool_call in (turn.get("tool_calls") or [])
+        if tool_call.get("tool_name")
+    ]
+
+    return {
+        "dir": sub_dir.name,
+        "task_name": info.get("task_name"),
+        "uid": info.get("uid"),
+        "status": str(info.get("status", "")).split(".")[-1],
+        "class": cls,
+        "conversation_mode": conversation_mode,
+        "has_env_user_message": bool(env_user_message_turns),
+        "env_user_message_turns": env_user_message_turns,
+        "n_env_user_messages": len(env_user_message_turns),
+        "tool_name_sequence": tool_name_sequence,
+    }
+
+
+def summarize_tau2_non_solo(records: list[dict[str, Any]], samples_per_class: int) -> dict[str, Any]:
+    non_solo_records = [record for record in records if record.get("conversation_mode") == "non_solo"]
+    with_env_user_message = [
+        record for record in non_solo_records if record.get("has_env_user_message")
+    ]
+    without_env_user_message = [
+        record for record in non_solo_records if not record.get("has_env_user_message")
+    ]
+    return {
+        "n_tau2_trajectories": len(records),
+        "n_non_solo_trajectories": len(non_solo_records),
+        "n_non_solo_with_env_user_message": len(with_env_user_message),
+        "n_non_solo_without_env_user_message": len(without_env_user_message),
+        "sample_non_solo_with_env_user_message": with_env_user_message[:samples_per_class],
+        "sample_non_solo_without_env_user_message": without_env_user_message[:samples_per_class],
+    }
+
+
 def format_score(v: Any) -> str:
     try:
         return f"{float(v):.3f}"
@@ -125,6 +191,7 @@ def render_markdown(
     policy_counter: Counter,
     save_reason_counter: Counter,
     max_iter_hint: int,
+    tau2_non_solo_summary: dict[str, Any] | None,
 ) -> str:
     desc = dict(CLASS_DESCRIPTIONS)
     desc["truncated"] = f"🟡 触顶 max_iteration={max_iter_hint} 被截断"
@@ -163,6 +230,47 @@ def render_markdown(
             lines.append("")
             for reason, count in save_reason_counter.most_common():
                 lines.append(f"- `{reason}`: {count}")
+            lines.append("")
+
+    if tau2_non_solo_summary and tau2_non_solo_summary.get("n_tau2_trajectories"):
+        lines.append("## tau2 non-solo 触发情况")
+        lines.append("")
+        lines.append(
+            f"- tau2 轨迹数：**{tau2_non_solo_summary['n_tau2_trajectories']}**"
+        )
+        lines.append(
+            f"- non-solo 轨迹数：**{tau2_non_solo_summary['n_non_solo_trajectories']}**"
+        )
+        lines.append(
+            f"- 真正触发 `env_user_message` 的 non-solo 轨迹：**{tau2_non_solo_summary['n_non_solo_with_env_user_message']}**"
+        )
+        lines.append(
+            f"- 没触发 follow-up user message 的 non-solo 轨迹：**{tau2_non_solo_summary['n_non_solo_without_env_user_message']}**"
+        )
+        lines.append("")
+        with_env = tau2_non_solo_summary.get("sample_non_solo_with_env_user_message") or []
+        if with_env:
+            lines.append("### 已触发 follow-up user message 的样本")
+            lines.append("")
+            lines.append("| dir | task | status | env_user_message_turns |")
+            lines.append("|---|---|---|---|")
+            for rec in with_env:
+                turns = ",".join(str(turn_idx) for turn_idx in rec["env_user_message_turns"])
+                lines.append(
+                    f"| `{rec['dir']}` | {rec['task_name']} | {rec['status']} | {turns} |"
+                )
+            lines.append("")
+        without_env = tau2_non_solo_summary.get("sample_non_solo_without_env_user_message") or []
+        if without_env:
+            lines.append("### 未触发 follow-up user message 的样本")
+            lines.append("")
+            lines.append("| dir | task | status | tools |")
+            lines.append("|---|---|---|---|")
+            for rec in without_env:
+                tools = ",".join(rec["tool_name_sequence"][:5])
+                lines.append(
+                    f"| `{rec['dir']}` | {rec['task_name']} | {rec['status']} | {tools} |"
+                )
             lines.append("")
     lines.append("## 分类统计")
     lines.append("")
@@ -321,6 +429,7 @@ def analyze(
 
     by_class: dict[str, list] = defaultdict(list)
     all_records: list[dict[str, Any]] = []
+    tau2_records: list[dict[str, Any]] = []
     err_counter: Counter = Counter()
 
     print(f"[+] scanning {traj_dir}")
@@ -345,6 +454,9 @@ def analyze(
         rec = build_record(sub, d, cls)
         by_class[cls].append(rec)
         all_records.append(rec)
+        tau2_record = build_tau2_non_solo_record(sub, d, cls)
+        if tau2_record is not None:
+            tau2_records.append(tau2_record)
 
     print(f"[+] total trajectories: {n}")
     print("[+] class distribution:")
@@ -387,6 +499,7 @@ def analyze(
         task for task, steps in task_steps.items()
         if len({step for step in steps if step != "na"}) > 1
     }
+    tau2_non_solo_summary = summarize_tau2_non_solo(tau2_records, samples_per_class)
 
     report = {
         "run_dir": str(run_dir),
@@ -408,6 +521,7 @@ def analyze(
         "trajectory_save_policy_distribution": dict(policy_counter),
         "trajectory_save_reason_distribution": dict(save_reason_counter),
         "parse_errors": dict(err_counter),
+        "tau2_non_solo_summary": tau2_non_solo_summary,
     }
 
     json_path = out_dir / "trajectory_classification.json"
@@ -428,6 +542,7 @@ def analyze(
         policy_counter=policy_counter,
         save_reason_counter=save_reason_counter,
         max_iter_hint=max_iter_hint,
+        tau2_non_solo_summary=tau2_non_solo_summary,
     )
     md_path = out_dir / "case_analysis.md"
     md_path.write_text(md)

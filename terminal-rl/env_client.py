@@ -142,6 +142,19 @@ class TerminalEnvClient:
             raise RuntimeError(f"exec_tool failed: {out}")
         return str(out.get("observation", ""))
 
+    async def agent_reply(self, lease_id: str, assistant_text: str) -> dict[str, Any]:
+        out = await post(
+            f"{self.base_url}/agent_reply",
+            {"lease_id": lease_id, "assistant_text": assistant_text},
+            max_retries=self.default_max_retries,
+        )
+        if not out.get("ok", False):
+            raise RuntimeError(f"agent_reply failed: {out}")
+        return {
+            "continue": bool(out.get("continue", False)),
+            "user_message": str(out.get("user_message", "") or ""),
+        }
+
     async def evaluate(
         self, lease_id: str, trajectory: dict[str, Any] | None = None
     ) -> float:
