@@ -48,6 +48,17 @@ REPO_ROOT="$(cd -- "${SCRIPT_DIR}/../.." &>/dev/null && pwd)"
 
 log() { echo "[$(date +'%F %T')] $*"; }
 
+docker_network_rm_safe() {
+    local timeout_s="$1"
+    if ! command -v flock >/dev/null 2>&1; then
+        log "  WARN: flock is unavailable; skipping unsafe Docker network removal"
+        return 0
+    fi
+    flock -w "${timeout_s}" "${DOCKER_NETWORK_LIFECYCLE_LOCK}" \
+        xargs -r -n 20 timeout "${timeout_s}" docker network rm \
+        >/dev/null 2>&1 || true
+}
+
 detect_docker_data_root() {
     local detected=""
     if [[ -n "${DOCKER_DATA_ROOT:-}" ]]; then
@@ -109,6 +120,7 @@ SKIP_PREFLIGHT_CLEANUP="${SKIP_PREFLIGHT_CLEANUP:-0}"
 PREFLIGHT_KILL_ORPHAN_RUNNING="${PREFLIGHT_KILL_ORPHAN_RUNNING:-1}"
 FINAL_DOCKER_CLEANUP="${FINAL_DOCKER_CLEANUP:-1}"
 FINAL_DOCKER_CLEANUP_TIMEOUT="${FINAL_DOCKER_CLEANUP_TIMEOUT:-90}"
+DOCKER_NETWORK_LIFECYCLE_LOCK="${DOCKER_NETWORK_LIFECYCLE_LOCK:-/tmp/openclaw_docker_network_lifecycle.lock}"
 POOL_SERVER_SHUTDOWN_GRACE="${POOL_SERVER_SHUTDOWN_GRACE:-60}"
 PROXY_ENV_FILE="${PROXY_ENV_FILE:-/etc/seta_build_proxy.env}"
 SKIP_PROXY_ENV="${SKIP_PROXY_ENV:-0}"
@@ -366,7 +378,7 @@ cleanup_stopped_pool_objects() {
     log "  Docker cleanup (${reason}): owned dangling networks=${count:-0} namespace=${TERMINAL_RL_POOL_NAMESPACE}"
     if [[ "${count:-0}" -gt 0 ]] 2>/dev/null; then
         printf '%s\n' "${ids}" \
-            | xargs -r -n 20 timeout "${FINAL_DOCKER_CLEANUP_TIMEOUT}" docker network rm >/dev/null 2>&1 || true
+            | docker_network_rm_safe "${FINAL_DOCKER_CLEANUP_TIMEOUT}"
     fi
 }
 

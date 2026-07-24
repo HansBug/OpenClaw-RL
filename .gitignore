@@ -15,6 +15,9 @@ a3s-code-adapter/docs/
 terminal-rl/dataset/swesmith_convert/
 terminal-rl/dataset/swesmith_env/
 terminal-rl/dataset/swesmith_smoke/
+terminal-rl/dataset/sweverified_convert/
+terminal-rl/dataset/sweverified_env/
+terminal-rl/dataset/.sweverified_artifact.lock
 
 
 # Byte-compiled / optimized / DLL files

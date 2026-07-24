@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import fcntl
 import json
 import logging
 import os
@@ -11,6 +12,7 @@ import inspect
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
 from functools import partial
 from pathlib import Path
 from typing import Any
@@ -28,6 +30,7 @@ from ..custom_types import RunContext, TaskSpec, TaskTimeouts
 from .agentharm_env import AgentHarmEnv
 from .agent_safetybench_env import AgentSafetyBenchEnv
 from .docker_compose_utils import compose_up_no_build, prepare_task_docker_image
+from .swe_task_utils import build_swe_user_message, is_swe_task_path
 
 logger = logging.getLogger("terminal.env.worker.terminal_env")
 logger.setLevel(logging.INFO)
@@ -39,6 +42,26 @@ _TEST_EXIT_CODE_RE = re.compile(r"__TERMINAL_RL_TEST_EXIT_CODE__=(\d+)\b")
 _GIT_COMMIT_RE = re.compile(r"^[0-9a-fA-F]{40,64}$")
 _POOL_NAMESPACE_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,62}$")
 _DOCKER_CLEANUP_EXECUTOR: ThreadPoolExecutor | None = None
+
+
+@contextmanager
+def _docker_network_lifecycle_lock():
+    """Serialize Compose network start/stop with host watchdog pruning."""
+
+    lock_path = Path(
+        os.getenv(
+            "DOCKER_NETWORK_LIFECYCLE_LOCK",
+            "/tmp/openclaw_docker_network_lifecycle.lock",
+        )
+    )
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    lock_fd = os.open(lock_path, os.O_RDONLY | os.O_CREAT, 0o666)
+    with os.fdopen(lock_fd, "r", encoding="utf-8") as lock_file:
+        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
 
 
 class _DockerCleanupDeadlineExceeded(TimeoutError):
@@ -741,6 +764,72 @@ printf '__SWESMITH_COMMITS__=%s %s\n' "${task_commit}" "${bug_commit}"
     return parts[0], parts[1]
 
 
+def _run_container_shell(
+    container_name: str, command: str, *, timeout: float
+) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        ["docker", "exec", "-u", "root", container_name, "sh", "-lc", command],
+        capture_output=True,
+        text=True,
+        timeout=timeout,
+        check=False,
+    )
+
+
+def _snapshot_sweverified_workspace(
+    container_name: str, task_meta: dict[str, Any]
+) -> str:
+    """Snapshot the image's pre-agent worktree without changing its checkout."""
+
+    base_commit = str(task_meta.get("base_commit") or "").strip()
+    if not _GIT_COMMIT_RE.fullmatch(base_commit):
+        raise RuntimeError(
+            f"SWE-Verified task has invalid base_commit={base_commit!r}"
+        )
+    git = "git -c safe.directory=/testbed -C /testbed"
+    command = f"""
+set -eu
+base={shlex.quote(base_commit)}
+{git} cat-file -e "$base^{{commit}}"
+original_index_tree=$({git} write-tree)
+{git} add -A
+baseline_tree=$({git} write-tree)
+baseline_commit=$(printf '%s\\n' terminal-rl-sweverified-baseline | \
+  {git} -c user.name=terminal-rl -c user.email=terminal-rl@localhost \
+  commit-tree "$baseline_tree" -p "$base")
+{git} read-tree "$original_index_tree"
+printf '%s' "$baseline_commit"
+"""
+    result = _run_container_shell(container_name, command, timeout=120.0)
+    baseline = (result.stdout or "").strip()
+    if result.returncode != 0 or not _GIT_COMMIT_RE.fullmatch(baseline):
+        detail = (result.stderr or result.stdout or "no output").strip()[-1000:]
+        raise RuntimeError(
+            "Could not snapshot the initial SWE-Verified workspace: "
+            f"rc={result.returncode} detail={detail}"
+        )
+    return baseline
+
+
+def _capture_sweverified_patch(
+    container_name: str, baseline_commit: str
+) -> str:
+    if not _GIT_COMMIT_RE.fullmatch(str(baseline_commit or "")):
+        raise RuntimeError("SWE-Verified workspace baseline is missing or invalid")
+    git = "git -c safe.directory=/testbed -C /testbed"
+    command = (
+        f"{git} add -A && "
+        f"{git} diff --binary --no-ext-diff {shlex.quote(baseline_commit)}"
+    )
+    result = _run_container_shell(container_name, command, timeout=120.0)
+    if result.returncode != 0:
+        detail = (result.stderr or result.stdout or "no output").strip()[-1000:]
+        raise RuntimeError(
+            f"Could not export SWE-Verified prediction patch: {detail}"
+        )
+    return result.stdout or ""
+
+
 def _docker_compose_down_projects(
     *,
     docker_compose_path: str | None,
@@ -809,14 +898,15 @@ def _docker_compose_down_projects(
             service_timeout,
         ]
         try:
-            completed = subprocess.run(
-                cmd,
-                capture_output=True,
-                text=True,
-                timeout=_docker_cleanup_command_timeout(
-                    command_timeout, deadline
-                ),
-            )
+            with _docker_network_lifecycle_lock():
+                completed = subprocess.run(
+                    cmd,
+                    capture_output=True,
+                    text=True,
+                    timeout=_docker_cleanup_command_timeout(
+                        command_timeout, deadline
+                    ),
+                )
             logger.warning(
                 "Docker compose down finished for TerminalEnv %s project=%s "
                 "reason=%s rc=%s stdout=%s stderr=%s",
@@ -1307,7 +1397,8 @@ def _force_remove_docker_objects_impl(
 
     for net_id in network_ids:
         try:
-            removed_net = _run(["docker", "network", "rm", net_id])
+            with _docker_network_lifecycle_lock():
+                removed_net = _run(["docker", "network", "rm", net_id])
             logger.warning(
                 "Force docker network rm finished for TerminalEnv %s id=%s rc=%s",
                 trial_name,
@@ -1656,15 +1747,16 @@ def force_remove_orphan_docker_objects(
         resource_max_remove = max(0, _env_int("WORKER_ORPHAN_DOCKER_SWEEP_RESOURCE_MAX_REMOVE", 128))
         if resource_max_remove:
             try:
-                _remove_inactive_compose_resources(
-                    resource_kind="network",
-                    active_project_names=active_projects,
-                    active_task_ids=active_tasks,
-                    reason=reason,
-                    timeout=timeout,
-                    max_remove=resource_max_remove,
-                    deadline=deadline,
-                )
+                with _docker_network_lifecycle_lock():
+                    _remove_inactive_compose_resources(
+                        resource_kind="network",
+                        active_project_names=active_projects,
+                        active_task_ids=active_tasks,
+                        reason=reason,
+                        timeout=timeout,
+                        max_remove=resource_max_remove,
+                        deadline=deadline,
+                    )
                 # A volume name is reusable, so deleting it after a list/inspect
                 # ownership check still has a TOCTOU race. Non-default pools reject
                 # named volumes in their Compose model and never sweep them by name.
@@ -1686,26 +1778,27 @@ def force_remove_orphan_docker_objects(
 
 
 def _stop_terminal_compat(terminal: Terminal, timeout: float) -> None:
-    try:
-        supports_timeout = "timeout" in inspect.signature(terminal.stop).parameters
-    except (TypeError, ValueError):
-        supports_timeout = False
+    with _docker_network_lifecycle_lock():
+        try:
+            supports_timeout = "timeout" in inspect.signature(terminal.stop).parameters
+        except (TypeError, ValueError):
+            supports_timeout = False
 
-    if supports_timeout:
-        terminal.stop(timeout=timeout)
-    else:
-        if _env_bool("TERMINAL_ENV_FAST_CLOSE", False) or _env_bool(
-            "TERMINAL_ENV_SKIP_UNBOUNDED_STOP", False
-        ):
+        if supports_timeout:
+            terminal.stop(timeout=timeout)
+        else:
+            if _env_bool("TERMINAL_ENV_FAST_CLOSE", False) or _env_bool(
+                "TERMINAL_ENV_SKIP_UNBOUNDED_STOP", False
+            ):
+                logger.warning(
+                    "Terminal.stop(timeout=...) is unsupported; skipping unbounded "
+                    "Terminal.stop() under fast close."
+                )
+                return
             logger.warning(
-                "Terminal.stop(timeout=...) is unsupported; skipping unbounded "
-                "Terminal.stop() under fast close."
+                "Terminal.stop(timeout=...) is unsupported; retrying with Terminal.stop()."
             )
-            return
-        logger.warning(
-            "Terminal.stop(timeout=...) is unsupported; retrying with Terminal.stop()."
-        )
-        terminal.stop()
+            terminal.stop()
 
 
 def _drain_toolkit_sessions(toolkit: Any) -> None:
@@ -1757,6 +1850,7 @@ class TerminalEnv:
         self._lifecycle_lock = asyncio.Lock()
         self._closed = False
         self._task_spec: TaskSpec | None = None
+        self._task_meta: dict[str, Any] | None = None
         self._run_ctx: RunContext | None = None
         self._timeouts: TaskTimeouts | None = None
 
@@ -1776,6 +1870,7 @@ class TerminalEnv:
         self._data_source = ""
         self._swesmith_task_commit: str | None = None
         self._swesmith_bug_commit: str | None = None
+        self._sweverified_baseline_commit: str | None = None
 
     async def reset(
         self,
@@ -1805,6 +1900,7 @@ class TerminalEnv:
 
         self._closed = False
         self._task_spec = task_spec
+        self._task_meta = dict(task_meta)
         self._run_ctx = run_ctx
         self._timeouts = timeouts
         self._eval_attempt = 0
@@ -1812,6 +1908,7 @@ class TerminalEnv:
         self._data_source = str(task_meta.get("data_source") or "")
         self._swesmith_task_commit = None
         self._swesmith_bug_commit = None
+        self._sweverified_baseline_commit = None
 
         if task_meta.get("data_source") == "agent_safetybench":
             self._agent_safetybench_env = AgentSafetyBenchEnv()
@@ -1864,6 +1961,46 @@ class TerminalEnv:
                     "SWE-smith task directory fingerprint is missing or stale: "
                     f"{task_path}"
                 )
+        elif self._data_source == "sweverified":
+            from ..data_utils.convert_sweverified_to_terminal_rl import (
+                DATASET_NAME,
+                DATASET_REVISION,
+                SWEBENCH_COMMIT,
+                SWEBENCH_VERSION,
+                TASK_FORMAT_VERSION,
+                expected_task_path,
+                official_image_name,
+                validate_task_dir_fingerprint,
+            )
+
+            instance_id = str(task_meta.get("swe_instance_id") or "")
+            expected_values = {
+                "task_path": expected_task_path(instance_id),
+                "source_dataset": DATASET_NAME,
+                "source_revision": DATASET_REVISION,
+                "swebench_harness_version": SWEBENCH_VERSION,
+                "swebench_harness_commit": SWEBENCH_COMMIT,
+                "task_format_version": TASK_FORMAT_VERSION,
+                "image_name": official_image_name(instance_id),
+            }
+            for key, expected in expected_values.items():
+                actual = (
+                    self._task_spec.task_path
+                    if key == "task_path"
+                    else task_meta.get(key)
+                )
+                if actual != expected:
+                    raise RuntimeError(
+                        "SWE-Verified task metadata is stale or untrusted: "
+                        f"{key} expected={expected!r} actual={actual!r}"
+                    )
+            if not validate_task_dir_fingerprint(
+                {"metadata": task_meta}, task_path
+            ):
+                raise RuntimeError(
+                    "SWE-Verified task directory fingerprint is missing or "
+                    f"stale: {task_path}"
+                )
         output_path = Path(self._run_ctx.log_dir).resolve()
         output_path.mkdir(parents=True, exist_ok=True)
         namespace = _current_pool_namespace()
@@ -1872,7 +2009,7 @@ class TerminalEnv:
             if not _compose_declares_pool_namespace(compose_path):
                 raise RuntimeError(
                     "non-default Docker pool requires a single static Compose "
-                    "model matching the exact generated SWE-smith format before "
+                    "model matching the exact generated SWE task format before "
                     "image preparation: "
                     f"{compose_path}"
                 )
@@ -2046,12 +2183,13 @@ class TerminalEnv:
                 # Image preparation has already completed. Always start through
                 # the bounded subprocess path; pinned Terminal-Bench start() has
                 # no timeout and can strand the reset thread indefinitely.
-                compose_up_no_build(
-                    self._terminal,
-                    timeout=self._timeouts.reset_session,
-                    container_name=self._trial_handler.client_container_name,
-                    logger=logger,
-                )
+                with _docker_network_lifecycle_lock():
+                    compose_up_no_build(
+                        self._terminal,
+                        timeout=self._timeouts.reset_session,
+                        container_name=self._trial_handler.client_container_name,
+                        logger=logger,
+                    )
             except Exception:
                 logger.exception(
                     "TerminalEnv docker start failed task=%s uid=%s container=%s "
@@ -2135,6 +2273,30 @@ class TerminalEnv:
                         reason="swesmith_trusted_commit_capture_failed",
                     )
                     raise
+            elif self._data_source == "sweverified":
+                try:
+                    self._sweverified_baseline_commit = (
+                        _snapshot_sweverified_workspace(
+                            self._trial_handler.client_container_name,
+                            task_meta,
+                        )
+                    )
+                except Exception:
+                    logger.exception(
+                        "SWE-Verified workspace snapshot failed task=%s uid=%s",
+                        self._task_spec.task_name,
+                        self._run_ctx.uid,
+                    )
+                    _force_remove_docker_objects(
+                        trial_name=self._trial_handler.trial_name,
+                        client_container_name=self._trial_handler.client_container_name,
+                        docker_image_name_prefix=self._trial_handler.docker_image_name_prefix,
+                        docker_compose_path=str(
+                            self._trial_handler.task_paths.docker_compose_path
+                        ),
+                        reason="sweverified_workspace_snapshot_failed",
+                    )
+                    raise
 
             try:
                 _raise_if_cancelled("after_docker_start")
@@ -2162,7 +2324,11 @@ class TerminalEnv:
             )
             self._terminal_toolkit = TerminalToolkit(
                 timeout=20.0,
-                working_directory=None,
+                working_directory=(
+                    "/testbed"
+                    if is_swe_task_path(self._task_spec.task_path)
+                    else None
+                ),
                 use_docker_backend=True,
                 docker_container_name=self._trial_handler.client_container_name,
                 session_logs_dir=session_logs_dir,
@@ -2175,7 +2341,11 @@ class TerminalEnv:
                 "shell_write_content_to_file": self._terminal_toolkit.shell_write_content_to_file,
             }
 
-            user_msg = f"Task name:{self._task_spec.task_name}\nTask instruction: {self._task_spec.instruction}"
+            user_msg = build_swe_user_message(
+                task_name=self._task_spec.task_name,
+                task_path=self._task_spec.task_path,
+                instruction=self._task_spec.instruction,
+            )
             function_tools = [FunctionTool(fn) for fn in self._tools.values()]
             tool_schemas = [
                 func_tool.get_openai_tool_schema() for func_tool in function_tools
@@ -2260,10 +2430,59 @@ class TerminalEnv:
         ):
             raise RuntimeError("env is not initialized; call reset first")
 
+        is_sweverified = self._data_source == "sweverified"
+        defer_sweverified = (
+            is_sweverified
+            and isinstance(trajectory, dict)
+            and trajectory.get("swebench_defer_grading") is True
+        )
+        if is_sweverified and not defer_sweverified:
+            raise RuntimeError(
+                "SWE-Verified terminal-rl workers export predictions only. "
+                "Set swebench_defer_grading=true and score predictions with "
+                "the pinned official swebench.harness.run_evaluation."
+            )
+
         def _sync_eval() -> float:
             task_name = (
                 self._task_spec.task_name if self._task_spec is not None else "unknown"
             )
+            if is_sweverified:
+                if self._task_meta is None or not self._sweverified_baseline_commit:
+                    raise RuntimeError(
+                        "SWE-Verified metadata/workspace baseline is unavailable"
+                    )
+                model_patch = _capture_sweverified_patch(
+                    self._trial_handler.client_container_name,
+                    self._sweverified_baseline_commit,
+                )
+                self._last_eval = {
+                    "grader": "swebench_prediction_export",
+                    "grading_deferred": True,
+                    "swebench_version": self._task_meta.get(
+                        "swebench_harness_version"
+                    ),
+                    "swebench_commit": self._task_meta.get(
+                        "swebench_harness_commit"
+                    ),
+                    "instance_id": self._task_meta.get(
+                        "swe_instance_id", task_name
+                    ),
+                    "repo": self._task_meta.get("repo"),
+                    "version": self._task_meta.get("version"),
+                    "model_patch": model_patch,
+                    "patch_is_None": False,
+                    "patch_exists": True,
+                    "resolved": None,
+                    "reward": 0.0,
+                }
+                logger.info(
+                    "SWE-Verified prediction exported instance=%s bytes=%d",
+                    self._last_eval["instance_id"],
+                    len(model_patch),
+                )
+                return 0.0
+
             paths: list[Path] = [self._trial_handler.task_paths.run_tests_path]
             if self._trial_handler.task_paths.test_dir.exists():
                 paths.append(self._trial_handler.task_paths.test_dir)
@@ -2401,6 +2620,13 @@ class TerminalEnv:
             timeout=self._timeouts.eval + 30.0,
         )
 
+    def evaluation_depends_on_trajectory(self) -> bool:
+        return (
+            self._agent_safetybench_env is not None
+            or self._agentharm_env is not None
+            or self._data_source == "sweverified"
+        )
+
     def last_eval_details(self) -> dict[str, Any] | None:
         if self._agent_safetybench_env is not None:
             details = getattr(self._agent_safetybench_env, "_last_eval", None)
@@ -2452,6 +2678,7 @@ class TerminalEnv:
         self._parser = None
         self._terminal_toolkit = None
         self._task_spec = None
+        self._task_meta = None
         self._run_ctx = None
         self._timeouts = None
         self._agent_safetybench_env = None
@@ -2460,6 +2687,7 @@ class TerminalEnv:
         self._data_source = ""
         self._swesmith_task_commit = None
         self._swesmith_bug_commit = None
+        self._sweverified_baseline_commit = None
 
         cleanup_completed = terminal is None
         cleanup_error = False
