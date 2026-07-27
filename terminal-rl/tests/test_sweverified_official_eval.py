@@ -5,6 +5,7 @@ import importlib.util
 import json
 import os
 import re
+import subprocess
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -233,7 +234,14 @@ def test_launchers_pin_formal_dataset_model_and_official_harness() -> None:
     assert "WORKER_PREFLIGHT_ONLY" in worker
     assert "SWEVERIFIED_REQUIRE_PINNED_WORKER_DEPS" in worker
     assert "requirements-swesmith-worker.txt" in worker
-    assert "WORKER_URLS=http://<docker-worker-host>:18083" in launcher
+    assert ".venv-swesmith-worker/bin/python" in worker
+    assert 'import_module("terminal-rl.remote.pool_server")' in worker
+    assert worker.count('import_module("terminal-rl.remote.pool_server")') == 2
+    assert "pool_server Python dependency preflight failed" in worker
+    assert "require_env WORKER_URLS" in launcher
+    assert "require_env HF_CKPT" in launcher
+    assert "require_env REF_LOAD" in launcher
+    assert 'export INIT_CKPT="${INIT_CKPT:-${REF_LOAD}}"' in launcher
     assert "EVAL_N_SAMPLES=1" in launcher
     assert "ROLLOUT_NUM_GPUS_PER_ENGINE" in launcher
     assert "Qwen/Qwen3-8B" in launcher
@@ -244,6 +252,22 @@ def test_launchers_pin_formal_dataset_model_and_official_harness() -> None:
     assert "HARNESS_PREFLIGHT_ONLY" in harness
     assert "pip install --editable" in harness
     assert "from swebench.harness.run_evaluation import main" in harness
+
+
+def test_worker_rejects_explicit_python_that_cannot_import_pool_server() -> None:
+    env = os.environ.copy()
+    env["POOL_SERVER_PYTHON"] = "/bin/false"
+    proc = subprocess.run(
+        ["bash", str(WORKER)],
+        cwd=ROOT,
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=30,
+        check=False,
+    )
+    assert proc.returncode == 2
+    assert "pool_server Python dependency preflight failed" in proc.stderr
 
 
 def test_network_pruning_and_compose_lifecycle_share_host_lock() -> None:

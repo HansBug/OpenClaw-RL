@@ -6,6 +6,11 @@
 SWE-bench Verified 的标准评测链路，目标模型为 `Qwen/Qwen3-8B` 基模，
 默认开启 thinking mode。
 
+代码分支 `zch/sweverified-terminal-rl-eval` 从 SWE-smith PR #18 的最新
+head `97518bc8` 直接切出。应先合并 SWE-smith PR；若上游采用 squash merge，
+再将本分支 rebase 到更新后的上游目标分支后提交，确保新 PR 只展示
+SWE-bench Verified 相关差异。
+
 SWE-bench Verified 是 **eval benchmark**，不是训练数据集。完整流程分为：
 
 1. 固定版本的 500 条 Verified 数据转换与任务目录生成；
@@ -51,12 +56,8 @@ worker 内部不会自行宣称 `resolved`，也不会用自定义测试结果�
 ```bash
 cd /path/to/OpenClaw-RL
 
-unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY
-source <(curl -fsSL \
-  http://deploy.i.h.pjlab.org.cn/infra/scripts/setup_proxy.sh)
-
 MODE=full \
-PYTHON_BIN=/root/miniconda3/bin/python3 \
+PYTHON_BIN="$(command -v python3)" \
 bash terminal-rl/data_utils/download_sweverified.sh
 ```
 
@@ -85,6 +86,11 @@ terminal-rl/dataset/sweverified_env/<instance_id>/
 ```bash
 cd /path/to/OpenClaw-RL
 
+python3.12 -m venv .venv-swesmith-worker
+.venv-swesmith-worker/bin/python -m pip install \
+  -r terminal-rl/remote/requirements-swesmith-worker.txt
+
+POOL_SERVER_PYTHON="$PWD/.venv-swesmith-worker/bin/python" \
 ENV_SERVER_PORT=18083 \
 WORKER_MAX_TASKS=4 \
 WORKER_MAX_RUNS_PER_TASK=2 \
@@ -106,9 +112,14 @@ Compose start/down、watchdog network cleanup 通过同一个 host file lock
 
 ```bash
 WORKER_PREFLIGHT_ONLY=1 \
-POOL_SERVER_PYTHON=/root/miniconda3/bin/python3 \
+POOL_SERVER_PYTHON="$PWD/.venv-swesmith-worker/bin/python" \
 bash terminal-rl/remote/run_pool_server_sweverified_pu.sh
 ```
+
+`POOL_SERVER_PYTHON` 必须能真实导入
+`terminal-rl.remote.pool_server`，并满足 pinned dependency 版本。不能仅因为
+`fastapi` 可导入就复用系统 Python。受限网络环境应由使用者在执行命令前
+配置可访问 GitHub 与 PyPI 的代理或 package index。
 
 ## 5. Worker Smoke
 
@@ -136,7 +147,7 @@ python3 terminal-rl/scripts/smoke_swe_worker.py \
 
 ## 6. 4 卡 Qwen3-8B 正式生成
 
-在 4 卡 H20 GPU 节点执行：
+在 4 卡 H20/H200 GPU 节点执行：
 
 ```bash
 cd /path/to/OpenClaw-RL
@@ -144,6 +155,7 @@ cd /path/to/OpenClaw-RL
 WORKER_URLS=http://<docker-worker-host>:18083 \
 HF_CKPT=/path/to/Qwen3-8B \
 REF_LOAD=/path/to/Qwen3-8B_torch_dist \
+TRAIN_PYTHON="$(command -v python3)" \
 WANDB_MODE=offline \
 bash terminal-rl/scripts/run_sweverified_qwen3_8b_base_think_eval.sh
 ```
@@ -210,43 +222,28 @@ runs/<run_id>/swebench_official/harness/
 以该目录中的官方 report 统计 `resolved` 与 `resolved rate`。生成阶段的
 `reward=0` 只是 deferred grading 占位值，不能当作模型得分。
 
-## 8. 已有本地评测审计
+## 8. 本地验证结果
 
-历史 run：
+当前分支的 merge-base 为最新 SWE-smith PR head `97518bc8`，相对该基线
+仅包含 SWE-bench Verified 范围的提交。针对当前代码已完成：
 
-```text
-runs/eval_qwen3-8b_prerl_sweverified_fixed_2026-07-22_234611
-```
+- 固定 Hugging Face revision 完整转换 `500/500`；
+- task dir 生成 `500/500`，canonical JSONL SHA256 为
+  `4282529dbcc1b9253fa91da35b9f1768a2002b391cc90ac6a4e64575d59cfbf3`；
+- SWE-Verified、SWE-smith converter、Docker lifecycle 与 close lifecycle
+  focused regression：`97 passed`；
+- shell `bash -n`、Python compile、`git diff --check`：通过；
+- 正式 launcher `EVAL_DRY_RUN=1`：通过；实际校验
+  Qwen3-8B revision `b968826d...`、模型 artifact manifest、500 条数据指纹和
+  全部 runtime path；
+- 4 卡正式 topology 为 `2 x TP=2`，Megatron eval-only 占位 topology 为
+  `world=1 / TP=1`，避免二者误复用导致 world-size assertion。
 
-截至 2026-07-23 12:37：
-
-- progress 停在 `251/500`；
-- 已落盘 `248` 个 trajectory；
-- status：`197 truncated / 49 completed / 2 failed`；
-- router 中有 3 次 `/reset HTTP 500`，后续请求可继续，属于 worker
-  生命周期稳定性问题；
-- 没有完整 500 条 `predictions.jsonl`；
-- 没有官方 harness aggregate report；
-- 当前没有对应 SGLang/RolloutManager 进程。
-
-因此该 run **未完成 SWE-bench Verified 官方评测**。它只证明旧链路能够
-长时间运行并处理约半数样本，不能作为最终 benchmark 结果。
-
-本分支已完成的本地验证：
-
-- 固定官方 Hugging Face revision 完整转换 `500/500`；
-- 转换后任务目录 `500/500`；
-- 数据 SHA256 与 launcher 固定值一致；
-- 500 个 task 内容指纹逐条通过 worker read-only preflight；
-- Qwen3-8B 固定 revision、4 卡 `2 x TP=2` topology 的正式 launcher
-  `EVAL_DRY_RUN=1` 通过；
-- 官方 harness `4.1.0@f7bbbb2...` 安装来源、500 条 prediction schema
-  与 ID 唯一性 preflight 通过；
-- SWE-Verified + SWE-smith 相关回归测试 `72 passed`；
-- 除仓库已有 `router_server_readyz` 测试桩不兼容外，其余全仓测试
-  `161 passed`；该 2 项失败位于未修改的 router/test 文件，原因是旧
-  `_FakeRouter` 缺少现有 `maybe_reload_workers()` 方法；
-- Python compile、shell `bash -n`、`git diff --check` 通过。
+旧实验
+`runs/eval_qwen3-8b_prerl_sweverified_fixed_2026-07-22_234611`
+运行到约 `251/500`，证明 Qwen3-8B、SGLang、remote env 和 Docker workspace
+主链路可持续工作，但没有生成完整 500 条 prediction，也没有官方 aggregate
+report，因此不计为当前 commit 的完整 benchmark 结果。
 
 完整任务的验收标准是：
 

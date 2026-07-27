@@ -2,7 +2,7 @@
 # Terminal-RL Qwen3-8B eval-only launcher.
 #
 # Runs slime/eval_only.py with SGLang rollout engines only. No actor/training
-# workers are started. Designed for the puyuan 4-GPU cluster environment.
+# workers are started.
 
 set -euo pipefail
 set -x
@@ -10,8 +10,10 @@ set -x
 log() { echo "[$(date +'%F %T')] $*"; }
 require_cmd() { command -v "$1" >/dev/null 2>&1 || { echo "[ERROR] missing cmd: $1"; exit 1; }; }
 
-LIGHTRFT_PY312_BIN="${LIGHTRFT_PY312_BIN:-/mnt/shared-storage-user/puyuan/conda_envs/lightrft_py312/bin}"
-export PATH="${LIGHTRFT_PY312_BIN}:${PATH}"
+LIGHTRFT_PY312_BIN="${LIGHTRFT_PY312_BIN:-}"
+if [[ -n "${LIGHTRFT_PY312_BIN}" ]]; then
+  export PATH="${LIGHTRFT_PY312_BIN}:${PATH}"
+fi
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &>/dev/null && pwd)"
 REPO_ROOT="${REPO_ROOT:-$(cd "${SCRIPT_DIR}/.." && pwd)}"
@@ -19,11 +21,22 @@ export REPO_ROOT
 export SLIME_DIR="${SLIME_DIR:-${REPO_ROOT}/slime}"
 export MEGATRON_DIR="${MEGATRON_DIR:-${REPO_ROOT}/Megatron-LM}"
 
-TRAIN_PYTHON="${TRAIN_PYTHON:-${LIGHTRFT_PY312_BIN}/python3}"
-HF_CKPT="${HF_CKPT:-/mnt/shared-storage-user/puyuan/code/slime/Qwen3-8B/}"
-REF_LOAD="${REF_LOAD:-/mnt/shared-storage-user/puyuan/code/slime/Qwen3-8B_torch_dist/}"
-INIT_CKPT="${INIT_CKPT:-/mnt/shared-storage-user/puyuan/code/slime/Qwen3-8B_torch_dist}"
-STEP119_CKPT="${STEP119_CKPT:-/mnt/shared-storage-gpfs2/narmodel/agenticrl/ckpt/terminal-rl_qwen3-8b_8gpu_mixed-s6_asb2_ah2-rwcs_rule_rule-c0.3_dapo-ch0.28-tok1-dyn1_mt10_2026-06-01_090757_0603copy}"
+TRAIN_PYTHON="${TRAIN_PYTHON:-$(command -v python3 || true)}"
+HF_CKPT="${HF_CKPT:-}"
+REF_LOAD="${REF_LOAD:-}"
+INIT_CKPT="${INIT_CKPT:-${REF_LOAD}}"
+STEP119_CKPT="${STEP119_CKPT:-}"
+
+for required_name in TRAIN_PYTHON HF_CKPT REF_LOAD; do
+  if [[ -z "${!required_name}" ]]; then
+    echo "[ERROR] ${required_name} is required." >&2
+    exit 2
+  fi
+done
+if [[ ! -x "${TRAIN_PYTHON}" ]]; then
+  echo "[ERROR] TRAIN_PYTHON is not executable: ${TRAIN_PYTHON}" >&2
+  exit 2
+fi
 
 EVAL_CKPT="${EVAL_CKPT:-init}"
 EVAL_SUITE="${EVAL_SUITE:-mock}"
@@ -89,6 +102,10 @@ case "${EVAL_CKPT}" in
     CKPT_STEP_ARGS=()
     ;;
   step119)
+    if [[ -z "${STEP119_CKPT}" ]]; then
+      echo "[ERROR] EVAL_CKPT=step119 requires STEP119_CKPT=/path/to/checkpoint"
+      exit 1
+    fi
     CKPT_LABEL="step119"
     LOAD_CKPT="${LOAD_CKPT:-${STEP119_CKPT}}"
     CKPT_STEP_ARGS=(--ckpt-step 119)
@@ -288,8 +305,16 @@ fi
 
 export AGENT_SAFETYBENCH_REMOTE_ENV=0
 export AGENTHARM_REMOTE_ENV=0
-export AGENT_SAFETYBENCH_ROOT="${AGENT_SAFETYBENCH_ROOT:-/mnt/shared-storage-user/puyuan/code/Agent-SafetyBench}"
-export AGENTHARM_ROOT="${AGENTHARM_ROOT:-/mnt/shared-storage-user/puyuan/code/inspect_evals/src/inspect_evals/agentharm}"
+export AGENT_SAFETYBENCH_ROOT="${AGENT_SAFETYBENCH_ROOT:-}"
+export AGENTHARM_ROOT="${AGENTHARM_ROOT:-}"
+if [[ "${INCLUDES_SAFETY}" == "1" && -z "${AGENT_SAFETYBENCH_ROOT}" ]]; then
+  echo "[ERROR] EVAL_SUITE=${EVAL_SUITE} requires AGENT_SAFETYBENCH_ROOT." >&2
+  exit 2
+fi
+if [[ "${INCLUDES_AGENTHARM}" == "1" && -z "${AGENTHARM_ROOT}" ]]; then
+  echo "[ERROR] EVAL_SUITE=${EVAL_SUITE} requires AGENTHARM_ROOT." >&2
+  exit 2
+fi
 export SAFETY_BENCH_REWARD AGENTHARM_REWARD SETA_SAFETY SAFETY_REWARD_COEF
 
 INCLUDES_REMOTE_ENV=0

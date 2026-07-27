@@ -60,12 +60,15 @@ export WORKER_SHIM_CLEANUP_ENABLED="${WORKER_SHIM_CLEANUP_ENABLED:-0}"
 POOL_SERVER_PYTHON="${POOL_SERVER_PYTHON:-}"
 if [[ -z "${POOL_SERVER_PYTHON}" ]]; then
   for candidate in \
+    "${TERMINAL_RL_DIR}/../.venv-swesmith-worker/bin/python" \
     "${SHARED_CONDA_POOL_SERVER_VENV:-${TERMINAL_RL_DIR}/../../conda_envs/openclaw-worker-py312}/bin/python" \
     "${TERMINAL_RL_DIR}/../.venv/bin/python" \
     "$(command -v python3 || command -v python)"; do
     if [[ -x "${candidate}" ]] &&
-       timeout 60 "${candidate}" -c \
-         'import anyio, fastapi, uvicorn, yaml; from camel.toolkits import TerminalToolkit; import terminal_bench' \
+       timeout 60 env \
+         "PYTHONPATH=${TERMINAL_RL_DIR}/..${PYTHONPATH:+:${PYTHONPATH}}" \
+         "${candidate}" -c \
+         'import importlib; module = importlib.import_module("terminal-rl.remote.pool_server"); assert module.app is not None' \
          >/dev/null 2>&1; then
       POOL_SERVER_PYTHON="${candidate}"
       break
@@ -74,6 +77,14 @@ if [[ -z "${POOL_SERVER_PYTHON}" ]]; then
 fi
 if [[ -z "${POOL_SERVER_PYTHON}" ]]; then
   echo "[ERROR] no compatible terminal-rl worker Python was found." >&2
+  exit 2
+fi
+if ! timeout 60 env \
+  "PYTHONPATH=${TERMINAL_RL_DIR}/..${PYTHONPATH:+:${PYTHONPATH}}" \
+  "${POOL_SERVER_PYTHON}" -c \
+  'import importlib; module = importlib.import_module("terminal-rl.remote.pool_server"); assert module.app is not None'; then
+  echo "[ERROR] pool_server Python dependency preflight failed for ${POOL_SERVER_PYTHON}." >&2
+  echo "        Install terminal-rl/remote/requirements-swesmith-worker.txt in that environment." >&2
   exit 2
 fi
 export POOL_SERVER_PYTHON

@@ -7,6 +7,14 @@ SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &>/dev/null && pwd)"
 TERMINAL_RL_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
 REPO_ROOT="$(cd "${TERMINAL_RL_DIR}/.." && pwd)"
 
+require_env() {
+  local name="$1"
+  if [[ -z "${!name:-}" ]]; then
+    echo "[ERROR] ${name} is required." >&2
+    exit 2
+  fi
+}
+
 if [[ -n "${EVAL_LIMIT:-}" ]]; then
   echo "[ERROR] This formal launcher requires all 500 SWE-bench Verified instances; unset EVAL_LIMIT." >&2
   exit 2
@@ -24,19 +32,23 @@ if [[ -n "${SWEBENCH_DEFER_GRADING:-}" && "${SWEBENCH_DEFER_GRADING}" != "1" ]];
   exit 2
 fi
 
-if [[ -z "${WORKER_URLS:-}" ]]; then
-  echo "[ERROR] set WORKER_URLS=http://<docker-worker-host>:18083" >&2
-  exit 2
-fi
+require_env WORKER_URLS
+require_env HF_CKPT
+require_env REF_LOAD
+TRAIN_PYTHON="${TRAIN_PYTHON:-$(command -v python3 || true)}"
+require_env TRAIN_PYTHON
+
 export WORKER_URLS
+export TRAIN_PYTHON
 export EVAL_SUITE=sweverified
 export EVAL_CKPT=init
 export FORMAL_SWEBENCH_VERIFIED=1
 export SWEBENCH_DEFER_GRADING=1
 export SWEBENCH_EXPECTED_INSTANCES=500
 export SWEBENCH_EXPECTED_DATASET_SHA256="4282529dbcc1b9253fa91da35b9f1768a2002b391cc90ac6a4e64575d59cfbf3"
-export HF_CKPT="${HF_CKPT:-/mnt/shared-storage-user/puyuan/code/slime/Qwen3-8B/}"
-export REF_LOAD="${REF_LOAD:-/mnt/shared-storage-user/puyuan/code/slime/Qwen3-8B_torch_dist/}"
+export HF_CKPT
+export REF_LOAD
+export INIT_CKPT="${INIT_CKPT:-${REF_LOAD}}"
 export CUSTOM_CONFIG_PATH="${CUSTOM_CONFIG_PATH:-${TERMINAL_RL_DIR}/configs/rollout_qwen3_think.yaml}"
 export SWEBENCH_MODEL_NAME_OR_PATH="${SWEBENCH_MODEL_NAME_OR_PATH:-Qwen/Qwen3-8B}"
 
