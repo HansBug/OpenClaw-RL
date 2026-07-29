@@ -48,12 +48,63 @@ REPO_ROOT="$(cd -- "${SCRIPT_DIR}/../.." &>/dev/null && pwd)"
 
 log() { echo "[$(date +'%F %T')] $*"; }
 
+docker_network_rm_safe() {
+    local timeout_s="$1"
+    if ! command -v flock >/dev/null 2>&1; then
+        log "  WARN: flock is unavailable; skipping unsafe Docker network removal"
+        return 0
+    fi
+    flock -w "${timeout_s}" "${DOCKER_NETWORK_LIFECYCLE_LOCK}" \
+        xargs -r -n 20 timeout "${timeout_s}" docker network rm \
+        >/dev/null 2>&1 || true
+}
+
+detect_docker_data_root() {
+    local detected=""
+    if [[ -n "${DOCKER_DATA_ROOT:-}" ]]; then
+        printf '%s\n' "${DOCKER_DATA_ROOT}"
+        return 0
+    fi
+    if [[ -n "${DOCKER_ROOT:-}" ]]; then
+        printf '%s\n' "${DOCKER_ROOT}"
+        return 0
+    fi
+    if command -v docker >/dev/null 2>&1; then
+        detected="$(timeout 10 docker info --format '{{.DockerRootDir}}' 2>/dev/null || true)"
+        if [[ -n "${detected}" ]]; then
+            printf '%s\n' "${detected}"
+            return 0
+        fi
+    fi
+    if [[ -f /etc/docker/daemon.json ]] && command -v python3 >/dev/null 2>&1; then
+        detected="$(python3 - <<'PY' 2>/dev/null || true
+import json
+with open("/etc/docker/daemon.json") as f:
+    print(json.load(f).get("data-root", ""))
+PY
+)"
+        if [[ -n "${detected}" ]]; then
+            printf '%s\n' "${detected}"
+            return 0
+        fi
+    fi
+    printf '%s\n' "/var/lib/docker"
+}
+
 # ── Configuration ─────────────────────────────────────────────────────────────
 # 坑1: capacity must balance rollout demand and Docker isolation limits.
 # Most tasks can run in parallel; known compose-unsafe tasks are serialized
 # through WORKER_SERIAL_TASK_IDS or explicit WORKER_TASK_MAX_RUNS_OVERRIDES.
 WORKER_MAX_TASKS="${WORKER_MAX_TASKS:-16}"
 WORKER_MAX_RUNS_PER_TASK="${WORKER_MAX_RUNS_PER_TASK:-8}"
+export TERMINAL_RL_POOL_NAMESPACE="${TERMINAL_RL_POOL_NAMESPACE:-default}"
+if [[ ! "${TERMINAL_RL_POOL_NAMESPACE}" =~ ^[a-z0-9][a-z0-9_-]{0,62}$ ]]; then
+    echo "[ERROR] TERMINAL_RL_POOL_NAMESPACE must match ^[a-z0-9][a-z0-9_-]{0,62}$." >&2
+    exit 1
+fi
+# Host-wide `docker system prune` cannot distinguish concurrent terminal-rl
+# pools. Keep it opt-in and rely on lease/namespace-owned cleanup by default.
+export WORKER_SHIM_CLEANUP_ENABLED="${WORKER_SHIM_CLEANUP_ENABLED:-0}"
 WORKER_SERIAL_TASK_IDS="${WORKER_SERIAL_TASK_IDS:-892,1133}"
 WORKER_TASK_MAX_RUNS_OVERRIDES="${WORKER_TASK_MAX_RUNS_OVERRIDES:-}"
 WORKER_AUTO_SERIALIZE_UNSAFE_COMPOSE="${WORKER_AUTO_SERIALIZE_UNSAFE_COMPOSE:-0}"
@@ -62,28 +113,34 @@ WORKER_MAX_CONCURRENT_CLOSES="${WORKER_MAX_CONCURRENT_CLOSES:-16}"
 WORKER_MAX_CONCURRENT_RESETS="${WORKER_MAX_CONCURRENT_RESETS:-16}"
 WORKER_RESET_ADMISSION_TIMEOUT="${WORKER_RESET_ADMISSION_TIMEOUT:-30}"
 WORKER_RESET_BACKLOG_RETRY_AFTER="${WORKER_RESET_BACKLOG_RETRY_AFTER:-10}"
+WORKER_RESET_CANCEL_JOIN_TIMEOUT="${WORKER_RESET_CANCEL_JOIN_TIMEOUT:-15}"
+WORKER_SHUTDOWN_RESET_JOIN_TIMEOUT="${WORKER_SHUTDOWN_RESET_JOIN_TIMEOUT:-20}"
 ENV_SERVER_PORT="${ENV_SERVER_PORT:-18081}"
 SKIP_PREFLIGHT_CLEANUP="${SKIP_PREFLIGHT_CLEANUP:-0}"
 PREFLIGHT_KILL_ORPHAN_RUNNING="${PREFLIGHT_KILL_ORPHAN_RUNNING:-1}"
 FINAL_DOCKER_CLEANUP="${FINAL_DOCKER_CLEANUP:-1}"
 FINAL_DOCKER_CLEANUP_TIMEOUT="${FINAL_DOCKER_CLEANUP_TIMEOUT:-90}"
+DOCKER_NETWORK_LIFECYCLE_LOCK="${DOCKER_NETWORK_LIFECYCLE_LOCK:-/tmp/openclaw_docker_network_lifecycle.lock}"
 POOL_SERVER_SHUTDOWN_GRACE="${POOL_SERVER_SHUTDOWN_GRACE:-60}"
 PROXY_ENV_FILE="${PROXY_ENV_FILE:-/etc/seta_build_proxy.env}"
 SKIP_PROXY_ENV="${SKIP_PROXY_ENV:-0}"
 CLAWSENTRY_NEEDED="${CLAWSENTRY_NEEDED:-0}"
 CS_GATEWAY_PORT="${CS_GATEWAY_PORT:-8090}"
-DOCKER_DATA_ROOT="${DOCKER_DATA_ROOT:-${DOCKER_ROOT:-/data}}"
+DOCKER_DATA_ROOT="$(detect_docker_data_root)"
+DOCKER_ROOT="${DOCKER_DATA_ROOT}"
 WORKER_DISK_GUARD_ENABLED="${WORKER_DISK_GUARD_ENABLED:-1}"
 WORKER_MIN_DOCKER_FREE_GB="${WORKER_MIN_DOCKER_FREE_GB:-50}"
 WORKER_MAX_DOCKER_USED_PCT="${WORKER_MAX_DOCKER_USED_PCT:-95}"
 WORKER_MAX_DOCKER_INODE_PCT="${WORKER_MAX_DOCKER_INODE_PCT:-80}"
-PREFLIGHT_DISK_CLEANUP="${PREFLIGHT_DISK_CLEANUP:-1}"
-PREFLIGHT_DOCKER_STORAGE_GC="${PREFLIGHT_DOCKER_STORAGE_GC:-1}"
+# Host-wide prune/GC cannot distinguish another pool on the same Docker host.
+# Capacity guards fail closed by default; an operator may opt into global GC.
+PREFLIGHT_DISK_CLEANUP="${PREFLIGHT_DISK_CLEANUP:-0}"
+PREFLIGHT_DOCKER_STORAGE_GC="${PREFLIGHT_DOCKER_STORAGE_GC:-0}"
 DOCKER_GC_TRIGGER_USED_PCT="${DOCKER_GC_TRIGGER_USED_PCT:-${WORKER_MAX_DOCKER_USED_PCT}}"
 DOCKER_GC_TARGET_USED_PCT="${DOCKER_GC_TARGET_USED_PCT:-90}"
 DOCKER_GC_MIN_FREE_GB="${DOCKER_GC_MIN_FREE_GB:-${WORKER_MIN_DOCKER_FREE_GB}}"
 DOCKER_GC_KEEP_PATTERNS="${DOCKER_GC_KEEP_PATTERNS:-ghcr.io/laude-institute/t-bench/*,ubuntu:*,python:*}"
-DOCKER_GC_PRUNE_VOLUMES="${DOCKER_GC_PRUNE_VOLUMES:-1}"
+DOCKER_GC_PRUNE_VOLUMES="${DOCKER_GC_PRUNE_VOLUMES:-0}"
 DOCKER_GC_DRY_RUN="${DOCKER_GC_DRY_RUN:-0}"
 DOCKER_GC_DELETE_OLD_IMAGES="${DOCKER_GC_DELETE_OLD_IMAGES:-0}"
 WORKER_MAX_CONCURRENT_BUILDS="${WORKER_MAX_CONCURRENT_BUILDS:-2}"
@@ -218,7 +275,7 @@ log "  max_tasks=${WORKER_MAX_TASKS}  max_runs_per_task=${WORKER_MAX_RUNS_PER_TA
 log "  serial_task_ids=${WORKER_SERIAL_TASK_IDS} task_run_overrides=${WORKER_TASK_MAX_RUNS_OVERRIDES:-<none>} auto_serial_compose=${WORKER_AUTO_SERIALIZE_UNSAFE_COMPOSE}"
 log "  max_concurrent_closes=${WORKER_MAX_CONCURRENT_CLOSES}"
 log "  max_concurrent_builds=${WORKER_MAX_CONCURRENT_BUILDS}"
-log "  max_concurrent_resets=${WORKER_MAX_CONCURRENT_RESETS} reset_admission_timeout=${WORKER_RESET_ADMISSION_TIMEOUT}s retry_after=${WORKER_RESET_BACKLOG_RETRY_AFTER}s"
+log "  max_concurrent_resets=${WORKER_MAX_CONCURRENT_RESETS} reset_admission_timeout=${WORKER_RESET_ADMISSION_TIMEOUT}s retry_after=${WORKER_RESET_BACKLOG_RETRY_AFTER}s cancel_join=${WORKER_RESET_CANCEL_JOIN_TIMEOUT}s shutdown_join=${WORKER_SHUTDOWN_RESET_JOIN_TIMEOUT}s"
 log "  build_queue_timeout=${WORKER_DOCKER_BUILD_QUEUE_TIMEOUT}s retry_after=${WORKER_DOCKER_BUILD_BACKLOG_RETRY_AFTER}s"
 log "  close_timeout queue=${WORKER_CLOSE_QUEUE_TIMEOUT}s session=${WORKER_CLOSE_SESSION_TIMEOUT}s legacy=${WORKER_CLOSE_TASK_TIMEOUT}s"
 log "  port=${ENV_SERVER_PORT}  skip_cleanup=${SKIP_PREFLIGHT_CLEANUP}"
@@ -259,26 +316,77 @@ docker_inode_snapshot() {
 
 TASK_CONTAINER_REGEX="${TASK_CONTAINER_REGEX:-^[0-9]+[-_].*(slime[-_]?run|client|helper).*$}"
 TASK_IMAGE_REGEX="${TASK_IMAGE_REGEX:-^tb__[0-9]+__.*(:|$)}"
+if [[ -z "${WORKER_CLEANUP_LEGACY_UNLABELED+x}" ]]; then
+    if [[ "${TERMINAL_RL_POOL_NAMESPACE}" == "default" ]]; then
+        # Existing SETA task Compose files predate pool labels.
+        WORKER_CLEANUP_LEGACY_UNLABELED=1
+    else
+        WORKER_CLEANUP_LEGACY_UNLABELED=0
+    fi
+fi
+if [[ "${WORKER_CLEANUP_LEGACY_UNLABELED}" != "0" && "${WORKER_CLEANUP_LEGACY_UNLABELED}" != "1" ]]; then
+    log "❌ WORKER_CLEANUP_LEGACY_UNLABELED must be 0 or 1"
+    exit 1
+fi
 
 task_container_lines() {
-    docker ps --format '{{.ID}}\t{{.Names}}\t{{.Image}}' 2>/dev/null \
-        | awk -F '\t' -v name_re="${TASK_CONTAINER_REGEX}" -v image_re="${TASK_IMAGE_REGEX}" \
-            '$2 ~ name_re || $3 ~ image_re {print $0}' || true
+    docker ps --format '{{.ID}}\t{{.Names}}\t{{.Image}}\t{{.Label "terminal-rl.pool-namespace"}}' 2>/dev/null \
+        | awk -F '\t' -v ns="${TERMINAL_RL_POOL_NAMESPACE}" \
+            -v legacy="${WORKER_CLEANUP_LEGACY_UNLABELED}" \
+            -v name_re="${TASK_CONTAINER_REGEX}" -v image_re="${TASK_IMAGE_REGEX}" \
+            '((ns == "default" && ($2 ~ name_re || $3 ~ image_re) && ($4 == "default" || (legacy == "1" && $4 == ""))) || (ns != "default" && $4 == ns)) {print $0}' || true
 }
 
 task_container_ids() {
     task_container_lines | awk -F '\t' 'NF >= 1 {print $1}' | sed '/^$/d' || true
 }
 
+stopped_pool_container_ids() {
+    docker ps -a --filter "status=exited" --filter "status=dead" \
+        --format '{{.ID}}\t{{.Names}}\t{{.Image}}\t{{.Label "terminal-rl.pool-namespace"}}' 2>/dev/null \
+        | awk -F '\t' -v ns="${TERMINAL_RL_POOL_NAMESPACE}" \
+            -v legacy="${WORKER_CLEANUP_LEGACY_UNLABELED}" \
+            -v name_re="${TASK_CONTAINER_REGEX}" -v image_re="${TASK_IMAGE_REGEX}" \
+            '((ns == "default" && ($2 ~ name_re || $3 ~ image_re) && ($4 == "default" || (legacy == "1" && $4 == ""))) || (ns != "default" && $4 == ns)) {print $1}' \
+        | sed '/^$/d' || true
+}
+
+dangling_pool_network_ids() {
+    docker network ls --filter "dangling=true" \
+        --format '{{.ID}}\t{{.Label "terminal-rl.pool-namespace"}}\t{{.Label "com.docker.compose.project"}}' 2>/dev/null \
+        | awk -F '\t' -v ns="${TERMINAL_RL_POOL_NAMESPACE}" \
+            -v legacy="${WORKER_CLEANUP_LEGACY_UNLABELED}" \
+            -v project_re="${TASK_CONTAINER_REGEX}" \
+            '((ns == "default" && ($2 == "default" || (legacy == "1" && $2 == "")) && $3 ~ project_re) || (ns != "default" && $2 == ns)) {print $1}' \
+        | sed '/^$/d' || true
+}
+
+cleanup_stopped_pool_objects() {
+    local reason="$1"
+    local ids count
+
+    ids="$(stopped_pool_container_ids)"
+    count=$(printf '%s\n' "${ids}" | sed '/^$/d' | wc -l || true)
+    log "  Docker cleanup (${reason}): owned stopped containers=${count:-0} namespace=${TERMINAL_RL_POOL_NAMESPACE}"
+    if [[ "${count:-0}" -gt 0 ]] 2>/dev/null; then
+        printf '%s\n' "${ids}" \
+            | xargs -r -n 20 timeout "${FINAL_DOCKER_CLEANUP_TIMEOUT}" docker rm -f >/dev/null 2>&1 || true
+    fi
+
+    ids="$(dangling_pool_network_ids)"
+    count=$(printf '%s\n' "${ids}" | sed '/^$/d' | wc -l || true)
+    log "  Docker cleanup (${reason}): owned dangling networks=${count:-0} namespace=${TERMINAL_RL_POOL_NAMESPACE}"
+    if [[ "${count:-0}" -gt 0 ]] 2>/dev/null; then
+        printf '%s\n' "${ids}" \
+            | docker_network_rm_safe "${FINAL_DOCKER_CLEANUP_TIMEOUT}"
+    fi
+}
+
 cleanup_task_docker_objects() {
     local reason="$1"
-    local ids count stopped dangling_nets
+    local ids count
 
-    stopped=$(docker ps -aq --filter "status=exited" --filter "status=dead" 2>/dev/null | wc -l || true)
-    log "  Docker cleanup (${reason}): stopped containers=${stopped:-0}"
-    if [[ "${stopped:-0}" -gt 0 ]] 2>/dev/null; then
-        timeout "${FINAL_DOCKER_CLEANUP_TIMEOUT}" docker container prune -f >/dev/null 2>&1 || true
-    fi
+    cleanup_stopped_pool_objects "${reason}"
 
     ids="$(task_container_ids)"
     count=$(printf '%s\n' "${ids}" | sed '/^$/d' | wc -l || true)
@@ -289,9 +397,6 @@ cleanup_task_docker_objects() {
         log "  Docker cleanup (${reason}): removed matching running task containers"
     fi
 
-    dangling_nets=$(docker network ls --filter "dangling=true" -q 2>/dev/null | wc -l || true)
-    log "  Docker cleanup (${reason}): dangling networks=${dangling_nets:-0}"
-    timeout "${FINAL_DOCKER_CLEANUP_TIMEOUT}" docker network prune -f >/dev/null 2>&1 || true
 }
 
 preflight_disk_guard() {
@@ -439,19 +544,7 @@ if [[ "${SKIP_PREFLIGHT_CLEANUP}" != "1" ]]; then
     if [[ "${PREFLIGHT_KILL_ORPHAN_RUNNING}" == "1" ]]; then
         cleanup_task_docker_objects "preflight"
     else
-        STOPPED=$(docker ps -aq --filter "status=exited" --filter "status=dead" 2>/dev/null | wc -l || true)
-        log "  stopped containers: ${STOPPED:-0}"
-        if [[ "${STOPPED:-0}" -gt 0 ]] 2>/dev/null; then
-            log "  Pruning stopped containers..."
-            timeout "${FINAL_DOCKER_CLEANUP_TIMEOUT}" docker container prune -f >/dev/null 2>&1 || true
-            log "  ✅ Pruned"
-        fi
-        DANGLING_NETS=$(docker network ls --filter "dangling=true" -q 2>/dev/null | wc -l || true)
-        if [[ "${DANGLING_NETS:-0}" -gt 0 ]] 2>/dev/null; then
-            log "  Pruning ${DANGLING_NETS} dangling networks..."
-            timeout "${FINAL_DOCKER_CLEANUP_TIMEOUT}" docker network prune -f >/dev/null 2>&1 || true
-            log "  ✅ Pruned networks"
-        fi
+        cleanup_stopped_pool_objects "preflight"
         ORPHAN_RUNNING=$(task_container_ids | wc -l || true)
         if [[ "${ORPHAN_RUNNING:-0}" -gt 0 ]] 2>/dev/null; then
             log "  ⚠️  ${ORPHAN_RUNNING} orphan task containers still running"
@@ -594,6 +687,8 @@ export WORKER_MAX_CONCURRENT_BUILDS
 export WORKER_MAX_CONCURRENT_RESETS
 export WORKER_RESET_ADMISSION_TIMEOUT
 export WORKER_RESET_BACKLOG_RETRY_AFTER
+export WORKER_RESET_CANCEL_JOIN_TIMEOUT
+export WORKER_SHUTDOWN_RESET_JOIN_TIMEOUT
 export WORKER_DOCKER_BUILD_QUEUE_TIMEOUT
 export WORKER_DOCKER_BUILD_BACKLOG_RETRY_AFTER
 export WORKER_RESET_TIMEOUT_RETRY_AFTER
@@ -665,20 +760,51 @@ export WORKER_TASK_IMAGE_RETRY_AFTER
 export CONTAINER_PIDS_LIMIT
 export CONTAINER_MEMORY_LIMIT
 
-if [ -d "${REPO_ROOT}/.venv" ]; then
-    source .venv/bin/activate
+pool_server_env_ok() {
+    local env_dir="$1"
+    [[ -x "${env_dir}/bin/python" ]] || return 1
+    "${env_dir}/bin/python" - <<'PY' >/dev/null 2>&1
+import importlib.util
+import sys
+
+if sys.version_info < (3, 12):
+    raise SystemExit(1)
+missing = [
+    name for name in ("terminal_bench", "fastapi", "uvicorn", "camel")
+    if importlib.util.find_spec(name) is None
+]
+raise SystemExit(1 if missing else 0)
+PY
+}
+
+SHARED_CONDA_POOL_SERVER_VENV="${SHARED_CONDA_POOL_SERVER_VENV:-$(cd "${REPO_ROOT}/.." && pwd)/conda_envs/openclaw-worker-py312}"
+if [[ -z "${POOL_SERVER_VENV:-}" ]] && pool_server_env_ok "${SHARED_CONDA_POOL_SERVER_VENV}"; then
+    POOL_SERVER_VENV="${SHARED_CONDA_POOL_SERVER_VENV}"
+else
+    if [[ -z "${POOL_SERVER_VENV:-}" && -x "${SHARED_CONDA_POOL_SERVER_VENV}/bin/python" ]]; then
+        log "  shared conda env is present but missing pool_server deps: ${SHARED_CONDA_POOL_SERVER_VENV}"
+    fi
+    POOL_SERVER_VENV="${POOL_SERVER_VENV:-${REPO_ROOT}/.venv}"
+fi
+
+if [ -f "${POOL_SERVER_VENV}/bin/activate" ]; then
+    # shellcheck disable=SC1090
+    source "${POOL_SERVER_VENV}/bin/activate"
+else
+    export PATH="${POOL_SERVER_VENV}/bin:${PATH}"
 fi
 
 POOL_SERVER_PYTHON="${POOL_SERVER_PYTHON:-}"
 if [[ -z "${POOL_SERVER_PYTHON}" ]]; then
-    if [[ -x "${REPO_ROOT}/.venv/bin/python" ]]; then
-        POOL_SERVER_PYTHON="${REPO_ROOT}/.venv/bin/python"
+    if [[ -x "${POOL_SERVER_VENV}/bin/python" ]]; then
+        POOL_SERVER_PYTHON="${POOL_SERVER_VENV}/bin/python"
     else
         POOL_SERVER_PYTHON="$(command -v python3 || command -v python)"
     fi
 fi
 
 log "  pool_server python: ${POOL_SERVER_PYTHON}"
+log "  pool_server env: ${POOL_SERVER_VENV}"
 "${POOL_SERVER_PYTHON}" - <<'PY'
 import sys
 print("  pool_server python version:", sys.version.replace("\n", " "))

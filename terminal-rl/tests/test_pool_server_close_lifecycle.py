@@ -3,10 +3,13 @@ from __future__ import annotations
 import asyncio
 import importlib
 import sys
+import threading
 import time
 import types
 from dataclasses import dataclass
 from pathlib import Path
+
+import pytest
 
 
 ROOT_DIR = Path(__file__).resolve().parents[2]
@@ -245,6 +248,44 @@ def test_close_allocated_run_cleans_up_without_unpack_error(monkeypatch, tmp_pat
 
         assert lease_id not in pool._run_to_task
         assert env.close_count == 1
+        assert (await pool.status())["recent_close_failures"] == []
+
+    asyncio.run(_case())
+
+
+def test_close_cleanup_failure_is_retained_in_worker_status(monkeypatch, tmp_path):
+    class FailingCleanupEnv(_DummyEnv):
+        async def close(self):
+            self.close_count += 1
+            raise RuntimeError("close postcondition failed")
+
+        async def force_cleanup(self, reason="external"):
+            self.force_cleanup_reason = reason
+            raise RuntimeError("force cleanup postcondition failed")
+
+    async def _case():
+        pool_server = _install_import_stubs(monkeypatch)
+        env = FailingCleanupEnv()
+        pool = _new_pool(pool_server, env, tmp_path)
+        lease = await pool.allocate("task")
+        lease_id = lease["lease_id"]
+
+        assert await pool.close_run(lease_id, reason="test_close") is True
+        tasks = list(pool._closing_tasks)
+        assert tasks
+        await asyncio.gather(*tasks, return_exceptions=False)
+
+        status = await pool.status()
+        assert status["pending_closes"] == 0
+        assert status["recent_close_failures"] == [
+            {
+                "lease_id": lease_id,
+                "task_key": "task",
+                "reason": "close_exception",
+                "error": "RuntimeError: force cleanup postcondition failed",
+                "timestamp": status["recent_close_failures"][0]["timestamp"],
+            }
+        ]
 
     asyncio.run(_case())
 
@@ -380,6 +421,116 @@ def test_cancelled_reset_waiter_leaves_admission_queue(monkeypatch, tmp_path):
     asyncio.run(_case())
 
 
+def test_admission_waiting_reset_is_not_reaped_and_close_joins_future(
+    monkeypatch, tmp_path
+):
+    async def _case():
+        monkeypatch.setenv("WORKER_MAX_CONCURRENT_RESETS", "1")
+        monkeypatch.setenv("WORKER_RESET_ADMISSION_TIMEOUT", "10")
+        monkeypatch.setenv("WORKER_CLOSE_REQUESTED_FORCE_RELEASE_AFTER", "0")
+        pool_server = _install_import_stubs(monkeypatch)
+        env = _DummyEnv()
+        pool = _new_pool(pool_server, env, tmp_path)
+        await pool._reset_admission_sem.acquire()
+
+        lease_id = (await pool.allocate("task"))["lease_id"]
+        reset_request = asyncio.create_task(
+            pool.reset(
+                lease_id,
+                {"task_name": "task", "task_path": "task", "instruction": "x"},
+            )
+        )
+        for _ in range(100):
+            status = await pool.status()
+            if status["reset_admission"]["waiting"] == 1:
+                break
+            await asyncio.sleep(0.01)
+        assert status["reset_admission"]["waiting"] == 1
+
+        async with pool._lock:
+            run_slot = pool._get_run_slot(lease_id)
+            reset_future = run_slot.reset_future
+            run_slot.last_used_ts = time.time() - 100
+            assert pool._reap_idle_locked() == []
+
+        assert await pool.close_run(lease_id, reason="test_close") is True
+        await asyncio.gather(reset_request, return_exceptions=True)
+        release_task = pool._close_requested_release_tasks.get(lease_id)
+        if release_task is not None:
+            await asyncio.gather(release_task, return_exceptions=False)
+        if pool._closing_tasks:
+            await asyncio.gather(*pool._closing_tasks, return_exceptions=True)
+        if pool._force_cleanup_tasks:
+            await asyncio.gather(*pool._force_cleanup_tasks, return_exceptions=True)
+
+        assert reset_future is not None and reset_future.done()
+        assert not env.reset_started.is_set()
+        assert lease_id not in pool._run_to_task
+        pool._reset_admission_sem.release()
+
+    asyncio.run(_case())
+
+
+def test_finishing_other_op_does_not_drop_admission_waiting_reset(
+    monkeypatch, tmp_path
+):
+    class BlockingExecEnv(_DummyEnv):
+        def __init__(self):
+            super().__init__()
+            self.exec_started = asyncio.Event()
+            self.release_exec = asyncio.Event()
+
+        async def exec_tool(self, *_args, **_kwargs):
+            self.exec_started.set()
+            await self.release_exec.wait()
+            return "ok"
+
+    async def _case():
+        monkeypatch.setenv("WORKER_MAX_CONCURRENT_RESETS", "1")
+        monkeypatch.setenv("WORKER_RESET_ADMISSION_TIMEOUT", "10")
+        monkeypatch.setenv("WORKER_CLOSE_REQUESTED_FORCE_RELEASE", "0")
+        pool_server = _install_import_stubs(monkeypatch)
+        env = BlockingExecEnv()
+        pool = _new_pool(pool_server, env, tmp_path)
+        await pool._reset_admission_sem.acquire()
+        lease_id = (await pool.allocate("task"))["lease_id"]
+
+        reset_request = asyncio.create_task(
+            pool.reset(
+                lease_id,
+                {"task_name": "task", "task_path": "task", "instruction": "x"},
+            )
+        )
+        for _ in range(100):
+            status = await pool.status()
+            if status["reset_admission"]["waiting"] == 1:
+                break
+            await asyncio.sleep(0.01)
+        assert status["reset_admission"]["waiting"] == 1
+
+        exec_request = asyncio.create_task(pool.exec_tool(lease_id, "noop", {}))
+        await env.exec_started.wait()
+        assert await pool.close_run(lease_id, reason="test_close") is True
+        env.release_exec.set()
+        await exec_request
+
+        async with pool._lock:
+            run_slot = pool._get_run_slot(lease_id)
+            assert run_slot.reset_future is not None
+            assert not run_slot.reset_future.done()
+        assert lease_id in pool._run_to_task
+        assert env.close_count == 0
+
+        reset_request.cancel()
+        await asyncio.gather(reset_request, return_exceptions=True)
+        if pool._closing_tasks:
+            await asyncio.gather(*pool._closing_tasks, return_exceptions=True)
+        assert lease_id not in pool._run_to_task
+        pool._reset_admission_sem.release()
+
+    asyncio.run(_case())
+
+
 def test_close_during_reset_is_deferred_until_in_flight_finishes(monkeypatch, tmp_path):
     async def _case():
         pool_server = _install_import_stubs(monkeypatch)
@@ -416,10 +567,25 @@ def test_close_during_reset_is_deferred_until_in_flight_finishes(monkeypatch, tm
 
 
 def test_close_during_reset_force_releases_after_delay(monkeypatch, tmp_path):
+    class JoinAwareEnv(_DummyEnv):
+        def __init__(self):
+            super().__init__()
+            self.reset_cancelled = asyncio.Event()
+            self.release_cancelled_reset = asyncio.Event()
+
+        async def reset(self, **_kwargs):
+            self.reset_started.set()
+            try:
+                await self.release_reset.wait()
+            except asyncio.CancelledError:
+                self.reset_cancelled.set()
+                await self.release_cancelled_reset.wait()
+                raise
+
     async def _case():
         pool_server = _install_import_stubs(monkeypatch)
         monkeypatch.setenv("WORKER_CLOSE_REQUESTED_FORCE_RELEASE_AFTER", "0")
-        env = _DummyEnv()
+        env = JoinAwareEnv()
         pool = _new_pool(pool_server, env, tmp_path)
 
         lease = await pool.allocate("task")
@@ -434,15 +600,78 @@ def test_close_during_reset_force_releases_after_delay(monkeypatch, tmp_path):
         await env.reset_started.wait()
 
         assert await pool.close_run(lease_id, reason="test_close") is True
-        await asyncio.sleep(0)
+        await env.reset_cancelled.wait()
+
+        # Cancellation has reached reset, but cleanup and lease removal must
+        # wait until reset itself has completely unwound.
+        assert lease_id in pool._run_to_task
+        assert not hasattr(env, "force_cleanup_reason")
+
+        env.release_cancelled_reset.set()
+        await asyncio.gather(reset_task, return_exceptions=True)
+        release_task = pool._close_requested_release_tasks.get(lease_id)
+        if release_task is not None:
+            await asyncio.gather(release_task, return_exceptions=False)
+        if pool._closing_tasks:
+            await asyncio.gather(*pool._closing_tasks, return_exceptions=True)
         if pool._force_cleanup_tasks:
             await asyncio.gather(*pool._force_cleanup_tasks, return_exceptions=True)
 
         assert lease_id not in pool._run_to_task
-        assert env.force_cleanup_reason == "close_requested_force_release:test_close"
+        assert env.close_count == 1 or env.force_cleanup_reason == (
+            "close_requested_force_release:test_close"
+        )
 
-        reset_task.cancel()
-        await asyncio.gather(reset_task, return_exceptions=True)
+    asyncio.run(_case())
+
+
+def test_reset_timeout_joins_cancelled_reset_before_lease_drop(monkeypatch, tmp_path):
+    class JoinAwareEnv(_DummyEnv):
+        def __init__(self):
+            super().__init__()
+            self.reset_cancelled = asyncio.Event()
+            self.release_cancelled_reset = asyncio.Event()
+
+        async def reset(self, **_kwargs):
+            self.reset_started.set()
+            try:
+                await self.release_reset.wait()
+            except asyncio.CancelledError:
+                self.reset_cancelled.set()
+                await self.release_cancelled_reset.wait()
+                raise
+
+    async def _case():
+        monkeypatch.setenv("WORKER_RESET_OPERATION_TIMEOUT", "0.2")
+        monkeypatch.setenv("WORKER_RESET_WARN_AFTER", "0.1")
+        pool_server = _install_import_stubs(monkeypatch)
+        env = JoinAwareEnv()
+        pool = _new_pool(pool_server, env, tmp_path)
+        lease_id = (await pool.allocate("task"))["lease_id"]
+
+        reset_task = asyncio.create_task(
+            pool.reset(
+                lease_id,
+                {"task_name": "task", "task_path": "task", "instruction": "do it"},
+            )
+        )
+        await env.reset_cancelled.wait()
+
+        assert not reset_task.done()
+        assert lease_id in pool._run_to_task
+        assert not pool._force_cleanup_tasks
+
+        env.release_cancelled_reset.set()
+        try:
+            await reset_task
+        except TimeoutError as exc:
+            assert "WORKER_RESET_TIMEOUT" in str(exc)
+        else:
+            raise AssertionError("expected reset timeout")
+
+        assert lease_id not in pool._run_to_task
+        if pool._force_cleanup_tasks:
+            await asyncio.gather(*pool._force_cleanup_tasks, return_exceptions=True)
 
     asyncio.run(_case())
 
@@ -475,7 +704,7 @@ def test_status_and_readyz_report_stale_allocated_run(monkeypatch, tmp_path):
     asyncio.run(_case())
 
 
-def test_allocate_auto_repairs_close_requested_task_capacity(monkeypatch, tmp_path):
+def test_allocate_does_not_repair_close_requested_live_operation(monkeypatch, tmp_path):
     async def _case():
         pool_server = _install_import_stubs(monkeypatch)
         monkeypatch.setenv("WORKER_DISK_GUARD_ENABLED", "0")
@@ -513,6 +742,16 @@ def test_allocate_auto_repairs_close_requested_task_capacity(monkeypatch, tmp_pa
         pool_server.json_payload = _payload
         response = await pool_server.allocate(object())
 
+        assert response.status_code == 429
+        assert response["auto_repair"]["close_requested"]["repaired_count"] == 0
+        assert old_lease in pool._run_to_task
+
+        async with pool._lock:
+            old_slot = pool._get_run_slot(old_lease)
+            old_slot.in_flight_ops = 0
+            old_slot.active_op = None
+
+        response = await pool_server.allocate(object())
         assert response.status_code == 200
         assert response["ok"] is True
         assert response["auto_repair"]["close_requested"]["repaired_count"] == 1
@@ -553,6 +792,60 @@ def test_repair_stale_run_force_cleans_inflight_close_requested(monkeypatch, tmp
         status = await pool.status()
         assert status["total_active_runs"] == 0
         assert status["stale_runs"] == []
+
+    asyncio.run(_case())
+
+
+def test_repair_resetting_rejects_retry_and_checks_reset_generation(
+    monkeypatch, tmp_path
+):
+    async def _case():
+        pool_server = _install_import_stubs(monkeypatch)
+        env = _DummyEnv()
+        pool = _new_pool(pool_server, env, tmp_path)
+        lease_id = (await pool.allocate("task"))["lease_id"]
+        old_future = asyncio.create_task(asyncio.sleep(3600))
+        async with pool._lock:
+            run_slot = pool._get_run_slot(lease_id)
+            run_slot.phase = "resetting"
+            run_slot.reset_started_ts = time.time() - 60
+            run_slot.reset_future = old_future
+
+        replacement: list[asyncio.Task] = []
+
+        async def _join_and_replace(task, **_kwargs):
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+            with pytest.raises(RuntimeError, match="closing"):
+                await pool.reset(
+                    lease_id,
+                    {"task_name": "task", "task_path": "task", "instruction": "x"},
+                )
+            new_future = asyncio.create_task(asyncio.sleep(3600))
+            replacement.append(new_future)
+            async with pool._lock:
+                current = pool._get_run_slot(lease_id)
+                current.reset_future = new_future
+                current.close_requested = False
+                current.drop_scheduled = False
+                current.phase = "resetting"
+            return True
+
+        monkeypatch.setattr(pool, "_cancel_and_join_reset_task", _join_and_replace)
+        result = await pool.repair_resetting_runs(
+            reason="test", min_age=0, max_repairs=1
+        )
+
+        assert result["repaired_count"] == 0
+        assert lease_id in pool._run_to_task
+        async with pool._lock:
+            assert pool._get_run_slot(lease_id).reset_future is replacement[0]
+
+        replacement[0].cancel()
+        await asyncio.gather(replacement[0], return_exceptions=True)
+        await pool.close_run(lease_id, reason="test_cleanup")
+        if pool._closing_tasks:
+            await asyncio.gather(*pool._closing_tasks, return_exceptions=True)
 
     asyncio.run(_case())
 
@@ -643,5 +936,311 @@ def test_rollout_probe_resets_executes_and_closes(monkeypatch, tmp_path):
             await asyncio.gather(*pool._closing_tasks, return_exceptions=False)
         assert env.close_count == 1
         assert response["lease_id"] not in pool._run_to_task
+
+    asyncio.run(_case())
+
+
+def test_shutdown_joins_active_reset_before_removing_lease_or_cleanup(
+    monkeypatch, tmp_path
+):
+    class SlowCancelEnv(_DummyEnv):
+        def __init__(self) -> None:
+            super().__init__()
+            self.cancel_seen = asyncio.Event()
+            self.events: list[str] = []
+
+        async def reset(self, **_kwargs):
+            self.events.append("reset_started")
+            self.reset_started.set()
+            try:
+                await self.release_reset.wait()
+            except asyncio.CancelledError:
+                self.cancel_seen.set()
+                await self.release_reset.wait()
+            self.events.append("reset_finished")
+            return "user", []
+
+        async def close(self):
+            self.events.append("close")
+            await super().close()
+
+        async def force_cleanup(self, reason="external"):
+            self.events.append("force_cleanup")
+            await super().force_cleanup(reason=reason)
+
+    async def _case():
+        pool_server = _install_import_stubs(monkeypatch)
+        env = SlowCancelEnv()
+        pool = _new_pool(pool_server, env, tmp_path)
+        lease = await pool.allocate("task")
+        lease_id = lease["lease_id"]
+        reset_request = asyncio.create_task(
+            pool.reset(
+                lease_id,
+                {"task_name": "task", "task_path": "task", "instruction": "x"},
+            )
+        )
+        await env.reset_started.wait()
+
+        shutdown_task = asyncio.create_task(pool.shutdown())
+        await asyncio.wait_for(env.cancel_seen.wait(), timeout=1.0)
+        await asyncio.sleep(0)
+        assert not shutdown_task.done()
+        assert lease_id in pool._run_to_task
+        with pytest.raises(pool_server.CapacityError, match="shutting down"):
+            await pool.allocate("new-task")
+        with pytest.raises(RuntimeError, match="shutting down"):
+            await pool.reset(
+                lease_id,
+                {"task_name": "task", "task_path": "task", "instruction": "x"},
+            )
+        with pytest.raises(RuntimeError, match="shutting down"):
+            await pool.exec_tool(lease_id, "noop", {})
+
+        env.release_reset.set()
+        await asyncio.wait_for(shutdown_task, timeout=2.0)
+        await asyncio.gather(reset_request, return_exceptions=True)
+
+        assert reset_request.done()
+        assert lease_id not in pool._run_to_task
+        assert env.events.index("reset_finished") < env.events.index("close")
+        assert env.events.index("reset_finished") < env.events.index("force_cleanup")
+        assert env.close_count == 1
+
+    asyncio.run(_case())
+
+
+def test_shutdown_has_deadline_for_cancellation_resistant_reset(monkeypatch, tmp_path):
+    class CancellationResistantEnv(_DummyEnv):
+        def __init__(self) -> None:
+            super().__init__()
+            self.cancel_seen = asyncio.Event()
+            self.reset_finished = asyncio.Event()
+            self.force_cleanup_count = 0
+            self.thread_started = threading.Event()
+            self.thread_release = threading.Event()
+
+        async def reset(self, **_kwargs):
+            self.reset_started.set()
+
+            def _blocking_reset():
+                self.thread_started.set()
+                self.thread_release.wait()
+                return "user", []
+
+            reset_thread = asyncio.create_task(asyncio.to_thread(_blocking_reset))
+            try:
+                return await asyncio.shield(reset_thread)
+            except asyncio.CancelledError:
+                self.cancel_seen.set()
+                while not reset_thread.done():
+                    try:
+                        await asyncio.shield(reset_thread)
+                    except asyncio.CancelledError:
+                        current = asyncio.current_task()
+                        if current is not None and hasattr(current, "uncancel"):
+                            current.uncancel()
+                        continue
+                await asyncio.gather(reset_thread, return_exceptions=True)
+                raise
+            finally:
+                self.reset_finished.set()
+
+        async def force_cleanup(self, reason="external"):
+            self.force_cleanup_count += 1
+            await super().force_cleanup(reason=reason)
+
+    async def _case():
+        pool_server = _install_import_stubs(monkeypatch)
+        monkeypatch.setenv("WORKER_RESET_CANCEL_JOIN_TIMEOUT", "0.05")
+        monkeypatch.setenv("WORKER_SHUTDOWN_RESET_JOIN_TIMEOUT", "0.10")
+        monkeypatch.setenv("WORKER_SHUTDOWN_CLOSE_TASKS_TIMEOUT", "0.05")
+        env = CancellationResistantEnv()
+        pool = _new_pool(pool_server, env, tmp_path)
+        lease = await pool.allocate("task")
+        lease_id = lease["lease_id"]
+        reset_request = asyncio.create_task(
+            pool.reset(
+                lease_id,
+                {"task_name": "task", "task_path": "task", "instruction": "x"},
+            )
+        )
+        await env.reset_started.wait()
+        for _ in range(100):
+            if env.thread_started.is_set():
+                break
+            await asyncio.sleep(0.01)
+        assert env.thread_started.is_set()
+
+        await asyncio.wait_for(pool.shutdown(), timeout=5.0)
+
+        assert env.cancel_seen.is_set()
+        assert not env.thread_release.is_set()
+        assert lease_id in pool._run_to_task
+        run_slot = pool._get_run_slot(lease_id)
+        assert run_slot.reset_quarantined is True
+        assert run_slot.phase == "reset_quarantined"
+        assert env.force_cleanup_count == 0
+
+        env.thread_release.set()
+        # ThreadPool scheduling can be delayed on loaded Python 3.10 CI hosts.
+        await asyncio.wait_for(env.reset_finished.wait(), timeout=5.0)
+        await asyncio.gather(reset_request, return_exceptions=True)
+        for _ in range(500):
+            if lease_id not in pool._run_to_task:
+                break
+            await asyncio.sleep(0.01)
+        assert lease_id not in pool._run_to_task
+        assert env.force_cleanup_count == 1
+        for _ in range(500):
+            if not pool._reset_quarantine_watchers:
+                break
+            await asyncio.sleep(0.01)
+        assert not pool._reset_quarantine_watchers
+
+    asyncio.run(_case())
+
+
+def test_cancelled_reset_is_quarantined_until_environment_reset_exits(
+    monkeypatch, tmp_path
+):
+    class CancellationResistantEnv(_DummyEnv):
+        def __init__(self) -> None:
+            super().__init__()
+            self.cancel_seen = asyncio.Event()
+            self.force_cleanup_count = 0
+
+        async def reset(self, **_kwargs):
+            self.reset_started.set()
+            try:
+                await self.release_reset.wait()
+            except asyncio.CancelledError:
+                self.cancel_seen.set()
+                await self.release_reset.wait()
+            return "user", []
+
+        async def force_cleanup(self, reason="external"):
+            self.force_cleanup_count += 1
+            await super().force_cleanup(reason=reason)
+
+    async def _case():
+        pool_server = _install_import_stubs(monkeypatch)
+        monkeypatch.setenv("WORKER_RESET_CANCEL_JOIN_TIMEOUT", "0.05")
+        env = CancellationResistantEnv()
+        pool = _new_pool(pool_server, env, tmp_path)
+        lease = await pool.allocate("task")
+        lease_id = lease["lease_id"]
+        reset_request = asyncio.create_task(
+            pool.reset(
+                lease_id,
+                {"task_name": "task", "task_path": "task", "instruction": "x"},
+            )
+        )
+        await env.reset_started.wait()
+
+        reset_request.cancel()
+        with pytest.raises(TimeoutError, match="WORKER_RESET_CANCELLED"):
+            await reset_request
+
+        run_slot = pool._get_run_slot(lease_id)
+        assert run_slot.reset_quarantined is True
+        assert env.force_cleanup_count == 0
+        status = await pool.status()
+        assert status["reset_quarantined_runs"] == 1
+        assert status["stale_runs"][0]["reason"] == "reset_quarantined"
+        with pytest.raises(pool_server.CapacityError) as exc_info:
+            await pool.allocate("task")
+        assert exc_info.value.code == "TASK_RESET_QUARANTINED"
+        with pytest.raises(RuntimeError, match="quarantined reset"):
+            await pool.exec_tool(lease_id, "noop", {})
+
+        watcher = run_slot.reset_quarantine_watcher
+        assert watcher is not None
+        watcher.cancel()
+        await asyncio.sleep(0)
+        assert not watcher.done()
+        assert lease_id in pool._run_to_task
+
+        env.release_reset.set()
+        for _ in range(100):
+            if lease_id not in pool._run_to_task:
+                break
+            await asyncio.sleep(0.01)
+        assert lease_id not in pool._run_to_task
+        assert env.force_cleanup_count == 1
+        for _ in range(100):
+            if not pool._reset_quarantine_watchers:
+                break
+            await asyncio.sleep(0.01)
+        assert not pool._reset_quarantine_watchers
+
+    asyncio.run(_case())
+
+
+def test_cancelled_orphan_sweep_joins_bounded_worker_thread(monkeypatch, tmp_path):
+    async def _case():
+        pool_server = _install_import_stubs(monkeypatch)
+        monkeypatch.setenv("WORKER_ORPHAN_DOCKER_SWEEP_INTERVAL", "1")
+        monkeypatch.setenv("WORKER_ORPHAN_DOCKER_SWEEP_TIMEOUT", "2")
+        started = threading.Event()
+        release = threading.Event()
+        finished = threading.Event()
+        observed: dict[str, object] = {}
+
+        def _blocking_sweep(**kwargs):
+            observed.update(kwargs)
+            started.set()
+            release.wait(timeout=5.0)
+            finished.set()
+            return 0
+
+        monkeypatch.setattr(
+            pool_server, "force_remove_orphan_docker_objects", _blocking_sweep
+        )
+        pool = _new_pool(pool_server, _DummyEnv(), tmp_path)
+        sweep_request = asyncio.create_task(
+            pool._maybe_cleanup_orphan_docker_containers()
+        )
+        for _ in range(200):
+            if started.is_set():
+                break
+            await asyncio.sleep(0.01)
+        assert started.is_set()
+
+        sweep_request.cancel()
+        await asyncio.sleep(0.05)
+        assert not sweep_request.done()
+        assert not finished.is_set()
+
+        release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await sweep_request
+        assert finished.is_set()
+        assert observed["cleanup_timeout"] == 2.0
+
+    asyncio.run(_case())
+
+
+def test_orphan_sweep_builtin_timeout_is_classified_on_python310(
+    monkeypatch, tmp_path
+):
+    async def _case():
+        pool_server = _install_import_stubs(monkeypatch)
+        monkeypatch.setenv("WORKER_ORPHAN_DOCKER_SWEEP_INTERVAL", "1")
+        monkeypatch.setenv("WORKER_ORPHAN_DOCKER_SWEEP_TIMEOUT", "2")
+        reasons: list[str] = []
+
+        def _timed_out_sweep(**_kwargs):
+            raise TimeoutError("deadline")
+
+        monkeypatch.setattr(
+            pool_server, "force_remove_orphan_docker_objects", _timed_out_sweep
+        )
+        pool = _new_pool(pool_server, _DummyEnv(), tmp_path)
+        monkeypatch.setattr(pool, "_record_orphan_sweep_failure", reasons.append)
+
+        await pool._maybe_cleanup_orphan_docker_containers()
+
+        assert reasons == ["timeout_after_2.0s"]
 
     asyncio.run(_case())

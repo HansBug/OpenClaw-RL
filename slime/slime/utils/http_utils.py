@@ -233,6 +233,8 @@ async def _post(
     url,
     payload,
     max_retries=60,
+    timeout=None,
+    headers=None,
     *,
     retry_base_delay: float = 1.0,
     retry_max_delay: float = 1.0,
@@ -245,7 +247,12 @@ async def _post(
     while retry_count < max_retries:
         response = None
         try:
-            response = await client.post(url, json=payload or {})
+            response = await client.post(
+                url,
+                json=payload or {},
+                timeout=timeout,
+                headers=headers,
+            )
             response.raise_for_status()
             content = await response.aread()
             try:
@@ -372,6 +379,8 @@ def _init_ray_distributed_post(args):
             url,
             payload,
             max_retries=60,
+            timeout=None,
+            headers=None,
             retry_base_delay=1.0,
             retry_max_delay=1.0,
             retry_backoff_factor=1.0,
@@ -384,6 +393,8 @@ def _init_ray_distributed_post(args):
                 url,
                 payload,
                 max_retries,
+                timeout=timeout,
+                headers=headers,
                 retry_base_delay=retry_base_delay,
                 retry_max_delay=retry_max_delay,
                 retry_backoff_factor=retry_backoff_factor,
@@ -418,6 +429,8 @@ async def post(
     url,
     payload,
     max_retries=60,
+    timeout=None,
+    headers=None,
     *,
     retry_base_delay: float = 1.0,
     retry_max_delay: float = 1.0,
@@ -438,6 +451,8 @@ async def post(
                     url,
                     payload,
                     max_retries,
+                    timeout,
+                    headers,
                     retry_base_delay,
                     retry_max_delay,
                     retry_backoff_factor,
@@ -445,7 +460,14 @@ async def post(
                     sorted(retry_statuses) if retry_statuses is not None else None,
                     sorted(non_retry_statuses) if non_retry_statuses is not None else None,
                 )
-                return await asyncio.to_thread(ray.get, obj_ref)
+                try:
+                    if timeout is not None:
+                        return await asyncio.to_thread(ray.get, obj_ref, timeout=timeout)
+                    return await asyncio.to_thread(ray.get, obj_ref)
+                except TimeoutError as e:
+                    raise TimeoutError(
+                        f"Distributed POST timed out after {timeout}s (url={url})"
+                    ) from e
         except Exception as e:
             logger.info(f"[http_utils] Distributed POST failed, falling back to local: {e} (url={url})")
             # fall through to local
@@ -455,6 +477,8 @@ async def post(
         url,
         payload,
         max_retries,
+        timeout=timeout,
+        headers=headers,
         retry_base_delay=retry_base_delay,
         retry_max_delay=retry_max_delay,
         retry_backoff_factor=retry_backoff_factor,
