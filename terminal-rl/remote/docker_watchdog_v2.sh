@@ -152,6 +152,7 @@ DOCKER_GC_DRY_RUN="${DOCKER_GC_DRY_RUN:-0}"
 DOCKER_GC_DELETE_OLD_IMAGES="${DOCKER_GC_DELETE_OLD_IMAGES:-0}"
 DOCKER_GC_TIMEOUT="${DOCKER_GC_TIMEOUT:-900}"
 WATCHDOG_PRUNE_TIMEOUT="${WATCHDOG_PRUNE_TIMEOUT:-120}"
+DOCKER_NETWORK_LIFECYCLE_LOCK="${DOCKER_NETWORK_LIFECYCLE_LOCK:-/tmp/openclaw_docker_network_lifecycle.lock}"
 POOL_STOP_ON_DISK_EMERGENCY="${POOL_STOP_ON_DISK_EMERGENCY:-1}"
 POOL_STOP_COOLDOWN_S="${POOL_STOP_COOLDOWN_S:-300}"
 
@@ -215,6 +216,17 @@ rotate_log_if_big() {
 log() {
     echo "$(date '+%F %T') ${LOG_PREFIX} $*"
     rotate_log_if_big
+}
+
+docker_network_prune_safe() {
+    local timeout_s="${1:-30}"
+    if ! command -v flock >/dev/null 2>&1; then
+        log "WARN: flock is unavailable; skipping unsafe docker network prune"
+        return 0
+    fi
+    timeout "${timeout_s}" flock -w "${timeout_s}" \
+        "${DOCKER_NETWORK_LIFECYCLE_LOCK}" \
+        docker network prune -f >/dev/null 2>&1 || true
 }
 
 positive_int_or_default() {
@@ -301,10 +313,12 @@ proxy_alive() {
 # 深度探活：模拟 pool_server 真实 reset 路径——能创建+删 bridge 网络
 docker_deep_alive() {
     local netname="wd_probe_$(date +%s)_$$"
-    if ! timeout 10 docker network create --driver bridge "$netname" >/dev/null 2>&1; then
+    command -v flock >/dev/null 2>&1 || return 0
+    if ! timeout 15 flock -w 10 "${DOCKER_NETWORK_LIFECYCLE_LOCK}" \
+        sh -c 'docker network create --driver bridge "$1" >/dev/null 2>&1 &&
+               docker network rm "$1" >/dev/null 2>&1' sh "${netname}"; then
         return 1
     fi
-    timeout 5 docker network rm "$netname" >/dev/null 2>&1 || true
     return 0
 }
 
@@ -533,7 +547,7 @@ repair_stuck_pool_pending_closes() {
             matched=1
         fi
         timeout 30 docker container prune -f --filter "until=0s" >/dev/null 2>&1 || true
-        timeout 30 docker network prune -f >/dev/null 2>&1 || true
+        docker_network_prune_safe 30
     else
         log "POOL_REPAIR: ${reason}; active rollouts exist, skipping container kill/prune and using pending-close API only"
     fi
@@ -599,7 +613,7 @@ emergency_pressure_relief() {
 
     # 清理 stopped + dangling network（foreground，防并发拖死 dockerd）
     timeout 30 docker container prune -f >/dev/null 2>&1 || true
-    timeout 30 docker network prune -f >/dev/null 2>&1 || true
+    docker_network_prune_safe 30
 }
 
 # ── cgroup 检测（v1 + v2）────────────────────────────────────────────
@@ -1060,7 +1074,7 @@ PY
     LAST_BRIDGE_NETS="$nets"
     if [ "$nets" -gt "$BRIDGE_NETS_WARN" ] 2>/dev/null; then
         log "WARN: ${nets} bridge networks, address-pool risk; pruning"
-        timeout 30 docker network prune -f >/dev/null 2>&1 || true
+        docker_network_prune_safe 30
     fi
     return "${ready_failed}"
 }
@@ -1151,7 +1165,7 @@ cleanup_stopped() {
     local dn
     dn=$(docker network ls --filter "dangling=true" -q 2>/dev/null | wc -l)
     if [ "${dn}" -gt 0 ]; then
-        timeout 20 docker network prune -f >/dev/null 2>&1 || true
+        docker_network_prune_safe 20
     fi
 }
 
@@ -1175,7 +1189,7 @@ docker_disk_stats() {
 disk_prune_light() {
     log "DISK: light cleanup: stopped containers + networks + build cache older than ${DISK_BUILD_CACHE_UNTIL}"
     timeout 30 docker container prune -f --filter "until=2m" >/dev/null 2>&1 || true
-    timeout 30 docker network prune -f >/dev/null 2>&1 || true
+    docker_network_prune_safe 30
     timeout "${WATCHDOG_PRUNE_TIMEOUT}" docker builder prune -af --filter "until=${DISK_BUILD_CACHE_UNTIL}" >/dev/null 2>&1 || true
     timeout 60 docker image prune -f >/dev/null 2>&1 || true
     docker_storage_gc warn
@@ -1887,7 +1901,7 @@ while true; do
         else
             DEEP_PROBE_FAILS=$((DEEP_PROBE_FAILS + 1))
             log "WARN: deep probe failed (network create/rm, fails=${DEEP_PROBE_FAILS}) — likely address-pool exhausted or docker CLI/API wedged"
-            timeout 30 docker network prune -f >/dev/null 2>&1 || true
+            docker_network_prune_safe 30
             if [ "${DEEP_PROBE_FAILS}" -ge 2 ]; then
                 trigger_repair "deep docker network probe failed ${DEEP_PROBE_FAILS} consecutive times"
                 DEEP_PROBE_FAILS=0

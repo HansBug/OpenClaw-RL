@@ -3283,6 +3283,17 @@ def eval_rollout_log(rollout_id, args, data, extra_metrics=None):
     if diag:
         logger.info("%s", diag)
 
+    if all_samples and os.getenv("SWEBENCH_RESULTS_DIR", "").strip():
+        try:
+            from swebench_report import write_official_artifacts
+
+            summary = write_official_artifacts(all_samples)
+            if summary is not None:
+                logger.info("SWE-bench prediction export summary: %s", summary)
+        except Exception:
+            logger.exception("Failed to write SWE-bench prediction artifacts")
+            raise
+
     _write_structured_metrics(records)
     _ensure_terminal_step_metric(args)
     logging_utils.log(args, _filter_wandb_metrics(log_dict), step_key="eval/step")

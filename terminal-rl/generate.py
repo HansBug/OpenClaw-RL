@@ -3659,8 +3659,14 @@ async def generate(
         reward = 0.0
         eval_error: str | None = None
         eval_details: dict[str, Any] | None = None
+        deferred_sweverified = (
+            data_source == "sweverified"
+            and _env_bool("SWEBENCH_DEFER_GRADING", False)
+        )
 
-        if (not is_aborted) and status != Sample.Status.FAILED:
+        if (not is_aborted) and (
+            status != Sample.Status.FAILED or deferred_sweverified
+        ):
             try:
                 assert env_client is not None and lease_id is not None
                 await env_client.heartbeat(lease_id)
@@ -3674,6 +3680,8 @@ async def generate(
                         status=status,
                         parse_error_count=agent_runner.parse_error_count,
                     )
+                elif deferred_sweverified:
+                    eval_payload = {"swebench_defer_grading": True}
                 raw_score = await env_client.evaluate(lease_id, trajectory=eval_payload)
                 reward = float(raw_score)
                 eval_details = _last_eval_details(env_client)
