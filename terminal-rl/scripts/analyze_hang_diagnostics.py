@@ -19,7 +19,8 @@ from typing import Any
 
 TIMESTAMP_RE = re.compile(r"\[(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})\]")
 ROLLOUT_RE = re.compile(r"data\.py:\d+ - rollout (\d+): (\{.+\})")
-TRAIN_RE = re.compile(r"model\.py:\d+ - step (\d+): (\{.+\})")
+# Support both legacy ``step N`` and newer slime ``train-step N`` logs.
+TRAIN_RE = re.compile(r"model\.py:\d+ - (?:train-)?step (\d+): (\{.+\})")
 RESET_500_RE = re.compile(r"Server error '500 .*?/reset")
 HEARTBEAT_500_RE = re.compile(r"Server error '500 .*?/heartbeat")
 EVALUATE_500_RE = re.compile(r"Server error '500 .*?/evaluate")

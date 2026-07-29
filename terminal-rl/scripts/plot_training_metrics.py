@@ -32,7 +32,9 @@ from pathlib import Path
 from typing import Any
 
 ROLLOUT_RE = re.compile(r"data\.py:\d+ - rollout (\d+): (\{.+\})")
-TRAIN_RE = re.compile(r"model\.py:\d+ - step (\d+): (\{.+\})")
+# Newer slime logs use ``train-step N`` while older runs use ``step N``.
+# Accept both so loss/grad/KL curves are not silently emitted empty.
+TRAIN_RE = re.compile(r"model\.py:\d+ - (?:train-)?step (\d+): (\{.+\})")
 PERF_RE = re.compile(r"rollout\.py:\d+ - perf (\d+): (\{.+\})")
 TIMESTAMP_RE = re.compile(r"^\[(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})\]")
 TRAJ_RE = re.compile(

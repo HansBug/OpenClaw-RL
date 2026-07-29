@@ -1471,7 +1471,10 @@ CUSTOM_ARGS=(
   --custom-eval-rollout-log-function-path rollout_log.eval_rollout_log
 )
 if [[ "${EXPLORE_ADVANTAGE_BONUS_ENABLED}" == "1" ]]; then
-  CUSTOM_ARGS+=(--custom-reward-post-process-path reward_postprocess.post_process_rewards)
+  # Keep the historical hook as the default, while allowing an rjob variant to
+  # test a drop-in post-process fix without forking this large launcher.
+  CUSTOM_REWARD_POST_PROCESS_PATH="${CUSTOM_REWARD_POST_PROCESS_PATH:-reward_postprocess.post_process_rewards}"
+  CUSTOM_ARGS+=(--custom-reward-post-process-path "${CUSTOM_REWARD_POST_PROCESS_PATH}")
 fi
 # --custom-config-path is optional in slime; only attach it if the yaml exists.
 if [[ -f "${CUSTOM_CONFIG_PATH}" ]]; then
@@ -1622,6 +1625,15 @@ fi
 # Pre-flight: sanity check each pool worker before launching training
 # (issue #3 §1.X-E: early detection of worker transport flakes).
 if [[ "${NEEDS_ENV_ROUTER}" == "1" ]]; then
+  # Router startup may wait indefinitely while its workers file is hot-reloaded.
+  # Keep the direct preflight aligned with the worker set that made the router
+  # ready instead of probing the stale WORKER_URLS snapshot from process start.
+  _REFRESHED_WORKER_URLS="$(read_worker_urls_from_file "${WORKER_URLS_FILE}")"
+  if [[ -n "${_REFRESHED_WORKER_URLS}" && "${_REFRESHED_WORKER_URLS}" != "${WORKER_URLS}" ]]; then
+    log "Worker URLs changed during router startup; refreshing preflight targets: ${WORKER_URLS} -> ${_REFRESHED_WORKER_URLS}"
+    WORKER_URLS="${_REFRESHED_WORKER_URLS}"
+    export WORKER_URLS
+  fi
   log "Probing worker endpoints..."
   IFS=',' read -r -a _WORKERS <<< "${WORKER_URLS}"
   READY_WORKERS=0

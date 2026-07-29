@@ -1,7 +1,42 @@
 # terminal-rl/scripts/
 
-Reusable analysis tools for terminal-rl training runs. All scripts accept
-`--run-dir <path>` and read/write under that directory.
+Reusable analysis tools for terminal-rl training runs. Single-run scripts accept
+`--run-dir <path>` and read/write under that directory; comparison scripts take
+the run paths explicitly.
+
+## compare_filtered_rollout_steps.py
+
+Compares SETA training runs without treating Docker/server-failure attempts as
+algorithm rollout progress. It keeps the unfiltered `rollout_id` diagnostic,
+then filters to `dataset=seta`, `phase=train`, `trainable_count > 0`, and finite
+`raw_reward`, and re-indexes those effective rollout steps contiguously.
+
+```bash
+python terminal-rl/scripts/compare_filtered_rollout_steps.py \
+  --baseline-run runs/<baseline_run_id> \
+  --experiment-run runs/<dive_po_run_id> \
+  --output-dir runs/<dive_po_run_id>/metrics/analysis \
+  --experiment-label "DiVE-PO v0716 centered-gate"
+```
+
+Outputs four baseline-comparison figures plus `*_report.md` and `*_meta.json`
+files for the actual-ID, all-effective-step, common-budget, and final filtered
+reward views.
+
+## plot_dive_po_exploration.py
+
+Refreshes the DiVE-PO-specific episodic/lifelong/fused/UCB curves, SQLite arm
+event plots, fair valid-step baseline comparison, `exploration_analysis.json`,
+and the concise `report.md` snapshot.
+
+```bash
+python terminal-rl/scripts/plot_dive_po_exploration.py \
+  --run-dir runs/<dive_po_run_id> \
+  --baseline-run runs/<baseline_run_id>
+```
+
+Run `plot_training_metrics.py` and `compare_filtered_rollout_steps.py` first so
+the standard curves and detailed filtered comparison use the same snapshot.
 
 ## analyze_trajectories.py
 
