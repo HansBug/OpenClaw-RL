@@ -393,3 +393,121 @@ def test_parse_claude_stream_json_prefers_result_event():
     )
     assert text == "final answer"
     assert isinstance(raw, list)
+
+
+def test_claude_code_sglang_backend_bridges_qwen_tool_use(tmp_path, monkeypatch):
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+    import threading
+
+    received = []
+
+    class EnvHandler(BaseHTTPRequestHandler):
+        def log_message(self, fmt, *args):
+            return None
+
+        def do_POST(self):
+            length = int(self.headers.get("Content-Length") or "0")
+            payload = json.loads(self.rfile.read(length).decode("utf-8") or "{}")
+            if self.path == "/heartbeat":
+                body = {"ok": True}
+            elif self.path == "/exec_tool":
+                received.append(payload)
+                body = {"ok": True, "observation": "created file"}
+            else:
+                body = {"ok": False, "error": "not found"}
+            raw = json.dumps(body).encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(raw)))
+            self.end_headers()
+            self.wfile.write(raw)
+
+    httpd = ThreadingHTTPServer(("127.0.0.1", 0), EnvHandler)
+    thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+    thread.start()
+
+    qwen_record = {
+        "messages": [{"role": "user", "content": "fix the bug"}],
+        "input_ids": [1, 2, 3],
+        "output_token_ids": [101, 102],
+        "output_token_logprobs": [-0.1, -0.2],
+        "output_text": "<tool_call>...</tool_call>",
+        "finish_reason": "tool_calls",
+        "latency_ms": 12.0,
+        "anthropic_content": [
+            {
+                "type": "tool_use",
+                "name": "mcp__terminal_rl__shell_exec",
+                "input": {"command": "echo ok > /tmp/out", "block": True, "timeout": 20},
+            }
+        ],
+    }
+
+    class FakeGateway:
+        def __init__(self, *, sglang_client, records_path, model_name):
+            _ = (sglang_client, model_name)
+            self.base_url = "http://127.0.0.1:12345"
+            self.records_path = records_path
+
+        def start(self):
+            self.records_path.write_text(json.dumps(qwen_record) + "\n", encoding="utf-8")
+            return self.base_url
+
+        def close(self):
+            return None
+
+        def records(self):
+            return [dict(qwen_record)]
+
+    class FakeEnv:
+        base_url = f"http://127.0.0.1:{httpd.server_address[1]}"
+
+    fake_cli = tmp_path / "claude"
+    fake_cli.write_text(
+        "#!/usr/bin/env python3\n"
+        "import json, sys\n"
+        "_ = sys.stdin.read()\n"
+        "print(json.dumps({'result': 'done'}))\n",
+        encoding="utf-8",
+    )
+    fake_cli.chmod(0o755)
+
+    monkeypatch.setattr(claude_agent_module, "ClaudeCodeQwenGateway", FakeGateway)
+    monkeypatch.setenv("CLAUDE_CODE_CLI", str(fake_cli))
+    monkeypatch.setenv("CLAUDE_CODE_LLM_BACKEND", "sglang")
+    monkeypatch.setenv("CLAUDE_CODE_WORKSPACE_ROOT", str(tmp_path / "workspaces"))
+    monkeypatch.setenv("CLAUDE_CODE_MCP_PYTHON", sys.executable)
+    monkeypatch.setenv("CLAUDE_CODE_TURN_TIMEOUT_SEC", "5")
+    monkeypatch.setenv("CLAUDE_CODE_QWEN_BRIDGE_MAX_TOOL_CALLS", "1")
+
+    try:
+        agent = claude_agent_module.ClaudeCodeAgent(
+            model_type="Qwen3",
+            sglang_client=DummySGLangClient(),
+            env_client=FakeEnv(),
+            lease_id="lease-1",
+            run_context=types.SimpleNamespace(uid="abc123"),
+            task_meta={"task_name": "seta-task", "task_path": "seta_env/1"},
+            max_total_tokens=8192,
+        )
+        agent.start_turn_loop("fix the bug")
+        context, _ = asyncio.run(agent.get_turn_context())
+        result = asyncio.run(
+            agent.run_model_turn(
+                context_messages=context,
+                sglang_client=DummySGLangClient(),
+                tool_schemas=[],
+                turn_idx=0,
+            )
+        )
+    finally:
+        httpd.shutdown()
+        httpd.server_close()
+        thread.join(timeout=2)
+
+    assert received
+    assert received[0]["lease_id"] == "lease-1"
+    assert received[0]["tool_call"]["name"] == "shell_exec"
+    assert result.model_response.tool_calls_count == 1
+    assert result.model_response.tool_calls[0]["source"] == "qwen-gateway-direct-bridge"
+    assert result.model_response.tool_calls[0]["result"] == "created file"

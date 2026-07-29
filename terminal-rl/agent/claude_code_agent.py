@@ -17,6 +17,7 @@ from dataclasses import dataclass, field
 from functools import lru_cache
 from pathlib import Path
 from typing import Any, Dict, List
+from urllib import error, request
 
 from agent.claude_code_qwen_gateway import ClaudeCodeQwenGateway
 from agent.prompts import get_developer_agent_prompt
@@ -318,6 +319,22 @@ class ClaudeCodeAgent:
         self._disallowed_tools = os.getenv("CLAUDE_CODE_DISALLOWED_TOOLS", "").strip()
         self._extra_args = os.getenv("CLAUDE_CODE_EXTRA_ARGS", "").strip()
         self._system_prompt = os.getenv("CLAUDE_CODE_SYSTEM_PROMPT", "").strip()
+        self._execute_qwen_tool_bridge = _env_flag(
+            "CLAUDE_CODE_EXECUTE_QWEN_TOOL_USES",
+            self._uses_sglang_gateway(),
+        )
+        self._qwen_tool_bridge_max_calls = max(
+            0,
+            _env_int("CLAUDE_CODE_QWEN_BRIDGE_MAX_TOOL_CALLS", 1),
+        )
+        self._minimal_system_prompt = _env_flag(
+            "CLAUDE_CODE_MINIMAL_SYSTEM_PROMPT",
+            self._uses_sglang_gateway(),
+        )
+        self._accept_qwen_partial_on_timeout = _env_flag(
+            "CLAUDE_CODE_ACCEPT_QWEN_PARTIAL_ON_TIMEOUT",
+            self._uses_sglang_gateway(),
+        )
 
     def set_max_parse_errors(self, max_parse_errors: int) -> None:
         self.max_parse_errors = max(1, int(max_parse_errors))
@@ -371,8 +388,12 @@ class ClaudeCodeAgent:
         completed = await self._run_claude_code_async(self._prompt)
         latency_ms = (time.monotonic() - started) * 1000.0
         text, raw_result = _parse_claude_output(completed.stdout, self._output_format)
-        tool_calls = self._load_tool_calls()
         qwen_records = self._load_qwen_gateway_records()
+        tool_calls = self._load_tool_calls()
+        if self._uses_sglang_gateway() and not tool_calls:
+            bridged_tool_calls = self._execute_qwen_tool_uses(qwen_records)
+            if bridged_tool_calls:
+                tool_calls = self._load_tool_calls()
         if self._uses_sglang_gateway():
             if not qwen_records:
                 raise RuntimeError(
@@ -467,12 +488,61 @@ class ClaudeCodeAgent:
                 check=False,
             )
         except subprocess.TimeoutExpired as exc:
+            self._stdout_path.write_text(exc.stdout or "", encoding="utf-8")
+            self._stderr_path.write_text(exc.stderr or "", encoding="utf-8")
+            if self._accept_qwen_partial_on_timeout:
+                partial = self._completed_from_qwen_partial_timeout(args, exc)
+                if partial is not None:
+                    return partial
             raise TimeoutError(
                 f"claude-code CLI timed out after {self._turn_timeout_sec:.0f}s"
             ) from exc
 
         self._check_completed(completed)
         return completed
+
+    def _completed_from_qwen_partial_timeout(
+        self,
+        args: list[str],
+        exc: subprocess.TimeoutExpired,
+    ) -> subprocess.CompletedProcess[str] | None:
+        records = self._load_qwen_gateway_records()
+        if not records:
+            return None
+        last_text = ""
+        for record in reversed(records):
+            last_text = str(
+                record.get("clean_text")
+                or record.get("output_text")
+                or ""
+            ).strip()
+            if last_text:
+                break
+        if not last_text:
+            last_text = "Claude Code timed out after the local Qwen gateway produced records."
+        stdout_payload = {
+            "type": "terminal_rl_partial_timeout",
+            "result": last_text,
+            "terminal_rl_partial_timeout": True,
+            "timeout_sec": self._turn_timeout_sec,
+            "qwen_gateway_turns": len(records),
+        }
+        stdout = json.dumps(stdout_payload, ensure_ascii=False)
+        stderr = exc.stderr or ""
+        if stderr:
+            stderr += "\n"
+        stderr += (
+            "[terminal-rl] claude-code CLI timed out; returning captured "
+            "Qwen gateway output as a partial trainable sample."
+        )
+        self._stdout_path.write_text(stdout, encoding="utf-8")
+        self._stderr_path.write_text(stderr, encoding="utf-8")
+        return subprocess.CompletedProcess(
+            args=args,
+            returncode=0,
+            stdout=stdout,
+            stderr=stderr,
+        )
 
     async def _run_claude_code_async(self, prompt: str) -> subprocess.CompletedProcess[str]:
         result: list[subprocess.CompletedProcess[str]] = []
@@ -587,13 +657,6 @@ class ClaudeCodeAgent:
         return supported
 
     def _default_system_prompt(self) -> str:
-        camel_prompt = get_developer_agent_prompt(
-            current_date=str(date.today()),
-            system="Linux (in Docker)",
-            machine=os.getenv("CLAUDE_CODE_MACHINE", "x86_64"),
-            is_workforce=False,
-            non_think_mode=self._non_think_mode,
-        )
         mcp_boundary = (
             "You are running inside the OpenClaw terminal-rl harness. Use only the "
             "terminal_rl MCP tools for task inspection and modification; they execute "
@@ -601,7 +664,28 @@ class ClaudeCodeAgent:
             "read_file, write_file, list_dir, shell_view, and shell_write_to_process "
             "through the MCP server for all reads, writes, and commands. Do not rely "
             "on local Read, Write, Edit, or Bash tools for task state. Keep command "
-            "output bounded and stop once the task is complete."
+            "output bounded and stop once the task is complete. When using tools, emit "
+            "exactly one valid tool call for the next action; do not wrap tool JSON in "
+            "prose, markdown, or shell quoting. Keep private reasoning very short. If "
+            "you can solve the task with a command or file write, call the appropriate "
+            "terminal_rl MCP tool immediately. After the task is solved, return one "
+            "brief final answer and do not request more tools."
+        )
+        if self._minimal_system_prompt:
+            return (
+                "/no_think\n"
+                "You are in OpenClaw terminal-rl. Do not write long reasoning. "
+                "Use exactly one terminal_rl MCP tool call for the next concrete action. "
+                "Use only mcp__terminal_rl tools, never local filesystem tools. "
+                "If the task is complete, answer briefly and stop.\n"
+                f"<terminal_rl_mcp_boundary>\n{mcp_boundary}\n</terminal_rl_mcp_boundary>"
+            )
+        camel_prompt = get_developer_agent_prompt(
+            current_date=str(date.today()),
+            system="Linux (in Docker)",
+            machine=os.getenv("CLAUDE_CODE_MACHINE", "x86_64"),
+            is_workforce=False,
+            non_think_mode=self._non_think_mode,
         )
         return f"{camel_prompt}\n\n<terminal_rl_mcp_boundary>\n{mcp_boundary}\n</terminal_rl_mcp_boundary>"
 
@@ -705,6 +789,141 @@ class ClaudeCodeAgent:
             if isinstance(item, dict):
                 records.append(item)
         return records
+
+    def _execute_qwen_tool_uses(self, records: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        if not self._execute_qwen_tool_bridge or self._qwen_tool_bridge_max_calls <= 0:
+            return []
+        if self._env_client is None or self._lease_id is None:
+            return []
+
+        bridged: list[dict[str, Any]] = []
+        for record in records:
+            for block in record.get("anthropic_content") or []:
+                if not isinstance(block, dict) or block.get("type") != "tool_use":
+                    continue
+                raw_name = str(block.get("name") or "").strip()
+                if not raw_name:
+                    continue
+                arguments = block.get("input") or {}
+                if not isinstance(arguments, dict):
+                    arguments = {"value": arguments}
+                tool_name = self._normalize_terminal_tool_name(raw_name)
+                if not tool_name:
+                    continue
+                bridged.append(self._exec_terminal_tool_bridge(tool_name, arguments, raw_name))
+                if len(bridged) >= self._qwen_tool_bridge_max_calls:
+                    return bridged
+        return bridged
+
+    def _normalize_terminal_tool_name(self, raw_name: str) -> str | None:
+        name = raw_name.strip()
+        if name.startswith("mcp__terminal_rl__"):
+            name = name[len("mcp__terminal_rl__") :]
+        elif name.startswith("terminal_rl__"):
+            name = name[len("terminal_rl__") :]
+        allowed = {
+            "shell_exec",
+            "shell_view",
+            "shell_write_to_process",
+            "shell_write_content_to_file",
+            "read_file",
+            "write_file",
+            "list_dir",
+        }
+        if name not in allowed:
+            logger.warning("Skipping unsupported Qwen terminal tool %r", raw_name)
+            return None
+        if name == "read_file":
+            return "shell_exec"
+        if name == "write_file":
+            return "shell_write_content_to_file"
+        if name == "list_dir":
+            return "shell_exec"
+        return name
+
+    def _normalize_terminal_tool_args(self, tool_name: str, arguments: dict[str, Any]) -> dict[str, Any]:
+        args = dict(arguments)
+        if tool_name == "shell_exec":
+            args.setdefault("id", "")
+            args.setdefault("block", True)
+            args.setdefault("timeout", 20)
+            if "command" in args:
+                return args
+            if "file_path" in args:
+                return {"id": "", "command": f"head -c 20000 {shlex.quote(str(args['file_path']))}", "block": True, "timeout": 20}
+            if "path" in args:
+                max_entries = args.get("max_entries", 200)
+                return {"id": "", "command": f"ls -la {shlex.quote(str(args['path']))} | head -n {int(max_entries)}", "block": True, "timeout": 20}
+        if tool_name == "shell_write_content_to_file" and "content" in args:
+            if "file_path" not in args and "path" in args:
+                args["file_path"] = args.pop("path")
+        return args
+
+    def _env_json_post(self, path: str, payload: dict[str, Any], *, timeout: float) -> dict[str, Any]:
+        base_url = str(getattr(self._env_client, "base_url", "")).rstrip("/")
+        if not base_url:
+            raise RuntimeError("env_client.base_url is required for Qwen tool bridge")
+        body = json.dumps(payload).encode("utf-8")
+        req = request.Request(
+            f"{base_url}{path}",
+            data=body,
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with request.urlopen(req, timeout=timeout) as resp:
+            text = resp.read().decode("utf-8")
+            return json.loads(text) if text else {}
+
+    def _exec_terminal_tool_bridge(
+        self,
+        tool_name: str,
+        arguments: dict[str, Any],
+        raw_name: str,
+    ) -> dict[str, Any]:
+        args = self._normalize_terminal_tool_args(tool_name, arguments)
+        call_id = f"qwen-bridge-{uuid.uuid4().hex[:16]}"
+        started = time.monotonic()
+        record: dict[str, Any] = {
+            "tool_call_id": call_id,
+            "tool_name": tool_name,
+            "raw_tool_name": raw_name,
+            "args": dict(args),
+            "source": "qwen-gateway-direct-bridge",
+        }
+        try:
+            try:
+                self._env_json_post("/heartbeat", {"lease_id": str(self._lease_id)}, timeout=30.0)
+            except Exception:
+                pass
+            out = self._env_json_post(
+                "/exec_tool",
+                {
+                    "lease_id": str(self._lease_id),
+                    "tool_call": {"name": tool_name, "arguments": args},
+                },
+                timeout=max(1.0, self._tool_timeout_ms / 1000.0),
+            )
+            if not out.get("ok", False):
+                raise RuntimeError(f"exec_tool failed: {out}")
+            observation = str(out.get("observation", ""))
+            record["result"] = observation[:4096]
+            return record
+        except error.HTTPError as exc:
+            detail = exc.read().decode("utf-8", errors="replace")[:1000]
+            record["error"] = f"HTTPError {exc.code}: {detail}"
+            raise RuntimeError(record["error"]) from exc
+        except Exception as exc:
+            record["error"] = f"{type(exc).__name__}: {exc}"
+            raise
+        finally:
+            record["latency_ms"] = (time.monotonic() - started) * 1000.0
+            self._append_tool_call_record(record)
+
+    def _append_tool_call_record(self, record: dict[str, Any]) -> None:
+        self._tool_log_path.parent.mkdir(parents=True, exist_ok=True)
+        with self._tool_log_path.open("a", encoding="utf-8") as fh:
+            fh.write(json.dumps(record, ensure_ascii=False, default=str))
+            fh.write("\n")
 
     def _interactions_from_qwen_records(
         self,

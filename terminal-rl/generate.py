@@ -94,6 +94,18 @@ async def _await_with_optional_timeout(awaitable, timeout: float, *, op_name: st
         raise TimeoutError(f"{op_name} timed out after {timeout:.1f}s") from exc
 
 
+def _is_reset_fresh_lease_retryable(exc: BaseException) -> bool:
+    text = f"{type(exc).__name__}: {exc}"
+    retry_markers = (
+        "WORKER_RESET_ADMISSION_BACKLOG",
+        "TASK_SLOTS_EXHAUSTED",
+        "LEASE_EXPIRED",
+        "410 Gone",
+        "503 Service Unavailable",
+    )
+    return any(marker in text for marker in retry_markers)
+
+
 _REMOTE_ENV_CONDITION: asyncio.Condition | None = None
 _REMOTE_ENV_ACTIVE_BY_TASK: dict[str, int] = {}
 _REMOTE_ENV_ACTIVE_TOTAL = 0
@@ -1984,7 +1996,12 @@ def _save_rollout_artifacts(
                 },
             )
             return
-        if str(status) == "Status.FAILED" and raw_score == 0.0 and len(turn_records) <= 1:
+        if (
+            str(status) == "Status.FAILED"
+            and raw_score == 0.0
+            and len(turn_records) <= 1
+            and not _env_bool("TRAJECTORY_SAVE_FAILED_SHORT_ROLLOUTS", False)
+        ):
             _attach_trajectory_save_metadata(
                 samples,
                 sample,
@@ -3064,6 +3081,7 @@ async def generate(
     lease_id: Optional[str] = None
     remote_env_admission_key: Optional[str] = None
     agent_runner = None
+    heartbeat_task: asyncio.Task | None = None
 
     prm_enable = bool(getattr(args, "prm_enable", False)) and (not evaluation)
     prm_coef = float(getattr(args, "prm_turn_coef", 1.0))
@@ -3138,35 +3156,118 @@ async def generate(
                 f"{run_ctx.sample_index}:reset"
             )
 
-        # P0 FIX (corrected): Do NOT retry reset with same lease_id
-        # First principles: lease_id is a handle to server-side resource.
-        # After timeout, server has cleaned up the lease, making it invalid.
-        # Retrying with same lease_id causes "Unknown run_lease_id" errors.
-        # Correct approach: Fail fast, let outer retry loop allocate new lease.
-        reset_coro = env_client.reset(**reset_kwargs)
-        try:
-            reset_payload = await _await_with_optional_timeout(
-                reset_coro,
-                reset_http_timeout,
-                op_name=f"{_log_tag} env reset",
+        # Reset can fail because the remote worker admitted the lease but could not
+        # enter reset before its admission timeout.  In that state the server may
+        # clean up the lease and subsequent reset attempts return 410.  Never retry
+        # the same lease after those failures; close it best-effort and allocate a
+        # fresh lease with a unique request_id instead.
+        reset_fresh_lease_retries = (
+            max(0, _env_int("ENV_RESET_FRESH_LEASE_RETRIES", 2))
+            if _uses_remote_terminal_env(task_meta)
+            else 0
+        )
+        reset_payload: dict[str, Any] | None = None
+        for reset_attempt in range(reset_fresh_lease_retries + 1):
+            reset_kwargs["lease_id"] = lease_id
+            if remote_env_admission_key is not None:
+                reset_kwargs["request_id"] = (
+                    f"{task_key}:{run_ctx.uid}:{run_ctx.group_index}:"
+                    f"{run_ctx.sample_index}:reset:{reset_attempt}"
+                )
+            reset_coro = env_client.reset(**reset_kwargs)
+            try:
+                reset_payload = await _await_with_optional_timeout(
+                    reset_coro,
+                    reset_http_timeout,
+                    op_name=f"{_log_tag} env reset",
+                )
+                break
+            except (TimeoutError, asyncio.TimeoutError) as reset_exc:
+                should_retry_reset = reset_attempt < reset_fresh_lease_retries
+                logger.error(
+                    "%s Reset timed out after %.1fs on lease %s%s",
+                    _log_tag,
+                    reset_http_timeout,
+                    lease_id,
+                    "; allocating fresh lease" if should_retry_reset else "",
+                )
+                try:
+                    await env_client.close(lease_id)
+                except Exception as close_exc:
+                    logger.debug(
+                        "%s Best-effort close after reset timeout: %s",
+                        _log_tag,
+                        close_exc,
+                    )
+                if not should_retry_reset:
+                    raise reset_exc
+            except Exception as reset_exc:
+                should_retry_reset = (
+                    reset_attempt < reset_fresh_lease_retries
+                    and _is_reset_fresh_lease_retryable(reset_exc)
+                )
+                if not should_retry_reset:
+                    raise
+                logger.warning(
+                    "%s Reset failed on lease %s with retryable remote error; "
+                    "allocating fresh lease (attempt %d/%d): %s",
+                    _log_tag,
+                    lease_id,
+                    reset_attempt + 1,
+                    reset_fresh_lease_retries,
+                    reset_exc,
+                )
+                try:
+                    await env_client.close(lease_id)
+                except Exception as close_exc:
+                    logger.debug(
+                        "%s Best-effort close after reset failure: %s",
+                        _log_tag,
+                        close_exc,
+                    )
+
+            fresh_request_id = (
+                f"{task_key}:{run_ctx.uid}:{run_ctx.group_index}:"
+                f"{run_ctx.sample_index}:reset-fresh:{reset_attempt + 1}:"
+                f"{uuid.uuid4().hex[:8]}"
             )
-        except (TimeoutError, asyncio.TimeoutError) as reset_exc:
-            # Reset failed: proactively close lease to prevent slot leak
-            logger.error(
-                "%s Reset failed after %.1fs, closing lease %s to prevent slot leak",
+            allocate_timeout = _env_float("ENV_ALLOCATE_HTTP_TIMEOUT", 300.0)
+            fresh_lease = await _await_with_optional_timeout(
+                env_client.allocate(task_key=task_key, request_id=fresh_request_id),
+                allocate_timeout,
+                op_name=f"{_log_tag} terminal env re-allocate after reset failure",
+            )
+            lease_id = str(fresh_lease["lease_id"])
+            logger.info(
+                "%s Re-allocated remote terminal env lease=%s after reset failure",
                 _log_tag,
-                reset_http_timeout,
                 lease_id,
             )
-            try:
-                await env_client.close(lease_id)
-            except Exception as close_exc:
-                logger.debug(
-                    "%s Best-effort close after reset failure: %s",
-                    _log_tag,
-                    close_exc,
-                )
-            raise reset_exc
+        if reset_payload is None:
+            raise RuntimeError(f"{_log_tag} env reset did not return a payload")
+
+        heartbeat_interval = _env_float("ENV_HEARTBEAT_INTERVAL", 30.0)
+        if _uses_remote_terminal_env(task_meta) and heartbeat_interval > 0:
+            async def _remote_env_heartbeat_loop() -> None:
+                assert env_client is not None and lease_id is not None
+                while True:
+                    await asyncio.sleep(heartbeat_interval)
+                    try:
+                        await env_client.heartbeat(lease_id)
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception as heartbeat_exc:
+                        logger.warning(
+                            "%s Background heartbeat failed for lease %s: %s",
+                            _log_tag,
+                            lease_id,
+                            heartbeat_exc,
+                        )
+                        if _is_reset_fresh_lease_retryable(heartbeat_exc):
+                            return
+
+            heartbeat_task = asyncio.create_task(_remote_env_heartbeat_loop())
+
         user_msg = str(reset_payload.get("user_msg", ""))
         raw_tools = list(reset_payload.get("tool_schemas", []))
         logger.info("%s Start terminal rollout", _log_tag)
@@ -4099,9 +4200,74 @@ async def generate(
             sample.response_length = 1
             sample.rollout_log_probs = [0.0]
             sample.loss_mask = [0]
+
+        failed_turn_records = list(turn_records)
+        if not failed_turn_records and _env_bool("TRAJECTORY_SAVE_FAILED_SHORT_ROLLOUTS", False):
+            agent_artifacts: dict[str, Any] = {}
+            rollout_agent = getattr(agent_runner, "_rollout_agent", None) if agent_runner is not None else None
+            for attr, key in (
+                ("_local_run_dir", "local_run_dir"),
+                ("_workspace", "workspace"),
+                ("_stdout_path", "stdout_path"),
+                ("_stderr_path", "stderr_path"),
+                ("_tool_log_path", "tool_calls_path"),
+                ("_qwen_records_path", "qwen_gateway_records_path"),
+            ):
+                value = getattr(rollout_agent, attr, None) if rollout_agent is not None else None
+                if value is not None:
+                    agent_artifacts[key] = str(value)
+            failed_turn_records = [
+                {
+                    "turn_idx": 0,
+                    "harness_option": locals().get("agent_type", None),
+                    "context_messages": [{"role": "user", "content": user_msg}] if "user_msg" in locals() else [],
+                    "assistant_output": "",
+                    "finish_reason": "generate_failed",
+                    "latency_ms": 0.0,
+                    "n_input_tokens": 0,
+                    "n_output_tokens": 0,
+                    "parse_error_recorded": False,
+                    "tool_calls": [],
+                    "error": {
+                        "type": type(exc).__name__,
+                        "message": str(exc),
+                    },
+                    "agent_artifacts": agent_artifacts,
+                }
+            ]
+        if failed_turn_records:
+            _save_rollout_artifacts(
+                task_spec=task_spec,
+                run_ctx=run_ctx,
+                sampling_params=sampling_params,
+                sample=sample,
+                samples=[sample],
+                status=sample.status,
+                raw_score=0.0,
+                eval_error=f"{type(exc).__name__}: {exc}",
+                turn_records=failed_turn_records,
+                safety_meta=sample.metadata.get("safety") if sample.metadata else None,
+                prm_meta=sample.metadata.get("prm") if sample.metadata else None,
+                safety_coef=safety_coef,
+                prm_coef=prm_coef,
+                trajectory_save_interval=traj_save_interval,
+            )
         return [sample]
 
     finally:
+        if heartbeat_task is not None:
+            heartbeat_task.cancel()
+            try:
+                await heartbeat_task
+            except asyncio.CancelledError:
+                pass
+            except Exception as heartbeat_exc:
+                logger.debug(
+                    "%s Background heartbeat task ended with error: %s",
+                    _log_tag,
+                    heartbeat_exc,
+                )
+
         for _turn_idx, t in prm_pending:
             if not t.done():
                 t.cancel()
