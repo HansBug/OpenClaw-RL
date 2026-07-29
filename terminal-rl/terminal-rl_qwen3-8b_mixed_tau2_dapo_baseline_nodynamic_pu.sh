@@ -1,26 +1,23 @@
 #!/usr/bin/env bash
-# Terminal-RL Qwen3-8B dataset-selectable GRPO/DAPO baseline.
+# Terminal-RL Qwen3-8B mixed-data + tau2 DAPO baseline without dynamic sampling.
 #
 # Defaults:
-#   * DATASET=mixed with seta:safety:agentharm = 6:2:2; supports swe-smith
-#   * ALGO=dapo, DAPO_DYNAMIC_SAMPLING=0 for the no-dynamic DAPO baseline
+#   * DATASET=mixed with seta:tau2:agentharm:agentsafetybench = 7:1:1:1
+#   * ALGO=dapo, DAPO_DYNAMIC_SAMPLING=0
 #   * CUSTOM_CONFIG_PATH=configs/rollout_qwen3_think.yaml
 #   * HARNESS_OPTION=camel-agent, MAX_TURN=10
 #
-# Prerequisites (remote worker):
-#   1. Pool server(s) running on reachable host(s), default port 18081 for SETA:
+# Prerequisites (remote 4-GPU worker):
+#   1. Pool server(s) running on reachable host(s), default port 18081:
 #        bash terminal-rl/remote/run_pool_server_pu_v2.sh
-#      SWE-smith uses a separate worker, default port 18082:
-#        bash terminal-rl/remote/run_pool_server_swesmith_pu.sh
-#   2. WORKER_URLS exported for the selected dataset, e.g.
+#   2. WORKER_URLS exported, e.g.
 #        export WORKER_URLS="http://<worker-ip>:18081"
-#        export WORKER_URLS="http://<worker-ip>:18082"
-#   3. Converted dataset files available.
+#   3. Converted SetA / tau2 / AgentHarm / Agent-SafetyBench datasets available.
 #
 # Usage:
-#   DATASET=mixed ALGO=dapo bash terminal-rl/terminal-rl_qwen3-8b_mixed_dapo_nodynamic_pu.sh
-#   DATASET=swe-smith ALGO=dapo bash terminal-rl/terminal-rl_qwen3-8b_mixed_dapo_nodynamic_pu.sh
-#   DATASET=seta ALGO=grpo bash terminal-rl/terminal-rl_qwen3-8b_mixed_dapo_nodynamic_pu.sh
+#   bash terminal-rl/terminal-rl_qwen3-8b_mixed_tau2_dapo_baseline_nodynamic_pu.sh
+#   DEBUG_MODE=1 bash terminal-rl/terminal-rl_qwen3-8b_mixed_tau2_dapo_baseline_nodynamic_pu.sh
+#   NUM_GPUS=4 ACTOR_GPUS=2 ROLLOUT_GPUS=2 bash ..._mixed_tau2_dapo_baseline_nodynamic_pu.sh
 #
 # Structured reward observability:
 #   TERMINAL_STRUCTURED_METRICS=1 writes per-rollout dataset reward breakdowns
@@ -31,17 +28,6 @@ set -x
 
 log() { echo "[$(date +'%F %T')] $*"; }
 require_cmd() { command -v "$1" >/dev/null 2>&1 || { echo "[ERROR] missing cmd: $1"; exit 1; }; }
-normalize_dataset() {
-  case "$1" in
-    swemith|swe-smith|swe_smith|SWE-Smith|SWESMITH)
-      echo "[WARN] DATASET=$1 normalized to DATASET=swesmith" >&2
-      echo "swesmith"
-      ;;
-    *)
-      echo "$1"
-      ;;
-  esac
-}
 
 # ── Conda env (Python 3.12 with transformer_engine + sglang) ─────────
 # This is THE only python on this worker that has TE installed:
@@ -109,8 +95,7 @@ CUSTOM_CONFIG_PATH="${CUSTOM_CONFIG_PATH:-${SCRIPT_DIR}/configs/rollout_qwen3_th
 HF_CKPT="${HF_CKPT:-/mnt/shared-storage-user/puyuan/code/slime/Qwen3-8B/}"
 REF_LOAD="${REF_LOAD:-/mnt/shared-storage-user/puyuan/code/slime/Qwen3-8B_torch_dist/}"
 
-EXPORT_ROOT="${EXPORT_ROOT:-/mnt/shared-storage-gpfs2/narmodel/agenticrl}"
-
+EXPORT_ROOT="${EXPORT_ROOT:-/mnt/shared-storage-user/narmodel/agenticrl}"
 RUN_TIMESTAMP="${RUN_TIMESTAMP:-$(date +%F_%H%M%S)}"
 DEBUG_MODE="${DEBUG_MODE:-0}"
 # Defaults needed early so the run directory name carries the key experiment
@@ -124,21 +109,14 @@ case "${ALGO}" in
     ;;
 esac
 export ALGO
-DATASET="$(normalize_dataset "${DATASET:-mixed}")"
+DATASET="${DATASET:-mixed}"
 case "${DATASET}" in
-  seta|safety|agentharm|mixed|swesmith) ;;
+  seta|safety|agentharm|tau2|mixed) ;;
   *)
-    echo "[ERROR] Unknown DATASET=${DATASET}. Use: seta|safety|agentharm|mixed|swesmith"
+    echo "[ERROR] Unknown DATASET=${DATASET}. Use: seta|safety|agentharm|tau2|mixed"
     exit 1
     ;;
 esac
-if [[ "${DATASET}" == "swesmith" ]]; then
-  export ENSURE_IMAGE_TIMEOUT="${ENSURE_IMAGE_TIMEOUT:-1800}"
-  export RESET_SESSION_TIMEOUT="${RESET_SESSION_TIMEOUT:-900}"
-  export CLOSE_SESSION_TIMEOUT="${CLOSE_SESSION_TIMEOUT:-90}"
-  export EVAL_TIMEOUT="${EVAL_TIMEOUT:-1200}"
-  export ROUTER_FORWARD_TIMEOUT="${ROUTER_FORWARD_TIMEOUT:-5100}"
-fi
 HARNESS_OPTION="${HARNESS_OPTION:-camel-agent}"
 case "${HARNESS_OPTION}" in
   camel-agent|camel_agent)
@@ -159,9 +137,10 @@ SETA_SAFETY="${SETA_SAFETY:-none}"
 SAFETY_BENCH_REWARD="${SAFETY_BENCH_REWARD:-dense_rule}"
 AGENTHARM_REWARD="${AGENTHARM_REWARD:-dense_rule}"
 SAFETY_REWARD_COEF="${SAFETY_REWARD_COEF:-0}"
-MIX_SETA_RATIO="${MIX_SETA_RATIO:-6}"
-MIX_SAFETY_RATIO="${MIX_SAFETY_RATIO:-2}"
-MIX_AGENTHARM_RATIO="${MIX_AGENTHARM_RATIO:-2}"
+MIX_SETA_RATIO="${MIX_SETA_RATIO:-7}"
+MIX_TAU2_RATIO="${MIX_TAU2_RATIO:-1}"
+MIX_AGENTHARM_RATIO="${MIX_AGENTHARM_RATIO:-1}"
+MIX_SAFETY_RATIO="${MIX_SAFETY_RATIO:-1}"
 MIX_MODE="${MIX_MODE:-all_visible}"
 MAX_TURN="${MAX_TURN:-10}"
 DAPO_EPS_CLIP_HIGH="${DAPO_EPS_CLIP_HIGH:-0.28}"
@@ -220,7 +199,6 @@ EXPLORE_AGENT57_UCB_MIN_PER_ARM="${EXPLORE_AGENT57_UCB_MIN_PER_ARM:-0}"
 EXPLORE_AGENT57_UCB_VALUE="${EXPLORE_AGENT57_UCB_VALUE:-legacy}"
 EXPLORE_AGENT57_UCB_DATASET_AWARE="${EXPLORE_AGENT57_UCB_DATASET_AWARE:-0}"
 EXPLORE_AGENT57_UCB_RANDOM_SEED="${EXPLORE_AGENT57_UCB_RANDOM_SEED:-}"
-EXPLORE_AGENT57_UCB_SEED_SALT="${EXPLORE_AGENT57_UCB_SEED_SALT:-}"
 EXPLORE_AGENT57_KEEP_BASELINE="${EXPLORE_AGENT57_KEEP_BASELINE:-1}"
 EPISODIC_MEMORY_BACKEND="${EPISODIC_MEMORY_BACKEND:-simhash_knn}"
 EXPLORE_AGENT57_EPISODIC_BACKEND="${EXPLORE_AGENT57_EPISODIC_BACKEND:-${EPISODIC_MEMORY_BACKEND}}"
@@ -235,7 +213,6 @@ EXPLORE_AGENT57_EPISODIC_VECTOR_DIM="${EXPLORE_AGENT57_EPISODIC_VECTOR_DIM:-256}
 EXPLORE_AGENT57_EPISODIC_RANDOM_SEED="${EXPLORE_AGENT57_EPISODIC_RANDOM_SEED:-}"
 EXPLORE_AGENT57_EPISODIC_OBS_MODE="${EXPLORE_AGENT57_EPISODIC_OBS_MODE:-fingerprint}"
 EXPLORE_AGENT57_EPISODIC_INCLUDE_TURN="${EXPLORE_AGENT57_EPISODIC_INCLUDE_TURN:-1}"
-EXPLORE_AGENT57_EPISODIC_TURN_MODE="${EXPLORE_AGENT57_EPISODIC_TURN_MODE:-bucket}"
 EXPLORE_AGENT57_EPISODIC_MULTI_PROBE_RADIUS="${EXPLORE_AGENT57_EPISODIC_MULTI_PROBE_RADIUS:-1}"
 EXPLORE_AGENT57_EPISODIC_NOVELTY_FLOOR="${EXPLORE_AGENT57_EPISODIC_NOVELTY_FLOOR:-0.05}"
 EXPLORE_AGENT57_LIFELONG="${EXPLORE_AGENT57_LIFELONG:-0}"
@@ -273,21 +250,10 @@ EXPLORE_ADVANTAGE_BONUS_COEF="${EXPLORE_ADVANTAGE_BONUS_COEF:-1.0}"
 EXPLORE_ADVANTAGE_BONUS_CLIP="${EXPLORE_ADVANTAGE_BONUS_CLIP:-0.5}"
 EXPLORE_ADVANTAGE_INTRINSIC_KEY="${EXPLORE_ADVANTAGE_INTRINSIC_KEY:-explore_agent57_intrinsic_signal}"
 EXPLORE_ADVANTAGE_LAMBDA="${EXPLORE_ADVANTAGE_LAMBDA:-0.05}"
-EXPLORE_ADVANTAGE_LAMBDA_SCHEDULE="${EXPLORE_ADVANTAGE_LAMBDA_SCHEDULE:-constant}"
-EXPLORE_ADVANTAGE_LAMBDA_DECAY_STEPS="${EXPLORE_ADVANTAGE_LAMBDA_DECAY_STEPS:-0}"
 EXPLORE_ADVANTAGE_ARM_WEIGHT_MODE="${EXPLORE_ADVANTAGE_ARM_WEIGHT_MODE:-normalized_beta}"
 EXPLORE_ADVANTAGE_TRUST_KEY="${EXPLORE_ADVANTAGE_TRUST_KEY:-explore_agent57_trust}"
-EXPLORE_ADVANTAGE_GATE_MODE="${EXPLORE_ADVANTAGE_GATE_MODE:-legacy}"
-EXPLORE_ADVANTAGE_OUTCOME_KEY="${EXPLORE_ADVANTAGE_OUTCOME_KEY:-raw_score}"
-EXPLORE_ADVANTAGE_COMPLETED_FLOOR="${EXPLORE_ADVANTAGE_COMPLETED_FLOOR:-0.50}"
-EXPLORE_ADVANTAGE_TRUNCATED_FLOOR="${EXPLORE_ADVANTAGE_TRUNCATED_FLOOR:-0.15}"
-EXPLORE_ADVANTAGE_FAILED_FLOOR="${EXPLORE_ADVANTAGE_FAILED_FLOOR:-0.0}"
-EXPLORE_ADVANTAGE_ABORTED_FLOOR="${EXPLORE_ADVANTAGE_ABORTED_FLOOR:-0.0}"
-EXPLORE_ADVANTAGE_TRUNCATED_INTRINSIC_SCALE="${EXPLORE_ADVANTAGE_TRUNCATED_INTRINSIC_SCALE:-1.0}"
-EXPLORE_ADVANTAGE_FAILED_INTRINSIC_SCALE="${EXPLORE_ADVANTAGE_FAILED_INTRINSIC_SCALE:-1.0}"
 EXPLORE_TRUNCATION_PENALTY="${EXPLORE_TRUNCATION_PENALTY:-0}"
 EXPLORE_ADVANTAGE_TRUNCATION_PENALTY="${EXPLORE_ADVANTAGE_TRUNCATION_PENALTY:-${EXPLORE_TRUNCATION_PENALTY}}"
-EXPLORE_TRUNCATION_PENALTY_OUTCOME_AWARE="${EXPLORE_TRUNCATION_PENALTY_OUTCOME_AWARE:-0}"
 EXPLORE_CDE_ACTOR="${EXPLORE_CDE_ACTOR:-0}"
 EXPLORE_CDE_ACTOR_ENABLED="${EXPLORE_CDE_ACTOR_ENABLED:-${EXPLORE_CDE_ACTOR}}"
 EXPLORE_CDE_ACTOR_OMEGA="${EXPLORE_CDE_ACTOR_OMEGA:-0.05}"
@@ -312,6 +278,14 @@ sanitize_run_part() {
   printf '%s' "$1" | tr -c 'A-Za-z0-9_.-' '-' | sed 's/-\\{1,\\}/-/g; s/^-//; s/-$//'
 }
 
+default_tau2_task_split() {
+  case "${1:-telecom}" in
+    telecom) echo "train" ;;
+    mock) echo "base" ;;
+    *) echo "train" ;;
+  esac
+}
+
 build_dataset_tag() {
   case "${DATASET}" in
     seta)
@@ -323,21 +297,26 @@ build_dataset_tag() {
     agentharm)
       echo "agentharm-$(short_mode "${AGENTHARM_REWARD}")"
       ;;
-    swesmith)
-      echo "swesmith"
+    tau2)
+      local tau2_domain tau2_split
+      tau2_domain="${TAU2_DOMAIN:-telecom}"
+      tau2_split="${TAU2_TASK_SPLIT:-$(default_tau2_task_split "${tau2_domain}")}"
+      echo "tau2-${tau2_domain}-${tau2_split}-${TAU2_POLICY_TYPE:-manual}"
       ;;
     mixed)
-      local seta_ratio safety_ratio agentharm_ratio
+      local seta_ratio tau2_ratio safety_ratio agentharm_ratio
       if [[ -n "${MIX_AGENTHARM_RATIO:-}" ]]; then
         seta_ratio="${MIX_SETA_RATIO:-0}"
+        tau2_ratio="${MIX_TAU2_RATIO:-0}"
         safety_ratio="${MIX_SAFETY_RATIO:-0}"
         agentharm_ratio="${MIX_AGENTHARM_RATIO:-0}"
       else
         seta_ratio="${MIX_SETA_RATIO:-1}"
+        tau2_ratio="${MIX_TAU2_RATIO:-0}"
         safety_ratio="${MIX_SAFETY_RATIO:-1}"
         agentharm_ratio="0"
       fi
-      echo "mixed-s${seta_ratio}_asb${safety_ratio}_ah${agentharm_ratio}-rw$(short_mode "${SETA_SAFETY}")_$(short_mode "${SAFETY_BENCH_REWARD}")_$(short_mode "${AGENTHARM_REWARD}")-c${SAFETY_REWARD_COEF}"
+      echo "mixed-s${seta_ratio}_tau2${tau2_ratio}_ah${agentharm_ratio}_asb${safety_ratio}-rw$(short_mode "${SETA_SAFETY}")_$(short_mode "${SAFETY_BENCH_REWARD}")_$(short_mode "${AGENTHARM_REWARD}")-c${SAFETY_REWARD_COEF}"
       ;;
     *)
       echo "${DATASET}"
@@ -359,34 +338,22 @@ build_algo_tag() {
 RUN_DATASET_TAG="$(sanitize_run_part "$(build_dataset_tag)")"
 RUN_ALGO_TAG="$(sanitize_run_part "$(build_algo_tag)")"
 RUN_HARNESS_TAG="$(sanitize_run_part "${HARNESS_OPTION}")"
-RUN_ALGO_NAME_TAG="${ALGO}"
-if [[ "${ALGO}" == "dapo" && "${DAPO_DYNAMIC_SAMPLING}" == "0" ]]; then
-  RUN_ALGO_NAME_TAG="dapo_nodynamic"
-fi
 # Checkpoint saving keeps only the latest N checkpoints by default.
 # When enabled, only the latest N checkpoints are kept; older ones are auto-deleted.
 MAX_CKPT_KEEP="${MAX_CKPT_KEEP:-2}"
 SAVE_INTERVAL="${SAVE_INTERVAL:-8}"
 if [[ "${DEBUG_MODE}" == "1" ]]; then
-  if [[ "${DATASET}" == "swesmith" ]]; then
-    RUN_NAME="${RUN_NAME:-terminal-rl_qwen3-8b_${NUM_GPUS}gpu_debug_swesmith_${RUN_ALGO_NAME_TAG}_think_harness-${RUN_HARNESS_TAG}_mt${MAX_TURN}_${RUN_TIMESTAMP}}"
-  else
-    RUN_NAME="${RUN_NAME:-terminal-rl_qwen3-8b_${NUM_GPUS}gpu_debug_mixed_${RUN_ALGO_NAME_TAG}_think_s${MIX_SETA_RATIO}_asb${MIX_SAFETY_RATIO}_ah${MIX_AGENTHARM_RATIO}_harness-${RUN_HARNESS_TAG}_mt${MAX_TURN}_${RUN_TIMESTAMP}}"
-  fi
+  RUN_NAME="${RUN_NAME:-terminal-rl_qwen3-8b_${NUM_GPUS}gpu_debug_mixed_tau2_dapo_nodynamic_think_s${MIX_SETA_RATIO}_tau2${MIX_TAU2_RATIO}_ah${MIX_AGENTHARM_RATIO}_asb${MIX_SAFETY_RATIO}_harness-${RUN_HARNESS_TAG}_mt${MAX_TURN}_${RUN_TIMESTAMP}}"
   # Debug mode: never save checkpoints regardless of MAX_CKPT_KEEP
   MAX_CKPT_KEEP=0
 else
-  if [[ "${DATASET}" == "swesmith" ]]; then
-    RUN_NAME="${RUN_NAME:-terminal-rl_qwen3-8b_${NUM_GPUS}gpu_swesmith_${RUN_ALGO_NAME_TAG}_think_harness-${RUN_HARNESS_TAG}_mt${MAX_TURN}_${RUN_TIMESTAMP}}"
-  else
-    RUN_NAME="${RUN_NAME:-terminal-rl_qwen3-8b_${NUM_GPUS}gpu_mixed_${RUN_ALGO_NAME_TAG}_think_s${MIX_SETA_RATIO}_asb${MIX_SAFETY_RATIO}_ah${MIX_AGENTHARM_RATIO}_harness-${RUN_HARNESS_TAG}_mt${MAX_TURN}_${RUN_TIMESTAMP}}"
-  fi
+  RUN_NAME="${RUN_NAME:-terminal-rl_qwen3-8b_${NUM_GPUS}gpu_mixed_tau2_dapo_nodynamic_think_s${MIX_SETA_RATIO}_tau2${MIX_TAU2_RATIO}_ah${MIX_AGENTHARM_RATIO}_asb${MIX_SAFETY_RATIO}_harness-${RUN_HARNESS_TAG}_mt${MAX_TURN}_${RUN_TIMESTAMP}}"
 fi
 
 # ── Unified run directory (see STORAGE.md) ───────────────────────────────
 # All outputs for this run go under runs/{RUN_ID}/ with structured subdirs.
 RUNS_ROOT="${RUNS_ROOT:-${REPO_ROOT}/runs}"
-CKPT_ROOT="${CKPT_ROOT:-${EXPORT_ROOT}/ckpt}"
+CKPT_ROOT="${CKPT_ROOT:-${RUNS_ROOT}/ckpt}"
 RUN_ID="${RUN_ID:-${RUN_NAME}}"
 RUN_DIR="${RUNS_ROOT}/${RUN_ID}"
 
@@ -394,7 +361,7 @@ RUN_DIR="${RUNS_ROOT}/${RUN_ID}"
 MAX_CKPT_KEEP="${MAX_CKPT_KEEP}" python3 "${SCRIPT_DIR}/run_paths.py" init \
   --runs-root "${RUNS_ROOT}" \
   --ckpt-root "${CKPT_ROOT}" \
-  --run-id "${RUN_ID}" > /dev/null
+  --run-id "${RUN_ID}" > /dev/null 2>&1
 
 # Derive all paths from RUN_DIR
 RUN_LOG_DIR="${RUN_DIR}/logs"
@@ -403,7 +370,7 @@ if [[ "${TERMINAL_SAVE_TRAJ_DIR+x}" ]]; then
 else
   TERMINAL_SAVE_TRAJ_DIR="${RUN_DIR}/trajectories"
 fi
-WANDB_DIR="${WANDB_DIR:-${RUN_DIR}/metrics/wandb}"
+WANDB_DIR="${RUN_DIR}/metrics/wandb"
 TERMINAL_STRUCTURED_METRICS="${TERMINAL_STRUCTURED_METRICS:-1}"
 TERMINAL_METRICS_JSONL="${TERMINAL_METRICS_JSONL:-${RUN_LOG_DIR}/metrics.jsonl}"
 TERMINAL_WANDB_METRIC_PROFILE="${TERMINAL_WANDB_METRIC_PROFILE:-full}"
@@ -453,14 +420,13 @@ case "${CLAUDE_CODE_LLM_BACKEND}" in
 esac
 CLAUDE_CODE_MODEL="${CLAUDE_CODE_MODEL:-}"
 CLAUDE_CODE_QWEN_GATEWAY_MODEL="${CLAUDE_CODE_QWEN_GATEWAY_MODEL:-qwen-8b-sglang}"
-CLAUDE_CODE_LOCAL_RUN_ROOT="${CLAUDE_CODE_LOCAL_RUN_ROOT:-${CLAUDE_CODE_WORKSPACE_ROOT:-${RUN_LOG_DIR}/claude_code_cli}}"
-CLAUDE_CODE_WORKSPACE_ROOT="${CLAUDE_CODE_WORKSPACE_ROOT:-${CLAUDE_CODE_LOCAL_RUN_ROOT}}"
+CLAUDE_CODE_WORKSPACE_ROOT="${CLAUDE_CODE_WORKSPACE_ROOT:-${RUN_DIR}/claude_code_workspaces}"
 CLAUDE_CODE_TURN_TIMEOUT_SEC="${CLAUDE_CODE_TURN_TIMEOUT_SEC:-900}"
 CLAUDE_CODE_TOOL_TIMEOUT_MS="${CLAUDE_CODE_TOOL_TIMEOUT_MS:-300000}"
 CLAUDE_CODE_MAX_TOOL_ROUNDS="${CLAUDE_CODE_MAX_TOOL_ROUNDS:-10}"
 CLAUDE_CODE_OUTPUT_FORMAT="${CLAUDE_CODE_OUTPUT_FORMAT:-json}"
 CLAUDE_CODE_PERMISSION_MODE="${CLAUDE_CODE_PERMISSION_MODE:-bypassPermissions}"
-CLAUDE_CODE_ALLOWED_TOOLS="${CLAUDE_CODE_ALLOWED_TOOLS:-mcp__terminal_rl__shell_exec,mcp__terminal_rl__shell_view,mcp__terminal_rl__shell_write_to_process,mcp__terminal_rl__shell_write_content_to_file,mcp__terminal_rl__read_file,mcp__terminal_rl__write_file,mcp__terminal_rl__list_dir}"
+CLAUDE_CODE_ALLOWED_TOOLS="${CLAUDE_CODE_ALLOWED_TOOLS:-mcp__terminal_rl__shell_exec,mcp__terminal_rl__shell_view,mcp__terminal_rl__shell_write_to_process,mcp__terminal_rl__shell_write_content_to_file}"
 CLAUDE_CODE_DISALLOWED_TOOLS="${CLAUDE_CODE_DISALLOWED_TOOLS:-}"
 CLAUDE_CODE_EXTRA_ARGS="${CLAUDE_CODE_EXTRA_ARGS:-}"
 CLAUDE_CODE_SYSTEM_PROMPT="${CLAUDE_CODE_SYSTEM_PROMPT:-}"
@@ -494,19 +460,11 @@ ENV_EVALUATE_MAX_RETRIES="${ENV_EVALUATE_MAX_RETRIES:-1}"
 ENV_CLOSE_MAX_RETRIES="${ENV_CLOSE_MAX_RETRIES:-3}"
 ENV_EXEC_TOOL_MAX_RETRIES="${ENV_EXEC_TOOL_MAX_RETRIES:-3}"
 ENV_ALLOCATE_HTTP_TIMEOUT="${ENV_ALLOCATE_HTTP_TIMEOUT:-300}"
-if [[ "${DATASET}" == "swesmith" ]]; then
-  ENV_RESET_HTTP_TIMEOUT="${ENV_RESET_HTTP_TIMEOUT:-5400}"
-else
-  ENV_RESET_HTTP_TIMEOUT="${ENV_RESET_HTTP_TIMEOUT:-2100}"
-fi
+ENV_RESET_HTTP_TIMEOUT="${ENV_RESET_HTTP_TIMEOUT:-2100}"
 ENV_CLOSE_HTTP_TIMEOUT="${ENV_CLOSE_HTTP_TIMEOUT:-90}"
 ENV_REMOTE_MAX_ACTIVE_TASKS="${ENV_REMOTE_MAX_ACTIVE_TASKS:-12}"
 ENV_REMOTE_MAX_ACTIVE_RUNS="${ENV_REMOTE_MAX_ACTIVE_RUNS:-0}"
-if [[ "${DATASET}" == "swesmith" ]]; then
-  ENV_REMOTE_MAX_RUNS_PER_TASK="${ENV_REMOTE_MAX_RUNS_PER_TASK:-4}"
-else
-  ENV_REMOTE_MAX_RUNS_PER_TASK="${ENV_REMOTE_MAX_RUNS_PER_TASK:-8}"
-fi
+ENV_REMOTE_MAX_RUNS_PER_TASK="${ENV_REMOTE_MAX_RUNS_PER_TASK:-8}"
 ENV_REMOTE_ADMISSION_TIMEOUT="${ENV_REMOTE_ADMISSION_TIMEOUT:-900}"
 ENV_REMOTE_ADMISSION_LOG_INTERVAL="${ENV_REMOTE_ADMISSION_LOG_INTERVAL:-30}"
 ENV_REMOTE_MAX_CONCURRENT_CLOSES="${ENV_REMOTE_MAX_CONCURRENT_CLOSES:-8}"
@@ -684,13 +642,20 @@ else
 fi
 RESUME_LOAD="${RESUME_LOAD:-${SAVE_CKPT}}"
 
-# Pre-flight: refuse to start if EXPORT_ROOT has < 80GB free (only when saving).
+# Pre-flight: refuse to start if the actual checkpoint filesystem has < 80GB free.
 if (( MAX_CKPT_KEEP > 0 )); then
-  AVAIL_GB=$(df -BG --output=avail "${EXPORT_ROOT}" 2>/dev/null | tail -1 | tr -dc '0-9')
+  CKPT_CHECK_DIR="$(dirname "${SAVE_CKPT}")"
+  mkdir -p "${CKPT_CHECK_DIR}"
+  AVAIL_GB=$(df -BG --output=avail "${CKPT_CHECK_DIR}" 2>/dev/null | tail -1 | tr -dc '0-9')
+  if [[ -z "${AVAIL_GB}" ]]; then
+    echo "[ERROR] Could not check free space for checkpoint dir: ${CKPT_CHECK_DIR}"
+    df -h "${CKPT_CHECK_DIR}" 2>&1 | tail -2 || true
+    exit 1
+  fi
   if [[ -n "${AVAIL_GB}" && "${AVAIL_GB}" -lt 80 ]]; then
-    echo "[ERROR] Free space at ${EXPORT_ROOT} is only ${AVAIL_GB}G, need >= 80G"
-    echo "        Clean old ckpts or set EXPORT_ROOT to a larger disk."
-    df -h "${EXPORT_ROOT}" 2>&1 | tail -2
+    echo "[ERROR] Free space at ${CKPT_CHECK_DIR} is only ${AVAIL_GB}G, need >= 80G"
+    echo "        Clean old ckpts or set CKPT_ROOT to a larger writable disk."
+    df -h "${CKPT_CHECK_DIR}" 2>&1 | tail -2
     exit 1
   fi
 fi
@@ -740,7 +705,8 @@ source "${SLIME_DIR}/scripts/models/qwen3-8B.sh"
 #   seta    = seta_env only (capability tasks, Docker-based evaluation)
 #   safety  = Agent-SafetyBench only (safety tasks, no Docker needed)
 #   agentharm = inspect_evals/agentharm only (safety tool tasks, no Docker needed)
-#   mixed   = configurable mix of seta / safety / agentharm
+#   tau2    = tau2-bench solo-compatible tasks (telecom / mock, no Docker needed)
+#   mixed   = configurable mix of seta / tau2 / agentharm / safety
 #
 # SETA_SAFETY: safety reward mode for seta_env data
 #   none       = pure outcome reward (2*accuracy - 1), no safety signal
@@ -770,7 +736,7 @@ case "${ALGO}" in
 esac
 export ALGO
 
-DATASET="$(normalize_dataset "${DATASET:-mixed}")"
+DATASET="${DATASET:-mixed}"
 SETA_SAFETY="${SETA_SAFETY:-none}"
 SAFETY_BENCH_REWARD="${SAFETY_BENCH_REWARD:-dense_rule}"
 AGENT_SAFETYBENCH_REMOTE_ENV="${AGENT_SAFETYBENCH_REMOTE_ENV:-0}"
@@ -778,28 +744,26 @@ AGENT_SAFETYBENCH_ROOT="${AGENT_SAFETYBENCH_ROOT:-/mnt/shared-storage-user/puyua
 AGENTHARM_REWARD="${AGENTHARM_REWARD:-dense_rule}"
 AGENTHARM_REMOTE_ENV="${AGENTHARM_REMOTE_ENV:-0}"
 AGENTHARM_ROOT="${AGENTHARM_ROOT:-/mnt/shared-storage-user/puyuan/code/inspect_evals/src/inspect_evals/agentharm}"
+TAU2_DOMAIN="${TAU2_DOMAIN:-telecom}"
+TAU2_TASK_SPLIT="${TAU2_TASK_SPLIT:-}"
+TAU2_POLICY_TYPE="${TAU2_POLICY_TYPE:-manual}"
+TAU2_REMOTE_ENV="${TAU2_REMOTE_ENV:-0}"
+TAU2_NUM_TASKS="${TAU2_NUM_TASKS:-}"
+TAU2_USER_LLM="${TAU2_USER_LLM:-openai/Qwen3.6-27B-FP8}"
+TAU2_USER_LLM_API_BASE="${TAU2_USER_LLM_API_BASE:-http://s-20260523131729-dtntr.ailab-pj.pjh-service.org.cn/v1}"
+TAU2_USER_LLM_TIMEOUT="${TAU2_USER_LLM_TIMEOUT:-15}"
+VLLM_API_KEY="${VLLM_API_KEY:-dummy}"
+SGLANG_REQUEST_TIMEOUT="${SGLANG_REQUEST_TIMEOUT:-180}"
+TAU2_BENCH_ROOT_DEFAULT="$(cd "${REPO_ROOT}/.." && pwd)/tau2-bench"
+TAU2_BENCH_ROOT="${TAU2_BENCH_ROOT:-${TAU2_BENCH_ROOT_DEFAULT}}"
+if [[ -z "${TAU2_TASK_SPLIT}" ]]; then
+  TAU2_TASK_SPLIT="$(default_tau2_task_split "${TAU2_DOMAIN}")"
+fi
 
 SETA_DATA="${SCRIPT_DIR}/dataset/seta_env_convert/train.jsonl"
 SAFETY_DATA="${SCRIPT_DIR}/dataset/agent_safetybench_convert/train.jsonl"
 AGENTHARM_RAW_DIR="${SCRIPT_DIR}/dataset/agentharm"
 AGENTHARM_DATA="${SCRIPT_DIR}/dataset/agentharm_convert/train.jsonl"
-SWESMITH_DATA="${SCRIPT_DIR}/dataset/swesmith_convert/train.jsonl"
-SWESMITH_ENV_DIR="${SWESMITH_ENV_DIR:-${SCRIPT_DIR}/dataset/swesmith_env}"
-SWESMITH_REQUIRE_FULL_DATA="${SWESMITH_REQUIRE_FULL_DATA:-1}"
-SWESMITH_ARTIFACT_SHA256=""
-SWESMITH_CONVERSION_MODE="not_applicable"
-SWESMITH_DATASET_REVISION=""
-SWESMITH_CONVERTER_SHA256=""
-SWESMITH_SOURCE_PROMPT_DATA=""
-SWESMITH_SOURCE_DEVICE=""
-SWESMITH_SOURCE_INODE=""
-case "${SWESMITH_REQUIRE_FULL_DATA}" in
-  0|1) ;;
-  *)
-    echo "[ERROR] SWESMITH_REQUIRE_FULL_DATA must be 0 or 1."
-    exit 1
-    ;;
-esac
 
 ensure_agentharm_dataset() {
   if [[ ! -d "${AGENTHARM_RAW_DIR}" ]]; then
@@ -811,219 +775,42 @@ ensure_agentharm_dataset() {
     --output-dir "${SCRIPT_DIR}/dataset/agentharm_convert"
 }
 
-ensure_swesmith_env_dirs() {
-  local prompt_data="$1"
-  local env_status total_count missing_count image_missing_count duplicate_count
-  local exact_missing_count expected_mismatch_count unsupported_runner_count
-  local profile_mismatch_count foreign_row_count
-  local artifact_sha256 conversion_mode dataset_revision converter_sha256
-  local source_device source_inode
-  local swesmith_dataset_root
-  swesmith_dataset_root="$(dirname -- "${SWESMITH_ENV_DIR}")"
-  env_status="$(python3 - "$prompt_data" "${swesmith_dataset_root}" "${SWESMITH_ENV_DIR}" "${SWESMITH_EXPECTED_SAMPLES:-}" "${SCRIPT_DIR}" "${SWESMITH_REQUIRE_FULL_DATA}" "${SWESMITH_STATS_PATH:-}" <<'PY'
-import hashlib
-import json
-import os
-import sys
-from pathlib import Path
-
-prompt = Path(sys.argv[1])
-dataset_root = Path(sys.argv[2])
-env_dir = Path(sys.argv[3])
-expected_samples = int(sys.argv[4]) if sys.argv[4] else None
-sys.path.insert(0, sys.argv[5])
-require_full = sys.argv[6] == "1"
-stats_path = Path(sys.argv[7]) if sys.argv[7] else prompt.with_name("convert_stats.json")
-from data_utils.convert_swesmith_to_terminal_rl import (
-    OFFICIAL_TEST_COMMANDS,
-    TASK_FORMAT_VERSION,
-    expected_swesmith_task_path,
-    infer_test_runner,
-    validate_swesmith_artifact_manifest,
-    validate_task_dir_fingerprint,
-)
-
-missing = 0
-image_missing = 0
-duplicates = 0
-unsupported_runners = 0
-profile_mismatches = 0
-foreign_rows = 0
-total = 0
-artifact_rows = 0
-exact_missing = 1
-stat_limit = 2000
-seen_task_names = set()
-required_names = [
-    "task.yaml",
-    "docker-compose.yaml",
-    "Dockerfile",
-    "run-tests.sh",
-    "tests/fail_to_pass.txt",
-    "tests/pass_to_pass.txt",
-    ".terminal-rl-swesmith-format",
-]
-artifact_digest = hashlib.sha256()
-with prompt.open("rb") as f:
-    artifact_stat = os.fstat(f.fileno())
-    for raw_line in f:
-        artifact_digest.update(raw_line)
-        if not raw_line.strip():
-            continue
-        artifact_rows += 1
-        obj = json.loads(raw_line)
-        meta = obj.get("metadata") or {}
-        if meta.get("data_source") != "swesmith":
-            foreign_rows += 1
-            continue
-        total += 1
-        if str(meta.get("test_runner") or "unsupported") == "unsupported":
-            unsupported_runners += 1
-        expected_runner = infer_test_runner(meta)
-        expected_command = OFFICIAL_TEST_COMMANDS.get(
-            str(meta.get("repo") or "").lower(), ""
-        )
-        try:
-            expected_task_path = expected_swesmith_task_path(meta.get("task_name"))
-        except ValueError:
-            expected_task_path = ""
-        if (
-            str(meta.get("task_format_version") or "") != TASK_FORMAT_VERSION
-            or str(meta.get("test_runner") or "") != expected_runner
-            or str(meta.get("test_command") or "") != expected_command
-            or str(meta.get("swesmith_instance_id") or "")
-            != str(meta.get("task_name") or "")
-            or str(meta.get("task_path") or "") != expected_task_path
-        ):
-            profile_mismatches += 1
-        task_name = str(meta.get("task_name") or "")
-        if not task_name or task_name in seen_task_names:
-            duplicates += 1
-        else:
-            seen_task_names.add(task_name)
-        task_path = str(meta.get("task_path") or "")
-        missing_image = not str(meta.get("image_name") or "").strip()
-        if missing_image:
-            image_missing += 1
-        if not task_path:
-            missing += 1
-            continue
-        task_dir = dataset_root / task_path
-        if task_path.startswith("swesmith_env/"):
-            task_dir = env_dir / task_path.split("/", 1)[1]
-        if missing < stat_limit:
-            complete = all((task_dir / rel).is_file() for rel in required_names)
-            if complete:
-                complete = validate_task_dir_fingerprint(obj, task_dir)
-            if not complete:
-                missing += 1
-        else:
-            exact_missing = 0
-manifest = {}
-if require_full:
-    try:
-        manifest = validate_swesmith_artifact_manifest(
-            prompt,
-            stats_path=stats_path,
-            require_full=True,
-            expected_samples=expected_samples,
-            artifact_rows=artifact_rows,
-            artifact_sha256=artifact_digest.hexdigest(),
-        )
-    except ValueError as exc:
-        raise SystemExit(f"[ERROR] {exc}") from exc
-expected_mismatch = int(expected_samples is not None and total != expected_samples)
-print(
-    f"{total} {missing} {image_missing} {duplicates} "
-    f"{exact_missing} {expected_mismatch} {unsupported_runners} "
-    f"{profile_mismatches} {foreign_rows} {artifact_digest.hexdigest()} "
-    f"{manifest.get('conversion_mode', 'custom')} "
-    f"{manifest.get('dataset_revision', '-')} "
-    f"{manifest.get('converter_sha256', '-')} "
-    f"{artifact_stat.st_dev} {artifact_stat.st_ino}"
-)
-PY
-)"
-  total_count="$(awk '{print $1}' <<<"${env_status}")"
-  missing_count="$(awk '{print $2}' <<<"${env_status}")"
-  image_missing_count="$(awk '{print $3}' <<<"${env_status}")"
-  duplicate_count="$(awk '{print $4}' <<<"${env_status}")"
-  exact_missing_count="$(awk '{print $5}' <<<"${env_status}")"
-  expected_mismatch_count="$(awk '{print $6}' <<<"${env_status}")"
-  unsupported_runner_count="$(awk '{print $7}' <<<"${env_status}")"
-  profile_mismatch_count="$(awk '{print $8}' <<<"${env_status}")"
-  foreign_row_count="$(awk '{print $9}' <<<"${env_status}")"
-  artifact_sha256="$(awk '{print $10}' <<<"${env_status}")"
-  conversion_mode="$(awk '{print $11}' <<<"${env_status}")"
-  dataset_revision="$(awk '{print $12}' <<<"${env_status}")"
-  converter_sha256="$(awk '{print $13}' <<<"${env_status}")"
-  source_device="$(awk '{print $14}' <<<"${env_status}")"
-  source_inode="$(awk '{print $15}' <<<"${env_status}")"
-  SWESMITH_ARTIFACT_SHA256="${artifact_sha256}"
-  SWESMITH_CONVERSION_MODE="${conversion_mode}"
-  [[ "${dataset_revision}" != "-" ]] && SWESMITH_DATASET_REVISION="${dataset_revision}"
-  [[ "${converter_sha256}" != "-" ]] && SWESMITH_CONVERTER_SHA256="${converter_sha256}"
-  SWESMITH_SOURCE_DEVICE="${source_device}"
-  SWESMITH_SOURCE_INODE="${source_inode}"
-
-  if (( total_count == 0 )); then
-    echo "[ERROR] DATASET=swesmith selected, but ${prompt_data} contains no SWE-smith rows."
+ensure_tau2_dataset() {
+  case "${TAU2_DOMAIN}" in
+    telecom|mock) ;;
+    *)
+      echo "[ERROR] Unsupported TAU2_DOMAIN=${TAU2_DOMAIN}. Use: telecom|mock"
+      exit 1
+      ;;
+  esac
+  if [[ ! -d "${TAU2_BENCH_ROOT}" ]]; then
+    echo "[ERROR] TAU2_BENCH_ROOT not found: ${TAU2_BENCH_ROOT}"
     exit 1
-  fi
-  if (( foreign_row_count > 0 )); then
-    echo "[ERROR] ${prompt_data} contains ${foreign_row_count} non-SWE-smith row(s)."
-    echo "        DATASET=swesmith requires a homogeneous converted JSONL."
-    exit 1
-  fi
-  if (( image_missing_count > 0 )); then
-    echo "[ERROR] ${image_missing_count} SWE-smith JSONL row(s) are missing metadata.image_name."
-    echo "        Re-run: CREATE_ENV_DIRS=1 bash ${SCRIPT_DIR}/data_utils/download_swesmith.sh"
-    exit 1
-  fi
-  if (( duplicate_count > 0 )); then
-    echo "[ERROR] ${duplicate_count} SWE-smith row(s) have missing or duplicate metadata.task_name."
-    exit 1
-  fi
-  if (( unsupported_runner_count > 0 )); then
-    echo "[ERROR] ${unsupported_runner_count} SWE-smith row(s) have no supported test runner/profile."
-    echo "        Re-convert with a pinned dataset revision and the current converter."
-    exit 1
-  fi
-  if (( profile_mismatch_count > 0 )); then
-    echo "[ERROR] ${profile_mismatch_count} SWE-smith row(s) use stale or untrusted task format/test profiles."
-    echo "        Re-run full dataset conversion with the current converter; env-only regeneration is insufficient."
-    exit 1
-  fi
-  if (( expected_mismatch_count > 0 )); then
-    echo "[ERROR] SWE-smith row count mismatch: expected=${SWESMITH_EXPECTED_SAMPLES} actual=${total_count}."
-    exit 1
-  fi
-  if (( missing_count == 0 )); then
-    return
   fi
 
-  if (( exact_missing_count == 1 )); then
-    echo "[WARN] SWE-smith env task dirs incomplete or outdated: ${missing_count} task(s)"
-  else
-    echo "[WARN] SWE-smith env task dirs incomplete or outdated: at least ${missing_count} task(s)"
+  TAU2_DATA_DIR="${SCRIPT_DIR}/dataset/tau2_${TAU2_DOMAIN}_${TAU2_TASK_SPLIT}_solo"
+  TAU2_DATA="${TAU2_DATA_DIR}/train.jsonl"
+  TAU2_ARGS=(
+    --tau2-root "${TAU2_BENCH_ROOT}"
+    --domain "${TAU2_DOMAIN}"
+    --task-split "${TAU2_TASK_SPLIT}"
+    --policy-type "${TAU2_POLICY_TYPE}"
+    --output-dir "${TAU2_DATA_DIR}"
+  )
+  if [[ -n "${TAU2_NUM_TASKS}" ]]; then
+    TAU2_ARGS+=(--num-tasks "${TAU2_NUM_TASKS}")
   fi
-  if [[ "${DRY_RUN}" == "1" ]]; then
-    echo "[ERROR] DRY_RUN=1 found incomplete/outdated SWE-smith task directories."
-    echo "        Regenerate task format v6 before launching training."
-    exit 1
-  fi
-  echo "[ERROR] SWE-smith env dirs are incomplete; training preflight is read-only."
-  echo "        Regenerate task format v6 with data_utils/download_swesmith.sh, then retry."
-  exit 1
+  python "${SCRIPT_DIR}/data_utils/convert_tau2_to_dataset.py" "${TAU2_ARGS[@]}"
 }
 
 INCLUDES_SETA="0"
 INCLUDES_SAFETY="0"
 INCLUDES_AGENTHARM="0"
-INCLUDES_SWESMITH="0"
-MIX_SETA_RATIO="${MIX_SETA_RATIO:-6}"
-MIX_SAFETY_RATIO="${MIX_SAFETY_RATIO:-2}"
-MIX_AGENTHARM_RATIO="${MIX_AGENTHARM_RATIO:-2}"
+INCLUDES_TAU2="0"
+MIX_SETA_RATIO="${MIX_SETA_RATIO:-7}"
+MIX_TAU2_RATIO="${MIX_TAU2_RATIO:-1}"
+MIX_AGENTHARM_RATIO="${MIX_AGENTHARM_RATIO:-1}"
+MIX_SAFETY_RATIO="${MIX_SAFETY_RATIO:-1}"
 MIX_MODE="${MIX_MODE:-all_visible}"
 export MIX_MODE
 
@@ -1041,14 +828,16 @@ case "${DATASET}" in
     ensure_agentharm_dataset
     ROLLOUT_PROMPT_DATA="${ROLLOUT_PROMPT_DATA:-${AGENTHARM_DATA}}"
     ;;
-  swesmith)
-    INCLUDES_SWESMITH="1"
-    ROLLOUT_PROMPT_DATA="${ROLLOUT_PROMPT_DATA:-${SWESMITH_DATA}}"
+  tau2)
+    INCLUDES_TAU2="1"
+    ensure_tau2_dataset
+    ROLLOUT_PROMPT_DATA="${ROLLOUT_PROMPT_DATA:-${TAU2_DATA}}"
     ;;
   mixed)
     if [[ -n "${MIX_AGENTHARM_RATIO:-}" ]]; then
-      ensure_agentharm_dataset
-      MIXED_DATA="${SCRIPT_DIR}/dataset/mixed_sources.jsonl"
+      [[ -n "${MIX_AGENTHARM_RATIO:-}" && "${MIX_AGENTHARM_RATIO}" != "0" ]] && ensure_agentharm_dataset
+      [[ -n "${MIX_TAU2_RATIO:-}" && "${MIX_TAU2_RATIO}" != "0" ]] && ensure_tau2_dataset
+      MIXED_DATA="${SCRIPT_DIR}/dataset/mixed_seta_tau2_agentharm_safety.jsonl"
       MIX_ARGS=(
         --output "${MIXED_DATA}"
         --seed "${MIX_SEED:-42}"
@@ -1070,15 +859,17 @@ case "${DATASET}" in
         MIX_LABELS+=("${label}(${ratio})")
       }
       add_mix_source "${SETA_DATA}" "${MIX_SETA_RATIO:-}" "seta"
-      add_mix_source "${SAFETY_DATA}" "${MIX_SAFETY_RATIO:-}" "safety"
+      add_mix_source "${TAU2_DATA:-}" "${MIX_TAU2_RATIO:-}" "tau2"
       add_mix_source "${AGENTHARM_DATA}" "${MIX_AGENTHARM_RATIO:-}" "agentharm"
+      add_mix_source "${SAFETY_DATA}" "${MIX_SAFETY_RATIO:-}" "safety"
       if [[ "${#MIX_LABELS[@]}" -eq 0 ]]; then
-        echo "[ERROR] No mixed sources selected. Set MIX_SETA_RATIO, MIX_SAFETY_RATIO, or MIX_AGENTHARM_RATIO to a positive value."
+        echo "[ERROR] No mixed sources selected. Set MIX_SETA_RATIO, MIX_TAU2_RATIO, MIX_AGENTHARM_RATIO, or MIX_SAFETY_RATIO to a positive value."
         exit 1
       fi
       [[ -n "${MIX_SETA_RATIO:-}" && "${MIX_SETA_RATIO}" != "0" ]] && INCLUDES_SETA="1"
-      [[ -n "${MIX_SAFETY_RATIO:-}" && "${MIX_SAFETY_RATIO}" != "0" ]] && INCLUDES_SAFETY="1"
+      [[ -n "${MIX_TAU2_RATIO:-}" && "${MIX_TAU2_RATIO}" != "0" ]] && INCLUDES_TAU2="1"
       [[ -n "${MIX_AGENTHARM_RATIO:-}" && "${MIX_AGENTHARM_RATIO}" != "0" ]] && INCLUDES_AGENTHARM="1"
+      [[ -n "${MIX_SAFETY_RATIO:-}" && "${MIX_SAFETY_RATIO}" != "0" ]] && INCLUDES_SAFETY="1"
       if [[ -n "${MIX_TOTAL:-}" ]]; then
         MIX_ARGS+=(--total "${MIX_TOTAL}")
       fi
@@ -1116,7 +907,7 @@ case "${DATASET}" in
     ROLLOUT_PROMPT_DATA="${ROLLOUT_PROMPT_DATA:-${MIXED_DATA}}"
     ;;
   *)
-    echo "[ERROR] Unknown DATASET=${DATASET}. Use: seta|safety|agentharm|mixed|swesmith"
+    echo "[ERROR] Unknown DATASET=${DATASET}. Use: seta|safety|agentharm|tau2|mixed"
     exit 1
     ;;
 esac
@@ -1126,85 +917,14 @@ if [[ -z "${ROLLOUT_PROMPT_DATA}" ]]; then
   exit 1
 fi
 if [[ ! -f "${ROLLOUT_PROMPT_DATA}" ]]; then
-  if [[ "${INCLUDES_SWESMITH}" == "1" && "${ROLLOUT_PROMPT_DATA}" == "${SWESMITH_DATA}" ]]; then
-    echo "[ERROR] SWE-smith full train data not found: ${SWESMITH_DATA}"
-    echo "        The downloader defaults to smoke.jsonl for safe path validation."
-    echo "        Generate full train data explicitly:"
-    echo "        MODE=full ALLOW_FULL=1 CREATE_ENV_DIRS=1 bash ${SCRIPT_DIR}/data_utils/download_swesmith.sh"
-    echo "        Or set ROLLOUT_PROMPT_DATA to an existing smoke/custom JSONL."
-    exit 1
-  fi
   echo "[ERROR] ROLLOUT_PROMPT_DATA=${ROLLOUT_PROMPT_DATA} not found"
   exit 1
 fi
 echo "[config] ALGO=${ALGO} DATASET=${DATASET} SETA_SAFETY=${SETA_SAFETY} SAFETY_BENCH_REWARD=${SAFETY_BENCH_REWARD} AGENTHARM_REWARD=${AGENTHARM_REWARD}"
-if [[ "${INCLUDES_SWESMITH}" == "1" ]]; then
-  SWESMITH_ARTIFACT_LOCK="${SWESMITH_ARTIFACT_LOCK:-$(dirname -- "${SWESMITH_ENV_DIR}")/.swesmith_artifact.lock}"
-  if ! command -v flock >/dev/null 2>&1; then
-    echo "[ERROR] flock is required for SWE-smith artifact/task consistency."
-    exit 1
-  fi
-  exec 8>"${SWESMITH_ARTIFACT_LOCK}"
-  if ! flock -s -n 8; then
-    echo "[ERROR] SWE-smith conversion/publication is active: ${SWESMITH_ARTIFACT_LOCK}"
-    echo "        Wait for conversion to finish, then restart training."
-    exit 1
-  fi
-  ensure_swesmith_env_dirs "${ROLLOUT_PROMPT_DATA}"
-  if [[ "${SWESMITH_REQUIRE_FULL_DATA}" == "1" ]]; then
-    SWESMITH_SOURCE_PROMPT_DATA="${ROLLOUT_PROMPT_DATA}"
-    SWESMITH_STATS_SOURCE="${SWESMITH_STATS_PATH:-$(dirname -- "${ROLLOUT_PROMPT_DATA}")/convert_stats.json}"
-    SWESMITH_FROZEN_PROMPT_DATA="${RUN_DIR}/config/swesmith_train_${SWESMITH_ARTIFACT_SHA256}.jsonl"
-    SWESMITH_FROZEN_TMP="${SWESMITH_FROZEN_PROMPT_DATA}.tmp.$$"
-    rm -f "${SWESMITH_FROZEN_TMP}"
-    if ! ln -- "${ROLLOUT_PROMPT_DATA}" "${SWESMITH_FROZEN_TMP}"; then
-      echo "[ERROR] Could not hard-link the validated SWE-smith artifact into the run directory."
-      echo "        Keep RUNS_ROOT and the formal dataset on the same filesystem."
-      exit 1
-    fi
-    read -r frozen_device frozen_inode < <(stat -c '%d %i' "${SWESMITH_FROZEN_TMP}")
-    if [[ "${frozen_device}" != "${SWESMITH_SOURCE_DEVICE}" || "${frozen_inode}" != "${SWESMITH_SOURCE_INODE}" ]]; then
-      rm -f "${SWESMITH_FROZEN_TMP}"
-      echo "[ERROR] SWE-smith train.jsonl changed during preflight; retry after conversion finishes."
-      exit 1
-    fi
-    if [[ -e "${SWESMITH_FROZEN_PROMPT_DATA}" ]]; then
-      read -r existing_device existing_inode < <(stat -c '%d %i' "${SWESMITH_FROZEN_PROMPT_DATA}")
-      if [[ "${existing_device}" == "${SWESMITH_SOURCE_DEVICE}" && "${existing_inode}" == "${SWESMITH_SOURCE_INODE}" ]]; then
-        rm -f "${SWESMITH_FROZEN_TMP}"
-      else
-        rm -f "${SWESMITH_FROZEN_PROMPT_DATA}"
-        mv "${SWESMITH_FROZEN_TMP}" "${SWESMITH_FROZEN_PROMPT_DATA}"
-      fi
-    else
-      mv "${SWESMITH_FROZEN_TMP}" "${SWESMITH_FROZEN_PROMPT_DATA}"
-    fi
-    chmod a-w "${SWESMITH_FROZEN_PROMPT_DATA}"
-    cp "${SWESMITH_STATS_SOURCE}" "${RUN_DIR}/config/swesmith_convert_stats.json.tmp"
-    mv -f "${RUN_DIR}/config/swesmith_convert_stats.json.tmp" "${RUN_DIR}/config/swesmith_convert_stats.json"
-    python3 - "${SCRIPT_DIR}" "${SWESMITH_FROZEN_PROMPT_DATA}" "${RUN_DIR}/config/swesmith_convert_stats.json" "${SWESMITH_ARTIFACT_SHA256}" <<'PY'
-import sys
-from pathlib import Path
-
-sys.path.insert(0, sys.argv[1])
-from data_utils.convert_swesmith_to_terminal_rl import (
-    CANONICAL_SWESMITH_ROWS,
-    validate_swesmith_artifact_manifest,
-)
-
-validate_swesmith_artifact_manifest(
-    Path(sys.argv[2]),
-    stats_path=Path(sys.argv[3]),
-    require_full=True,
-    artifact_rows=CANONICAL_SWESMITH_ROWS,
-    artifact_sha256=sys.argv[4],
-)
-PY
-    ROLLOUT_PROMPT_DATA="${SWESMITH_FROZEN_PROMPT_DATA}"
-    echo "[swesmith] frozen formal artifact: ${ROLLOUT_PROMPT_DATA}"
-  fi
+echo "[config] sources seta=${INCLUDES_SETA} tau2=${INCLUDES_TAU2} agentharm=${INCLUDES_AGENTHARM} safety=${INCLUDES_SAFETY}"
+if [[ "${INCLUDES_TAU2}" == "1" ]]; then
+  echo "[config] tau2 domain=${TAU2_DOMAIN} split=${TAU2_TASK_SPLIT} policy_type=${TAU2_POLICY_TYPE} root=${TAU2_BENCH_ROOT}"
 fi
-echo "[config] sources seta=${INCLUDES_SETA} safety=${INCLUDES_SAFETY} agentharm=${INCLUDES_AGENTHARM} swesmith=${INCLUDES_SWESMITH}"
 echo "[config] data=${ROLLOUT_PROMPT_DATA}"
 
 NEEDS_ENV_ROUTER="0"
@@ -1217,16 +937,13 @@ fi
 if [[ "${INCLUDES_AGENTHARM}" == "1" && "${AGENTHARM_REMOTE_ENV}" == "1" ]]; then
   NEEDS_ENV_ROUTER="1"
 fi
-if [[ "${INCLUDES_SWESMITH}" == "1" ]]; then
-  NEEDS_ENV_ROUTER="1"
-fi
 echo "[config] needs_env_router=${NEEDS_ENV_ROUTER} AGENT_SAFETYBENCH_REMOTE_ENV=${AGENT_SAFETYBENCH_REMOTE_ENV} AGENTHARM_REMOTE_ENV=${AGENTHARM_REMOTE_ENV}"
 
 # Optional dataset blacklist (issue #3 §1.X / §2.x stuck offenders).
 # Default-ON; set USE_BLACKLIST=0 to keep the raw dataset.
 USE_BLACKLIST="${USE_BLACKLIST:-1}"
 DATASET_BLACKLIST="${DATASET_BLACKLIST:-786,96,90,456,856,210,999,305,25,684,345,553,962,916,1264,282,324,768,46,996}"
-if [[ "${USE_BLACKLIST}" == "1" && "${INCLUDES_SETA}" == "1" && -n "${DATASET_BLACKLIST}" ]]; then
+if [[ "${USE_BLACKLIST}" == "1" && -n "${DATASET_BLACKLIST}" ]]; then
   if [[ "${DRY_RUN}" == "1" ]]; then
     FILTERED_DATA="${RUN_DIR}/config/$(basename "${ROLLOUT_PROMPT_DATA%.jsonl}").filtered.jsonl"
   else
@@ -1260,13 +977,7 @@ fi
 
 # ── Router / worker URLs ─────────────────────────────────────────────
 WORKER_URLS="${WORKER_URLS:-}"
-RUN_LOCAL_WORKER_URLS_FILE=""
-if [[ -z "${WORKER_URLS_FILE:-}" && "${DATASET}" == "swesmith" ]]; then
-  RUN_LOCAL_WORKER_URLS_FILE="${RUN_DIR}/config/worker_urls.txt"
-  WORKER_URLS_FILE="${RUN_LOCAL_WORKER_URLS_FILE}"
-else
-  WORKER_URLS_FILE="${WORKER_URLS_FILE:-${SCRIPT_DIR}/worker_urls.txt}"
-fi
+WORKER_URLS_FILE="${WORKER_URLS_FILE:-${SCRIPT_DIR}/worker_urls.txt}"
 WORKER_URLS_RELOAD_INTERVAL="${WORKER_URLS_RELOAD_INTERVAL:-120}"
 
 read_worker_urls_from_file() {
@@ -1299,21 +1010,27 @@ if [[ -z "${WORKER_URLS}" && -f "${WORKER_URLS_FILE}" ]]; then
 fi
 if [[ "${DRY_RUN}" != "1" && "${NEEDS_ENV_ROUTER}" == "1" && -z "${WORKER_URLS}" ]]; then
   echo "[ERROR] WORKER_URLS is unset. Example:"
-  if [[ "${DATASET}" == "swesmith" ]]; then
-    echo "        export WORKER_URLS=http://<worker-ip>:18082"
-  else
-    echo "        export WORKER_URLS=http://<worker-ip>:18081"
-  fi
+  echo "        export WORKER_URLS=http://<worker-ip>:18081"
   echo "        or write that URL into WORKER_URLS_FILE=${WORKER_URLS_FILE}"
   exit 1
 fi
 if [[ "${NEEDS_ENV_ROUTER}" == "1" && -n "${WORKER_URLS}" ]]; then
   mkdir -p "$(dirname "${WORKER_URLS_FILE}")"
-  if [[ -n "${RUN_LOCAL_WORKER_URLS_FILE}" ]]; then
-    printf "%s\n" "${WORKER_URLS}" > "${WORKER_URLS_FILE}"
-  elif [[ ! -s "${WORKER_URLS_FILE}" ]]; then
+  if [[ ! -s "${WORKER_URLS_FILE}" ]]; then
     printf "%s\n" "${WORKER_URLS}" > "${WORKER_URLS_FILE}"
   fi
+fi
+WORKER_URL_COUNT=0
+SINGLE_WORKER_URL=""
+if [[ -n "${WORKER_URLS}" ]]; then
+  IFS=',' read -r -a _CONFIG_WORKERS <<< "${WORKER_URLS}"
+  for _worker_url in "${_CONFIG_WORKERS[@]}"; do
+    _worker_url="${_worker_url//[[:space:]]/}"
+    [[ -n "${_worker_url}" ]] || continue
+    WORKER_URL_COUNT=$((WORKER_URL_COUNT + 1))
+    SINGLE_WORKER_URL="${_worker_url%/}"
+  done
+  unset _CONFIG_WORKERS _worker_url
 fi
 export WORKER_URLS WORKER_URLS_FILE WORKER_URLS_RELOAD_INTERVAL
 
@@ -1330,27 +1047,34 @@ export PROVIDER_NAME="${PROVIDER_NAME:-build}"
 export ENV_SERVER_BIND_HOST="${ENV_SERVER_BIND_HOST:-0.0.0.0}"
 export ENV_SERVER_PORT="${ENV_SERVER_PORT:-18080}"
 export ENV_SERVER_HOST="${ENV_SERVER_HOST:-${MASTER_ADDR}}"
-FIRST_WORKER_URL=""
-if [[ -n "${WORKER_URLS}" ]]; then
-  FIRST_WORKER_URL="${WORKER_URLS%%,*}"
-fi
-if [[ "${NEEDS_ENV_ROUTER}" == "1" && -n "${FIRST_WORKER_URL}" ]]; then
-  # When explicit remote workers are provided, use them directly by default.
-  # Set START_ENV_POOL_SERVER=1 to force launching a local fan-out router.
-  export ENV_SERVER_URL="${ENV_SERVER_URL:-${FIRST_WORKER_URL}}"
-  export START_ENV_POOL_SERVER="${START_ENV_POOL_SERVER:-0}"
+FORCE_ENV_ROUTER="${FORCE_ENV_ROUTER:-0}"
+START_ENV_ROUTER="${START_ENV_ROUTER:-${NEEDS_ENV_ROUTER}}"
+if [[ "${NEEDS_ENV_ROUTER}" == "1" && "${WORKER_URL_COUNT}" -eq 1 && "${FORCE_ENV_ROUTER}" != "1" ]]; then
+  START_ENV_ROUTER="0"
+  export ENV_SERVER_URL="${ENV_SERVER_URL:-${SINGLE_WORKER_URL}}"
 else
   export ENV_SERVER_URL="${ENV_SERVER_URL:-http://${ENV_SERVER_HOST}:${ENV_SERVER_PORT}}"
-  export START_ENV_POOL_SERVER="${START_ENV_POOL_SERVER:-${NEEDS_ENV_ROUTER}}"
 fi
+export START_ENV_ROUTER
+export START_ENV_POOL_SERVER="${START_ENV_POOL_SERVER:-${START_ENV_ROUTER}}"
 export AGENT_SAFETYBENCH_REMOTE_ENV
 export AGENTHARM_REMOTE_ENV
 export AGENTHARM_ROOT
 export AGENTHARM_REWARD
+export TAU2_REMOTE_ENV
+export TAU2_BENCH_ROOT
+export TAU2_DOMAIN
+export TAU2_TASK_SPLIT
+export TAU2_POLICY_TYPE
+export TAU2_USER_LLM
+export TAU2_USER_LLM_API_BASE
+export TAU2_USER_LLM_TIMEOUT
+export VLLM_API_KEY
+export SGLANG_REQUEST_TIMEOUT
 
 ROUTER_HOST="${ROUTER_HOST:-0.0.0.0}"
 ROUTER_PORT="${ROUTER_PORT:-${ENV_SERVER_PORT}}"
-CHECK_HOST="${CHECK_HOST:-127.0.0.1}"
+CHECK_HOST="${CHECK_HOST:-${ENV_SERVER_HOST}}"
 CHECK_WAIT_SECS="${CHECK_WAIT_SECS:-60}"
 READY_PROBE_TIMEOUT="${READY_PROBE_TIMEOUT:-5}"
 ROUTER_REQUIRE_READY="${ROUTER_REQUIRE_READY:-1}"
@@ -1393,6 +1117,20 @@ probe_ready_endpoint() {
   log "  [WARN] ${label}${path} not ready HTTP ${code}${body:+: ${body}}"
   rm -f "${tmp}" 2>/dev/null || true
   return 1
+}
+
+router_check_urls() {
+  local host seen
+  seen=" "
+  for host in "${CHECK_HOST}" "${ENV_SERVER_HOST}" "${MASTER_ADDR}" "127.0.0.1"; do
+    [[ -n "${host}" ]] || continue
+    [[ "${host}" != "0.0.0.0" ]] || host="127.0.0.1"
+    case "${seen}" in
+      *" ${host} "*) continue ;;
+    esac
+    seen="${seen}${host} "
+    printf 'http://%s:%s\n' "${host}" "${ROUTER_PORT}"
+  done
 }
 
 extract_stale_lease_ids() {
@@ -1583,7 +1321,12 @@ if [[ -n "${WORKER_URLS}" ]]; then
   ALL_WORKER_HOSTS="$(echo "${WORKER_URLS}" | tr ',' '\n' \
     | sed -E 's#https?://([^:/]+).*#\1#' | tr '\n' ',' | sed 's/,$//')"
 fi
-export NO_PROXY="${NO_PROXY:-localhost,127.0.0.1,${MASTER_ADDR}${ALL_WORKER_HOSTS:+,${ALL_WORKER_HOSTS}}}"
+TAU2_USER_LLM_HOST="$(printf '%s\n' "${TAU2_USER_LLM_API_BASE}" | sed -E 's#https?://([^/:]+).*#\1#')"
+DEFAULT_NO_PROXY="localhost,127.0.0.1,${MASTER_ADDR}${ALL_WORKER_HOSTS:+,${ALL_WORKER_HOSTS}}"
+if [[ -n "${TAU2_USER_LLM_HOST}" && "${TAU2_USER_LLM_HOST}" != "${TAU2_USER_LLM_API_BASE}" ]]; then
+  DEFAULT_NO_PROXY="${DEFAULT_NO_PROXY},${TAU2_USER_LLM_HOST}"
+fi
+export NO_PROXY="${NO_PROXY:-${DEFAULT_NO_PROXY}}"
 export no_proxy="${NO_PROXY}"
 
 # Router uses `python3` which, after the PATH export above, resolves to
@@ -1619,11 +1362,7 @@ else
   # each rollout = ROLLOUT_BATCH_SIZE * N_SAMPLES concurrent lease requests.
   # Keep this baseline explicit and predictable without dynamic sampling.
   ROLLOUT_BATCH_SIZE="${ROLLOUT_BATCH_SIZE:-8}"
-  if [[ "${DATASET}" == "swesmith" ]]; then
-    N_SAMPLES="${N_SAMPLES:-4}"
-  else
-    N_SAMPLES="${N_SAMPLES:-8}"
-  fi
+  N_SAMPLES="${N_SAMPLES:-8}"
   MAX_TOKENS_PER_GPU="${MAX_TOKENS_PER_GPU:-16384}"
 fi
 ROLLOUT_MAX_RESPONSE_LEN="${ROLLOUT_MAX_RESPONSE_LEN:-8192}"
@@ -1753,7 +1492,7 @@ if [[ -n "${ALGO_EXTRA_ARGS// }" ]]; then
 fi
 log "Algorithm config: ALGO=${ALGO} args=${ALGO_ARGS[*]} extra=${ALGO_EXTRA_ARGS_ARRAY[*]:-<none>}"
 log "Rollout retry config: max_retries=${ROLLOUT_GENERATION_MAX_RETRIES} initial_backoff=${ROLLOUT_GENERATION_RETRY_INITIAL_BACKOFF}s max_backoff=${ROLLOUT_GENERATION_RETRY_MAX_BACKOFF}s multiplier=${ROLLOUT_GENERATION_RETRY_BACKOFF_MULTIPLIER} env_storm_max_retries=${ROLLOUT_GENERATION_ENV_STORM_MAX_RETRIES} skip_on_failure=${ROLLOUT_GENERATION_SKIP_ON_FAILURE}"
-log "Exploration config: profile=${EXPLORATION_PROFILE} entropy=${EXPLORE_ENTROPY_COEF} intrinsic=${EXPLORE_INTRINSIC_ENABLED}/${EXPLORE_INTRINSIC} coef=${EXPLORE_INTRINSIC_COEF} schedule=${EXPLORE_INTRINSIC_SCHEDULE}/${EXPLORE_INTRINSIC_DECAY_STEPS} reducer=${EXPLORE_INTRINSIC_REDUCER} granularity=${EXPLORE_INTRINSIC_GRANULARITY} scope=${EXPLORE_INTRINSIC_SCOPE} score_components=${EXPLORE_SCORE_BONUS_COMPONENTS} safety_filter=${EXPLORE_SAFETY_FILTER_ENABLED}/${EXPLORE_SAFETY_FILTER} lprnd=${EXPLORE_LPRND_ENABLED}/${EXPLORE_LPRND} coef=${EXPLORE_LPRND_COEF} schedule=${EXPLORE_LPRND_SCHEDULE}/${EXPLORE_LPRND_DECAY_STEPS} agent57=${EXPLORE_AGENT57_LITE_ENABLED}/${EXPLORE_AGENT57_LITE} k=${EXPLORE_AGENT57_K} controller=${EXPLORE_AGENT57_CONTROLLER} ucb_eps=${EXPLORE_AGENT57_UCB_EPSILON} ucb_min=${EXPLORE_AGENT57_UCB_MIN_PER_ARM} ucb_value=${EXPLORE_AGENT57_UCB_VALUE} dataset_aware=${EXPLORE_AGENT57_UCB_DATASET_AWARE} ucb_seed=${EXPLORE_AGENT57_UCB_RANDOM_SEED:-<legacy>} episodic=${EXPLORE_AGENT57_EPISODIC_BACKEND} episodic_obs=${EXPLORE_AGENT57_EPISODIC_OBS_MODE} episodic_turn=${EXPLORE_AGENT57_EPISODIC_INCLUDE_TURN} episodic_probe=${EXPLORE_AGENT57_EPISODIC_MULTI_PROBE_RADIUS} episodic_floor=${EXPLORE_AGENT57_EPISODIC_NOVELTY_FLOOR} combine=${EXPLORE_AGENT57_COMBINE_MODE} ngu_clip=${EXPLORE_AGENT57_NGU_MOD_CLIP} ngu_reducer=${EXPLORE_AGENT57_NGU_EPISODIC_REDUCER} life_mod=${EXPLORE_AGENT57_NGU_LIFE_MOD_MODE}/${EXPLORE_AGENT57_NGU_LIFE_MOD_STD_CLIP} max_bonus=${EXPLORE_AGENT57_MAX_BONUS} betas=${EXPLORE_AGENT57_ARM_BETAS} temps=${EXPLORE_AGENT57_ARM_TEMPERATURES:-<inherit>} temp_warmup=${EXPLORE_AGENT57_ARM_TEMPERATURE_WARMUP_ROLLOUTS} lifelong=${EXPLORE_AGENT57_LIFELONG_ENABLED}/${EXPLORE_AGENT57_LIFELONG} life_coef=${EXPLORE_AGENT57_LIFELONG_COEF} life_backend=${EXPLORE_AGENT57_LIFELONG_BACKEND} life_key=${EXPLORE_AGENT57_LIFELONG_KEY_VERSION} life_dataset=${EXPLORE_AGENT57_LIFELONG_INCLUDE_DATASET} life_task=${EXPLORE_AGENT57_LIFELONG_INCLUDE_TASK} life_turn=${EXPLORE_AGENT57_LIFELONG_INCLUDE_TURN} life_obs=${EXPLORE_AGENT57_LIFELONG_OBS_MODE} life_hier=${EXPLORE_AGENT57_LIFELONG_HIERARCHICAL} life_weights=${EXPLORE_AGENT57_LIFELONG_TASK_WEIGHT}/${EXPLORE_AGENT57_LIFELONG_SKILL_WEIGHT}/${EXPLORE_AGENT57_LIFELONG_GLOBAL_WEIGHT} sqlite_timeout_ms=${EXPLORE_AGENT57_SQLITE_BUSY_TIMEOUT_MS} sqlite_wal=${EXPLORE_AGENT57_SQLITE_WAL} life_decay=${EXPLORE_AGENT57_LIFELONG_COUNT_DECAY} life_capacity=${EXPLORE_AGENT57_LIFELONG_CAPACITY} trust=${EXPLORE_AGENT57_TRUST_GATE} cde_actor=${EXPLORE_CDE_ACTOR_ENABLED}/${EXPLORE_CDE_ACTOR} omega=${EXPLORE_CDE_ACTOR_OMEGA} alpha=${EXPLORE_CDE_ACTOR_ALPHA} kappa=${EXPLORE_CDE_ACTOR_KAPPA} gate=${EXPLORE_CDE_ACTOR_REWARD_GATE} decay_steps=${EXPLORE_CDE_ACTOR_DECAY_STEPS} post_norm_bonus=${EXPLORE_ADVANTAGE_BONUS_ENABLED}/${EXPLORE_ADVANTAGE_BONUS} mode=${EXPLORE_ADVANTAGE_BONUS_MODE} components=${EXPLORE_ADVANTAGE_BONUS_COMPONENTS} coef=${EXPLORE_ADVANTAGE_BONUS_COEF} lambda=${EXPLORE_ADVANTAGE_LAMBDA} lambda_schedule=${EXPLORE_ADVANTAGE_LAMBDA_SCHEDULE}/${EXPLORE_ADVANTAGE_LAMBDA_DECAY_STEPS} intrinsic_key=${EXPLORE_ADVANTAGE_INTRINSIC_KEY} arm_weight=${EXPLORE_ADVANTAGE_ARM_WEIGHT_MODE} clip=${EXPLORE_ADVANTAGE_BONUS_CLIP} trunc_intr_scale=${EXPLORE_ADVANTAGE_TRUNCATED_INTRINSIC_SCALE} fail_intr_scale=${EXPLORE_ADVANTAGE_FAILED_INTRINSIC_SCALE} trunc_penalty=${EXPLORE_TRUNCATION_PENALTY} skip_zero_trainable=${SLIME_SKIP_ZERO_TRAINABLE_ROLLOUT}/${SLIME_SKIP_ZERO_TRAINABLE_TRAIN}"
+log "Exploration config: profile=${EXPLORATION_PROFILE} entropy=${EXPLORE_ENTROPY_COEF} intrinsic=${EXPLORE_INTRINSIC_ENABLED}/${EXPLORE_INTRINSIC} coef=${EXPLORE_INTRINSIC_COEF} schedule=${EXPLORE_INTRINSIC_SCHEDULE}/${EXPLORE_INTRINSIC_DECAY_STEPS} reducer=${EXPLORE_INTRINSIC_REDUCER} granularity=${EXPLORE_INTRINSIC_GRANULARITY} scope=${EXPLORE_INTRINSIC_SCOPE} score_components=${EXPLORE_SCORE_BONUS_COMPONENTS} safety_filter=${EXPLORE_SAFETY_FILTER_ENABLED}/${EXPLORE_SAFETY_FILTER} lprnd=${EXPLORE_LPRND_ENABLED}/${EXPLORE_LPRND} coef=${EXPLORE_LPRND_COEF} schedule=${EXPLORE_LPRND_SCHEDULE}/${EXPLORE_LPRND_DECAY_STEPS} agent57=${EXPLORE_AGENT57_LITE_ENABLED}/${EXPLORE_AGENT57_LITE} k=${EXPLORE_AGENT57_K} controller=${EXPLORE_AGENT57_CONTROLLER} ucb_eps=${EXPLORE_AGENT57_UCB_EPSILON} ucb_min=${EXPLORE_AGENT57_UCB_MIN_PER_ARM} ucb_value=${EXPLORE_AGENT57_UCB_VALUE} dataset_aware=${EXPLORE_AGENT57_UCB_DATASET_AWARE} ucb_seed=${EXPLORE_AGENT57_UCB_RANDOM_SEED:-<legacy>} episodic=${EXPLORE_AGENT57_EPISODIC_BACKEND} episodic_obs=${EXPLORE_AGENT57_EPISODIC_OBS_MODE} episodic_turn=${EXPLORE_AGENT57_EPISODIC_INCLUDE_TURN} episodic_probe=${EXPLORE_AGENT57_EPISODIC_MULTI_PROBE_RADIUS} episodic_floor=${EXPLORE_AGENT57_EPISODIC_NOVELTY_FLOOR} combine=${EXPLORE_AGENT57_COMBINE_MODE} ngu_clip=${EXPLORE_AGENT57_NGU_MOD_CLIP} ngu_reducer=${EXPLORE_AGENT57_NGU_EPISODIC_REDUCER} life_mod=${EXPLORE_AGENT57_NGU_LIFE_MOD_MODE}/${EXPLORE_AGENT57_NGU_LIFE_MOD_STD_CLIP} max_bonus=${EXPLORE_AGENT57_MAX_BONUS} betas=${EXPLORE_AGENT57_ARM_BETAS} temps=${EXPLORE_AGENT57_ARM_TEMPERATURES:-<inherit>} temp_warmup=${EXPLORE_AGENT57_ARM_TEMPERATURE_WARMUP_ROLLOUTS} lifelong=${EXPLORE_AGENT57_LIFELONG_ENABLED}/${EXPLORE_AGENT57_LIFELONG} life_coef=${EXPLORE_AGENT57_LIFELONG_COEF} life_backend=${EXPLORE_AGENT57_LIFELONG_BACKEND} life_key=${EXPLORE_AGENT57_LIFELONG_KEY_VERSION} life_dataset=${EXPLORE_AGENT57_LIFELONG_INCLUDE_DATASET} life_task=${EXPLORE_AGENT57_LIFELONG_INCLUDE_TASK} life_turn=${EXPLORE_AGENT57_LIFELONG_INCLUDE_TURN} life_obs=${EXPLORE_AGENT57_LIFELONG_OBS_MODE} life_hier=${EXPLORE_AGENT57_LIFELONG_HIERARCHICAL} life_weights=${EXPLORE_AGENT57_LIFELONG_TASK_WEIGHT}/${EXPLORE_AGENT57_LIFELONG_SKILL_WEIGHT}/${EXPLORE_AGENT57_LIFELONG_GLOBAL_WEIGHT} sqlite_timeout_ms=${EXPLORE_AGENT57_SQLITE_BUSY_TIMEOUT_MS} sqlite_wal=${EXPLORE_AGENT57_SQLITE_WAL} life_decay=${EXPLORE_AGENT57_LIFELONG_COUNT_DECAY} life_capacity=${EXPLORE_AGENT57_LIFELONG_CAPACITY} trust=${EXPLORE_AGENT57_TRUST_GATE} cde_actor=${EXPLORE_CDE_ACTOR_ENABLED}/${EXPLORE_CDE_ACTOR} omega=${EXPLORE_CDE_ACTOR_OMEGA} alpha=${EXPLORE_CDE_ACTOR_ALPHA} kappa=${EXPLORE_CDE_ACTOR_KAPPA} gate=${EXPLORE_CDE_ACTOR_REWARD_GATE} decay_steps=${EXPLORE_CDE_ACTOR_DECAY_STEPS} post_norm_bonus=${EXPLORE_ADVANTAGE_BONUS_ENABLED}/${EXPLORE_ADVANTAGE_BONUS} mode=${EXPLORE_ADVANTAGE_BONUS_MODE} components=${EXPLORE_ADVANTAGE_BONUS_COMPONENTS} coef=${EXPLORE_ADVANTAGE_BONUS_COEF} lambda=${EXPLORE_ADVANTAGE_LAMBDA} intrinsic_key=${EXPLORE_ADVANTAGE_INTRINSIC_KEY} arm_weight=${EXPLORE_ADVANTAGE_ARM_WEIGHT_MODE} clip=${EXPLORE_ADVANTAGE_BONUS_CLIP} trunc_penalty=${EXPLORE_TRUNCATION_PENALTY} skip_zero_trainable=${SLIME_SKIP_ZERO_TRAINABLE_ROLLOUT}/${SLIME_SKIP_ZERO_TRAINABLE_TRAIN}"
 if [[ "${ALGO}" == "dapo" ]]; then
   log "DAPO knobs: clip_low=${DAPO_EPS_CLIP_LOW} clip_high=${DAPO_EPS_CLIP_HIGH} token_loss=${DAPO_CALCULATE_PER_TOKEN_LOSS} dynamic_sampling=${DAPO_DYNAMIC_SAMPLING} failed_group_abort=${DAPO_FAILED_GROUP_ABORT_MIN_GROUPS}/${DAPO_FAILED_GROUP_ABORT_RATIO} overlong=${DAPO_OVERLONG_BUFFER_ENABLE}/${DAPO_OVERLONG_BUFFER_LEN}/${DAPO_OVERLONG_PENALTY_FACTOR}"
 fi
@@ -1771,29 +1510,14 @@ OPTIMIZER_ARGS=(
   --use-precision-aware-optimizer
 )
 
-WANDB_MODE="${WANDB_MODE:-offline}"
-WANDB_ENABLE="${WANDB_ENABLE:-0}"
-WANDB_KEY_VALUE="${WANDB_KEY:-${WANDB_API_KEY:-}}"
-case "${WANDB_ENABLE,,}" in
-  1|true|yes|on)
-    WANDB_ENABLE_RESOLVED=1
-    ;;
-  *)
-    WANDB_ENABLE_RESOLVED=0
-    ;;
-esac
-
-if [[ "${WANDB_MODE}" != "disabled" ]] && (( WANDB_ENABLE_RESOLVED || ${#WANDB_KEY_VALUE} > 0 )); then
+if [[ -n "${WANDB_KEY:-}" ]]; then
   WANDB_ARGS=(
     --use-wandb
-    --wandb-mode    "${WANDB_MODE}"
     --wandb-project "${WANDB_PROJECT:-terminal_rl}"
     --wandb-group   "${WANDB_GROUP:-qwen3-8b_4gpu}"
+    --wandb-key     "${WANDB_KEY}"
     --wandb-dir     "${WANDB_DIR}"
   )
-  if [[ -n "${WANDB_KEY_VALUE}" ]]; then
-    WANDB_ARGS+=(--wandb-key "${WANDB_KEY_VALUE}")
-  fi
 else
   WANDB_ARGS=()
 fi
@@ -1829,7 +1553,6 @@ fi
 
 TRAIN_ARGS=(
   --actor-num-nodes 1
-  --num-gpus-per-node "${NUM_GPUS}"
   --actor-num-gpus-per-node "${ACTOR_GPUS}"
   --num-gpus-per-node "${NUM_GPUS}"
   --rollout-num-gpus "${ROLLOUT_GPUS}"
@@ -1874,7 +1597,7 @@ trap cleanup EXIT INT TERM
 
 ROUTER_LOG="${RUN_LOG_DIR}/router.log"
 require_cmd curl
-if [[ "${NEEDS_ENV_ROUTER}" == "1" && "${START_ENV_POOL_SERVER}" == "1" ]]; then
+if [[ "${START_ENV_ROUTER}" == "1" ]]; then
   if [[ "${AUTO_CLOSE_STALE_WORKER_RUNS}" == "1" ]]; then
     log "Pre-cleaning stale worker runs before router readiness check..."
     close_stale_runs_for_all_workers "pre_router_start" || true
@@ -1883,6 +1606,8 @@ if [[ "${NEEDS_ENV_ROUTER}" == "1" && "${START_ENV_POOL_SERVER}" == "1" ]]; then
   log "  worker_urls_file=${WORKER_URLS_FILE} reload_interval=${WORKER_URLS_RELOAD_INTERVAL}s"
   log "  forward_timeout=${ROUTER_FORWARD_TIMEOUT}s retries=${ROUTER_FORWARD_RETRIES} backoff=${ROUTER_FORWARD_RETRY_BACKOFF}s pressure_cooldown=${ROUTER_PRESSURE_COOLDOWN}s no_proxy=${NO_PROXY}"
   log "  readiness require_router=${ROUTER_REQUIRE_READY} wait_forever=${ROUTER_READY_WAIT_FOREVER} require_worker=${WORKER_PREFLIGHT_REQUIRE_READY} probe_timeout=${READY_PROBE_TIMEOUT}s worker_timeout=${ROUTER_READYZ_WORKER_TIMEOUT}s auto_close_stale=${AUTO_CLOSE_STALE_WORKER_RUNS}"
+  log "  env_server_url=${ENV_SERVER_URL} worker_url_count=${WORKER_URL_COUNT} force_env_router=${FORCE_ENV_ROUTER}"
+  log "  router_check_urls=$(router_check_urls | paste -sd, -)"
   (
     cd "${REPO_ROOT}"
     "${ROUTER_PYTHON}" -m terminal-rl.router_server \
@@ -1897,11 +1622,18 @@ if [[ "${NEEDS_ENV_ROUTER}" == "1" && "${START_ENV_POOL_SERVER}" == "1" ]]; then
   # Wait for router readiness. /readyz validates at least one env worker; /healthz
   # is only used as fallback for older router implementations.
   ROUTER_READY=0
+  ROUTER_READY_BASE_URL=""
   i=1
   while true; do
-    if probe_ready_endpoint "http://${CHECK_HOST}:${ROUTER_PORT}" "router http://${CHECK_HOST}:${ROUTER_PORT}" "${READY_PROBE_TIMEOUT}"; then
-      log "router ready (attempt ${i})"
-      ROUTER_READY=1
+    for router_base_url in $(router_check_urls); do
+      if probe_ready_endpoint "${router_base_url}" "router ${router_base_url}" "${READY_PROBE_TIMEOUT}"; then
+        log "router ready (attempt ${i}, url=${router_base_url})"
+        ROUTER_READY=1
+        ROUTER_READY_BASE_URL="${router_base_url}"
+        break
+      fi
+    done
+    if [[ "${ROUTER_READY}" == "1" ]]; then
       break
     fi
     if [[ "${AUTO_CLOSE_STALE_WORKER_RUNS}" == "1" && $((i % STALE_WORKER_CLOSE_INTERVAL)) -eq 0 ]]; then
@@ -1923,14 +1655,10 @@ if [[ "${NEEDS_ENV_ROUTER}" == "1" && "${START_ENV_POOL_SERVER}" == "1" ]]; then
       exit 1
     fi
   fi
-  curl -fsS "http://${CHECK_HOST}:${ROUTER_PORT}/status" || true
+  curl -fsS --noproxy '*' "${ROUTER_READY_BASE_URL:-http://${CHECK_HOST}:${ROUTER_PORT}}/status" || true
   echo
 else
-  if [[ "${NEEDS_ENV_ROUTER}" == "1" ]]; then
-    log "Skipping local terminal env router; using ENV_SERVER_URL=${ENV_SERVER_URL} WORKER_URLS=${WORKER_URLS}"
-  else
-    log "Skipping terminal env router; Agent-SafetyBench uses local env backend"
-  fi
+  log "Skipping terminal env router; env_server_url=${ENV_SERVER_URL} start_env_router=${START_ENV_ROUTER} needs_env_router=${NEEDS_ENV_ROUTER}"
 fi
 
 # ── Start ClawSentry gateway (L1-only, reward-only) ──────────────────
@@ -2001,11 +1729,7 @@ else
 fi
 NCCL_NVLS_ENABLE="${NCCL_NVLS_ENABLE:-${HAS_NVLINK}}"
 NCCL_P2P_DISABLE="${NCCL_P2P_DISABLE:-0}"
-
-NCCL_IB_DISABLE="${NCCL_IB_DISABLE:-1}"
-export NCCL_NVLS_ENABLE NCCL_P2P_DISABLE NCCL_IB_DISABLE
-log "HAS_NVLINK=${HAS_NVLINK} NCCL_NVLS_ENABLE=${NCCL_NVLS_ENABLE} NCCL_P2P_DISABLE=${NCCL_P2P_DISABLE} NCCL_IB_DISABLE=${NCCL_IB_DISABLE}"
-
+log "HAS_NVLINK=${HAS_NVLINK} NCCL_NVLS_ENABLE=${NCCL_NVLS_ENABLE} NCCL_P2P_DISABLE=${NCCL_P2P_DISABLE}"
 
 # ── Dump run config ──────────────────────────────────────────────────
 cat > "${RUN_DIR}/config/run_config.json" <<CFGEOF
@@ -2029,15 +1753,10 @@ cat > "${RUN_DIR}/config/run_config.json" <<CFGEOF
   "rollout_engine_gpus": ${ROLLOUT_NUM_GPUS_PER_ENGINE},
   "dataset": "${DATASET}",
   "includes_seta": "${INCLUDES_SETA}",
+  "includes_tau2": "${INCLUDES_TAU2}",
   "includes_safety": "${INCLUDES_SAFETY}",
   "includes_agentharm": "${INCLUDES_AGENTHARM}",
-  "includes_swesmith": "${INCLUDES_SWESMITH}",
   "prompt_data": "${ROLLOUT_PROMPT_DATA}",
-  "swesmith_source_prompt_data": "${SWESMITH_SOURCE_PROMPT_DATA}",
-  "swesmith_artifact_sha256": "${SWESMITH_ARTIFACT_SHA256}",
-  "swesmith_conversion_mode": "${SWESMITH_CONVERSION_MODE}",
-  "swesmith_dataset_revision": "${SWESMITH_DATASET_REVISION}",
-  "swesmith_converter_sha256": "${SWESMITH_CONVERTER_SHA256}",
   "mix_mode": "${MIX_MODE}",
   "num_rollout": ${NUM_ROLLOUT},
   "rollout_batch_size": ${ROLLOUT_BATCH_SIZE},
@@ -2056,6 +1775,8 @@ cat > "${RUN_DIR}/config/run_config.json" <<CFGEOF
   "worker_urls_reload_interval": "${WORKER_URLS_RELOAD_INTERVAL}",
   "env_server_url": "${ENV_SERVER_URL}",
   "needs_env_router": "${NEEDS_ENV_ROUTER}",
+  "start_env_router": "${START_ENV_ROUTER}",
+  "worker_url_count": "${WORKER_URL_COUNT}",
   "router_pressure_cooldown": "${ROUTER_PRESSURE_COOLDOWN}",
   "router_require_ready": "${ROUTER_REQUIRE_READY}",
   "router_readyz_worker_timeout": "${ROUTER_READYZ_WORKER_TIMEOUT}",
@@ -2078,6 +1799,14 @@ cat > "${RUN_DIR}/config/run_config.json" <<CFGEOF
   "env_remote_max_runs_per_task": "${ENV_REMOTE_MAX_RUNS_PER_TASK}",
   "agent_safetybench_remote_env": "${AGENT_SAFETYBENCH_REMOTE_ENV}",
   "agentharm_remote_env": "${AGENTHARM_REMOTE_ENV}",
+  "tau2_remote_env": "${TAU2_REMOTE_ENV}",
+  "tau2_domain": "${TAU2_DOMAIN}",
+  "tau2_task_split": "${TAU2_TASK_SPLIT}",
+  "tau2_policy_type": "${TAU2_POLICY_TYPE}",
+  "tau2_bench_root": "${TAU2_BENCH_ROOT}",
+  "tau2_user_llm": "${TAU2_USER_LLM}",
+  "tau2_user_llm_api_base": "${TAU2_USER_LLM_API_BASE}",
+  "tau2_user_llm_timeout": "${TAU2_USER_LLM_TIMEOUT}",
   "safety_reward_enable": "${CLAWSENTRY_NEEDED}",
   "seta_safety": "${SETA_SAFETY}",
   "safety_bench_reward": "${SAFETY_BENCH_REWARD}",
@@ -2157,7 +1886,6 @@ cat > "${RUN_DIR}/config/run_config.json" <<CFGEOF
   "explore_agent57_ucb_value": "${EXPLORE_AGENT57_UCB_VALUE}",
   "explore_agent57_ucb_dataset_aware": "${EXPLORE_AGENT57_UCB_DATASET_AWARE}",
   "explore_agent57_ucb_random_seed": "${EXPLORE_AGENT57_UCB_RANDOM_SEED}",
-  "explore_agent57_ucb_seed_salt": "${EXPLORE_AGENT57_UCB_SEED_SALT}",
   "explore_agent57_keep_baseline": "${EXPLORE_AGENT57_KEEP_BASELINE}",
   "episodic_memory_backend": "${EPISODIC_MEMORY_BACKEND}",
   "explore_agent57_episodic_backend": "${EXPLORE_AGENT57_EPISODIC_BACKEND}",
@@ -2172,7 +1900,6 @@ cat > "${RUN_DIR}/config/run_config.json" <<CFGEOF
   "explore_agent57_episodic_random_seed": "${EXPLORE_AGENT57_EPISODIC_RANDOM_SEED}",
   "explore_agent57_episodic_obs_mode": "${EXPLORE_AGENT57_EPISODIC_OBS_MODE}",
   "explore_agent57_episodic_include_turn": "${EXPLORE_AGENT57_EPISODIC_INCLUDE_TURN}",
-  "explore_agent57_episodic_turn_mode": "${EXPLORE_AGENT57_EPISODIC_TURN_MODE}",
   "explore_agent57_episodic_multi_probe_radius": "${EXPLORE_AGENT57_EPISODIC_MULTI_PROBE_RADIUS}",
   "explore_agent57_episodic_novelty_floor": "${EXPLORE_AGENT57_EPISODIC_NOVELTY_FLOOR}",
   "explore_agent57_lifelong": "${EXPLORE_AGENT57_LIFELONG}",
@@ -2210,21 +1937,10 @@ cat > "${RUN_DIR}/config/run_config.json" <<CFGEOF
   "explore_advantage_bonus_clip": "${EXPLORE_ADVANTAGE_BONUS_CLIP}",
   "explore_advantage_intrinsic_key": "${EXPLORE_ADVANTAGE_INTRINSIC_KEY}",
   "explore_advantage_lambda": "${EXPLORE_ADVANTAGE_LAMBDA}",
-  "explore_advantage_lambda_schedule": "${EXPLORE_ADVANTAGE_LAMBDA_SCHEDULE}",
-  "explore_advantage_lambda_decay_steps": "${EXPLORE_ADVANTAGE_LAMBDA_DECAY_STEPS}",
   "explore_advantage_arm_weight_mode": "${EXPLORE_ADVANTAGE_ARM_WEIGHT_MODE}",
   "explore_advantage_trust_key": "${EXPLORE_ADVANTAGE_TRUST_KEY}",
-  "explore_advantage_gate_mode": "${EXPLORE_ADVANTAGE_GATE_MODE}",
-  "explore_advantage_outcome_key": "${EXPLORE_ADVANTAGE_OUTCOME_KEY}",
-  "explore_advantage_completed_floor": "${EXPLORE_ADVANTAGE_COMPLETED_FLOOR}",
-  "explore_advantage_truncated_floor": "${EXPLORE_ADVANTAGE_TRUNCATED_FLOOR}",
-  "explore_advantage_failed_floor": "${EXPLORE_ADVANTAGE_FAILED_FLOOR}",
-  "explore_advantage_aborted_floor": "${EXPLORE_ADVANTAGE_ABORTED_FLOOR}",
-  "explore_advantage_truncated_intrinsic_scale": "${EXPLORE_ADVANTAGE_TRUNCATED_INTRINSIC_SCALE}",
-  "explore_advantage_failed_intrinsic_scale": "${EXPLORE_ADVANTAGE_FAILED_INTRINSIC_SCALE}",
   "explore_truncation_penalty": "${EXPLORE_TRUNCATION_PENALTY}",
   "explore_advantage_truncation_penalty": "${EXPLORE_ADVANTAGE_TRUNCATION_PENALTY}",
-  "explore_truncation_penalty_outcome_aware": "${EXPLORE_TRUNCATION_PENALTY_OUTCOME_AWARE}",
   "slime_skip_zero_trainable_rollout": "${SLIME_SKIP_ZERO_TRAINABLE_ROLLOUT}",
   "slime_skip_zero_trainable_train": "${SLIME_SKIP_ZERO_TRAINABLE_TRAIN}",
   "explore_cde_actor": "${EXPLORE_CDE_ACTOR}",
@@ -2259,8 +1975,7 @@ cat > "${RUN_DIR}/config/run_config.json" <<CFGEOF
   "claude_code_llm_backend": "${CLAUDE_CODE_LLM_BACKEND}",
   "claude_code_model": "${CLAUDE_CODE_MODEL}",
   "claude_code_qwen_gateway_model": "${CLAUDE_CODE_QWEN_GATEWAY_MODEL}",
-  "claude_code_local_run_root": "${CLAUDE_CODE_LOCAL_RUN_ROOT}",
-  "claude_code_workspace_root_compat": "${CLAUDE_CODE_WORKSPACE_ROOT}",
+  "claude_code_workspace_root": "${CLAUDE_CODE_WORKSPACE_ROOT}",
   "claude_code_max_tool_rounds": "${CLAUDE_CODE_MAX_TOOL_ROUNDS}",
   "claude_code_tool_timeout_ms": "${CLAUDE_CODE_TOOL_TIMEOUT_MS}",
   "claude_code_turn_timeout_sec": "${CLAUDE_CODE_TURN_TIMEOUT_SEC}",
@@ -2333,7 +2048,6 @@ if [[ "${HARNESS_OPTION}" == "claude-code" ]]; then
     \"CLAUDE_CODE_LLM_BACKEND\": \"${CLAUDE_CODE_LLM_BACKEND}\",
     \"CLAUDE_CODE_MODEL\": \"${CLAUDE_CODE_MODEL}\",
     \"CLAUDE_CODE_QWEN_GATEWAY_MODEL\": \"${CLAUDE_CODE_QWEN_GATEWAY_MODEL}\",
-    \"CLAUDE_CODE_LOCAL_RUN_ROOT\": \"${CLAUDE_CODE_LOCAL_RUN_ROOT}\",
     \"CLAUDE_CODE_WORKSPACE_ROOT\": \"${CLAUDE_CODE_WORKSPACE_ROOT}\",
     \"CLAUDE_CODE_TURN_TIMEOUT_SEC\": \"${CLAUDE_CODE_TURN_TIMEOUT_SEC}\",
     \"CLAUDE_CODE_TOOL_TIMEOUT_MS\": \"${CLAUDE_CODE_TOOL_TIMEOUT_MS}\",
@@ -2364,8 +2078,6 @@ RUNTIME_ENV_JSON="{
     \"CUDA_DEVICE_MAX_CONNECTIONS\": \"1\",
     \"NCCL_NVLS_ENABLE\": \"${NCCL_NVLS_ENABLE}\",
     \"NCCL_P2P_DISABLE\": \"${NCCL_P2P_DISABLE}\",
-
-    \"NCCL_IB_DISABLE\": \"${NCCL_IB_DISABLE}\",
     \"SLIME_RAY_PLACEMENT_GPU_PROBE\": \"${SLIME_RAY_PLACEMENT_GPU_PROBE}\",
     \"SLIME_SKIP_ZERO_TRAINABLE_ROLLOUT\": \"${SLIME_SKIP_ZERO_TRAINABLE_ROLLOUT}\",
     \"SLIME_SKIP_ZERO_TRAINABLE_TRAIN\": \"${SLIME_SKIP_ZERO_TRAINABLE_TRAIN}\",
@@ -2388,10 +2100,6 @@ RUNTIME_ENV_JSON="{
     \"ENV_ALLOCATE_HTTP_TIMEOUT\": \"${ENV_ALLOCATE_HTTP_TIMEOUT}\",
     \"ENV_RESET_HTTP_TIMEOUT\": \"${ENV_RESET_HTTP_TIMEOUT}\",
     \"ENV_CLOSE_HTTP_TIMEOUT\": \"${ENV_CLOSE_HTTP_TIMEOUT}\",
-    \"ENSURE_IMAGE_TIMEOUT\": \"${ENSURE_IMAGE_TIMEOUT:-1200}\",
-    \"RESET_SESSION_TIMEOUT\": \"${RESET_SESSION_TIMEOUT:-600}\",
-    \"CLOSE_SESSION_TIMEOUT\": \"${CLOSE_SESSION_TIMEOUT:-60}\",
-    \"EVAL_TIMEOUT\": \"${EVAL_TIMEOUT:-600}\",
     \"ENV_REMOTE_MAX_ACTIVE_TASKS\": \"${ENV_REMOTE_MAX_ACTIVE_TASKS}\",
     \"ENV_REMOTE_MAX_ACTIVE_RUNS\": \"${ENV_REMOTE_MAX_ACTIVE_RUNS}\",
     \"ENV_REMOTE_MAX_RUNS_PER_TASK\": \"${ENV_REMOTE_MAX_RUNS_PER_TASK}\",
@@ -2400,6 +2108,16 @@ RUNTIME_ENV_JSON="{
     \"ENV_REMOTE_MAX_CONCURRENT_CLOSES\": \"${ENV_REMOTE_MAX_CONCURRENT_CLOSES}\",
     \"AGENT_SAFETYBENCH_REMOTE_ENV\": \"${AGENT_SAFETYBENCH_REMOTE_ENV}\",
     \"AGENTHARM_REMOTE_ENV\": \"${AGENTHARM_REMOTE_ENV}\",
+    \"TAU2_REMOTE_ENV\": \"${TAU2_REMOTE_ENV}\",
+    \"TAU2_BENCH_ROOT\": \"${TAU2_BENCH_ROOT}\",
+    \"TAU2_DOMAIN\": \"${TAU2_DOMAIN}\",
+    \"TAU2_TASK_SPLIT\": \"${TAU2_TASK_SPLIT}\",
+    \"TAU2_POLICY_TYPE\": \"${TAU2_POLICY_TYPE}\",
+    \"TAU2_USER_LLM\": \"${TAU2_USER_LLM}\",
+    \"TAU2_USER_LLM_API_BASE\": \"${TAU2_USER_LLM_API_BASE}\",
+    \"TAU2_USER_LLM_TIMEOUT\": \"${TAU2_USER_LLM_TIMEOUT}\",
+    \"VLLM_API_KEY\": \"${VLLM_API_KEY}\",
+    \"SGLANG_REQUEST_TIMEOUT\": \"${SGLANG_REQUEST_TIMEOUT}\",
     \"NO_PROXY\": \"${NO_PROXY}\",
     \"no_proxy\": \"${NO_PROXY}\",
     \"CS_HTTP_URL\": \"${CS_HTTP_URL}\",
@@ -2486,7 +2204,6 @@ RUNTIME_ENV_JSON="{
     \"EXPLORE_AGENT57_UCB_VALUE\": \"${EXPLORE_AGENT57_UCB_VALUE}\",
     \"EXPLORE_AGENT57_UCB_DATASET_AWARE\": \"${EXPLORE_AGENT57_UCB_DATASET_AWARE}\",
     \"EXPLORE_AGENT57_UCB_RANDOM_SEED\": \"${EXPLORE_AGENT57_UCB_RANDOM_SEED}\",
-    \"EXPLORE_AGENT57_UCB_SEED_SALT\": \"${EXPLORE_AGENT57_UCB_SEED_SALT}\",
     \"EXPLORE_AGENT57_KEEP_BASELINE\": \"${EXPLORE_AGENT57_KEEP_BASELINE}\",
     \"EPISODIC_MEMORY_BACKEND\": \"${EPISODIC_MEMORY_BACKEND}\",
     \"EXPLORE_AGENT57_EPISODIC_BACKEND\": \"${EXPLORE_AGENT57_EPISODIC_BACKEND}\",
@@ -2501,7 +2218,6 @@ RUNTIME_ENV_JSON="{
     \"EXPLORE_AGENT57_EPISODIC_RANDOM_SEED\": \"${EXPLORE_AGENT57_EPISODIC_RANDOM_SEED}\",
     \"EXPLORE_AGENT57_EPISODIC_OBS_MODE\": \"${EXPLORE_AGENT57_EPISODIC_OBS_MODE}\",
     \"EXPLORE_AGENT57_EPISODIC_INCLUDE_TURN\": \"${EXPLORE_AGENT57_EPISODIC_INCLUDE_TURN}\",
-    \"EXPLORE_AGENT57_EPISODIC_TURN_MODE\": \"${EXPLORE_AGENT57_EPISODIC_TURN_MODE}\",
     \"EXPLORE_AGENT57_EPISODIC_MULTI_PROBE_RADIUS\": \"${EXPLORE_AGENT57_EPISODIC_MULTI_PROBE_RADIUS}\",
     \"EXPLORE_AGENT57_EPISODIC_NOVELTY_FLOOR\": \"${EXPLORE_AGENT57_EPISODIC_NOVELTY_FLOOR}\",
     \"EXPLORE_AGENT57_LIFELONG\": \"${EXPLORE_AGENT57_LIFELONG}\",
@@ -2539,21 +2255,10 @@ RUNTIME_ENV_JSON="{
     \"EXPLORE_ADVANTAGE_BONUS_CLIP\": \"${EXPLORE_ADVANTAGE_BONUS_CLIP}\",
     \"EXPLORE_ADVANTAGE_INTRINSIC_KEY\": \"${EXPLORE_ADVANTAGE_INTRINSIC_KEY}\",
     \"EXPLORE_ADVANTAGE_LAMBDA\": \"${EXPLORE_ADVANTAGE_LAMBDA}\",
-    \"EXPLORE_ADVANTAGE_LAMBDA_SCHEDULE\": \"${EXPLORE_ADVANTAGE_LAMBDA_SCHEDULE}\",
-    \"EXPLORE_ADVANTAGE_LAMBDA_DECAY_STEPS\": \"${EXPLORE_ADVANTAGE_LAMBDA_DECAY_STEPS}\",
     \"EXPLORE_ADVANTAGE_ARM_WEIGHT_MODE\": \"${EXPLORE_ADVANTAGE_ARM_WEIGHT_MODE}\",
     \"EXPLORE_ADVANTAGE_TRUST_KEY\": \"${EXPLORE_ADVANTAGE_TRUST_KEY}\",
-    \"EXPLORE_ADVANTAGE_GATE_MODE\": \"${EXPLORE_ADVANTAGE_GATE_MODE}\",
-    \"EXPLORE_ADVANTAGE_OUTCOME_KEY\": \"${EXPLORE_ADVANTAGE_OUTCOME_KEY}\",
-    \"EXPLORE_ADVANTAGE_COMPLETED_FLOOR\": \"${EXPLORE_ADVANTAGE_COMPLETED_FLOOR}\",
-    \"EXPLORE_ADVANTAGE_TRUNCATED_FLOOR\": \"${EXPLORE_ADVANTAGE_TRUNCATED_FLOOR}\",
-    \"EXPLORE_ADVANTAGE_FAILED_FLOOR\": \"${EXPLORE_ADVANTAGE_FAILED_FLOOR}\",
-    \"EXPLORE_ADVANTAGE_ABORTED_FLOOR\": \"${EXPLORE_ADVANTAGE_ABORTED_FLOOR}\",
-    \"EXPLORE_ADVANTAGE_TRUNCATED_INTRINSIC_SCALE\": \"${EXPLORE_ADVANTAGE_TRUNCATED_INTRINSIC_SCALE}\",
-    \"EXPLORE_ADVANTAGE_FAILED_INTRINSIC_SCALE\": \"${EXPLORE_ADVANTAGE_FAILED_INTRINSIC_SCALE}\",
     \"EXPLORE_TRUNCATION_PENALTY\": \"${EXPLORE_TRUNCATION_PENALTY}\",
     \"EXPLORE_ADVANTAGE_TRUNCATION_PENALTY\": \"${EXPLORE_ADVANTAGE_TRUNCATION_PENALTY}\",
-    \"EXPLORE_TRUNCATION_PENALTY_OUTCOME_AWARE\": \"${EXPLORE_TRUNCATION_PENALTY_OUTCOME_AWARE}\",
     \"EXPLORE_CDE_ACTOR\": \"${EXPLORE_CDE_ACTOR}\",
     \"EXPLORE_CDE_ACTOR_ENABLED\": \"${EXPLORE_CDE_ACTOR_ENABLED}\",
     \"EXPLORE_CDE_ACTOR_OMEGA\": \"${EXPLORE_CDE_ACTOR_OMEGA}\",

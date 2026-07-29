@@ -30,7 +30,11 @@ from ..custom_types import RunContext, TaskSpec, TaskTimeouts
 from .agentharm_env import AgentHarmEnv
 from .agent_safetybench_env import AgentSafetyBenchEnv
 from .docker_compose_utils import compose_up_no_build, prepare_task_docker_image
+
 from .swe_task_utils import build_swe_user_message, is_swe_task_path
+
+from .tau2_env import Tau2Env
+
 
 logger = logging.getLogger("terminal.env.worker.terminal_env")
 logger.setLevel(logging.INFO)
@@ -1861,6 +1865,7 @@ class TerminalEnv:
         self._tools: dict[str, Any] = {}
         self._agent_safetybench_env: AgentSafetyBenchEnv | None = None
         self._agentharm_env: AgentHarmEnv | None = None
+        self._tau2_env: Tau2Env | None = None
         self._eval_attempt = 0
         self._last_eval: dict[str, Any] | None = None
         self._last_trial_name: str | None = None
@@ -1920,6 +1925,13 @@ class TerminalEnv:
         if task_meta.get("data_source") == "agentharm":
             self._agentharm_env = AgentHarmEnv()
             return await self._agentharm_env.reset(
+                task_meta=task_meta,
+                task_spec=task_spec,
+                run_ctx=run_ctx,
+            )
+        if task_meta.get("data_source") == "tau2":
+            self._tau2_env = Tau2Env()
+            return await self._tau2_env.reset(
                 task_meta=task_meta,
                 task_spec=task_spec,
                 run_ctx=run_ctx,
@@ -2393,6 +2405,8 @@ class TerminalEnv:
             return await self._agent_safetybench_env.exec_tool(name, arguments)
         if self._agentharm_env is not None:
             return await self._agentharm_env.exec_tool(name, arguments)
+        if self._tau2_env is not None:
+            return await self._tau2_env.exec_tool(name, arguments)
 
         if not self._tools:
             raise RuntimeError("env is not initialized; call reset first")
@@ -2416,11 +2430,18 @@ class TerminalEnv:
             return result
         return json.dumps(result, ensure_ascii=False)
 
+    async def handle_agent_reply(self, assistant_text: str) -> dict[str, Any]:
+        if self._tau2_env is not None:
+            return await self._tau2_env.handle_agent_reply(assistant_text)
+        return {"continue": False, "user_message": ""}
+
     async def evaluate(self, trajectory: dict[str, Any] | None = None) -> float:
         if self._agent_safetybench_env is not None:
             return await self._agent_safetybench_env.evaluate(trajectory)
         if self._agentharm_env is not None:
             return await self._agentharm_env.evaluate(trajectory)
+        if self._tau2_env is not None:
+            return await self._tau2_env.evaluate(trajectory)
 
         if (
             self._trial_handler is None
@@ -2634,6 +2655,9 @@ class TerminalEnv:
         if self._agentharm_env is not None:
             details = getattr(self._agentharm_env, "_last_eval", None)
             return details if isinstance(details, dict) else None
+        if self._tau2_env is not None:
+            details = getattr(self._tau2_env, "_last_eval", None)
+            return details if isinstance(details, dict) else None
         return self._last_eval if isinstance(self._last_eval, dict) else None
 
     async def close(self) -> None:
@@ -2671,6 +2695,7 @@ class TerminalEnv:
         toolkit = self._terminal_toolkit
         agent_safetybench_env = self._agent_safetybench_env
         agentharm_env = self._agentharm_env
+        tau2_env = self._tau2_env
 
         self._tools = {}
         self._terminal = None
@@ -2683,6 +2708,7 @@ class TerminalEnv:
         self._timeouts = None
         self._agent_safetybench_env = None
         self._agentharm_env = None
+        self._tau2_env = None
         self._last_eval = None
         self._data_source = ""
         self._swesmith_task_commit = None
@@ -2729,6 +2755,12 @@ class TerminalEnv:
                     logger.exception(
                         "Failed to cleanup AgentHarm env for %s", trial_name
                     )
+
+            if tau2_env is not None:
+                try:
+                    await tau2_env.close()
+                except Exception:
+                    logger.exception("Failed to cleanup tau2 env for %s", trial_name)
 
             if fast_close and terminal is not None:
                 try:

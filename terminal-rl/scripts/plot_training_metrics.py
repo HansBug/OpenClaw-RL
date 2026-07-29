@@ -24,6 +24,7 @@ from __future__ import annotations
 import argparse
 import ast
 import json
+import math
 import os
 import re
 import sys
@@ -796,6 +797,191 @@ def _plot_entropy_and_kl(
             fontsize=8,
         )
 
+def _safe_filename_part(value: str) -> str:
+    return re.sub(r"[^A-Za-z0-9_.-]+", "_", value).strip("_") or "unknown"
+
+
+def _style_axes(ax: Any, *, xlabel: str = "rollout", ylabel: str | None = None) -> None:
+    ax.set_xlabel(xlabel)
+    if ylabel:
+        ax.set_ylabel(ylabel)
+    ax.grid(alpha=0.22, lw=0.8)
+    for side in ("top", "right"):
+        ax.spines[side].set_visible(False)
+
+
+def _plot_series_line(ax: Any, xs: list[int], ys: list[float], label: str, **kwargs: Any) -> bool:
+    if not ys:
+        return False
+    style = {"lw": 1.8, "alpha": 0.9}
+    style.update(kwargs)
+    ax.plot(xs, ys, label=label, **style)
+    return True
+
+
+def _plot_structured_reward_curve(
+    plt: Any,
+    figs_dir: Path,
+    records: list[dict[str, Any]],
+    fallback: tuple[list[int], list[Any], list[Any], list[Any]] | None = None,
+    *,
+    collapse: int | None = None,
+) -> None:
+    """Primary reward figure using structured metrics.jsonl rollout/global_step axis."""
+    fig, axes = plt.subplots(2, 1, figsize=(13, 7), sharex=True)
+    datasets = _structured_dataset_names(records, include_overall=True)
+    if records and datasets:
+        total_plotted = False
+        for dataset in datasets:
+            xs, ys = _structured_series(records, dataset, "reward/total", break_gaps=False)
+            if not ys:
+                continue
+            kwargs: dict[str, Any] = {}
+            if dataset == "mixed-all":
+                kwargs = {"color": "black", "lw": 2.4, "alpha": 0.95}
+            total_plotted |= _plot_series_line(axes[0], xs, ys, dataset, **kwargs)
+        axes[0].set_title("total reward by dataset (structured metrics.jsonl)")
+        axes[0].axhline(0, color="gray", ls=":", lw=0.9)
+        _style_axes(axes[0], ylabel="mean reward")
+        if total_plotted:
+            axes[0].legend(ncol=3, fontsize=8, frameon=False)
+
+        raw_plotted = False
+        for dataset in datasets:
+            xs, ys = _structured_series(records, dataset, "reward/raw", break_gaps=False)
+            if not ys:
+                continue
+            kwargs = {"alpha": 0.85}
+            if dataset == "mixed-all":
+                kwargs = {"color": "black", "lw": 2.2, "alpha": 0.95}
+            raw_plotted |= _plot_series_line(axes[1], xs, ys, dataset, **kwargs)
+        axes[1].set_title("raw task reward by dataset")
+        axes[1].axhline(0, color="gray", ls=":", lw=0.9)
+        _style_axes(axes[1], ylabel="mean raw reward")
+        if raw_plotted:
+            axes[1].legend(ncol=3, fontsize=8, frameon=False)
+    elif fallback is not None:
+        r_ids, raw_rew, rew, trunc = fallback
+        axes[0].plot(r_ids, raw_rew, lw=1.8, label="legacy raw_reward")
+        axes[0].plot(r_ids, rew, lw=1.4, alpha=0.7, label="legacy reward")
+        axes[0].axhline(0, color="gray", ls=":", lw=0.9)
+        axes[0].legend(frameon=False)
+        axes[0].set_title("legacy reward curve from train.log")
+        _style_axes(axes[0], ylabel="reward")
+        axes[1].plot(r_ids, trunc, lw=1.6, label="legacy truncated_frac")
+        axes[1].legend(frameon=False)
+        axes[1].set_title("legacy truncation fraction")
+        _style_axes(axes[1], ylabel="fraction")
+    else:
+        for ax in axes:
+            ax.text(0.5, 0.5, "no reward metrics", ha="center", va="center", transform=ax.transAxes)
+            _style_axes(ax)
+    if collapse is not None:
+        for ax in axes:
+            ax.axvline(collapse, color="red", ls="--", alpha=0.45)
+    fig.suptitle("Reward curves use the structured rollout axis; train loss plots use train-step/log-index axis", fontsize=11)
+    plt.tight_layout()
+    plt.savefig(figs_dir / "reward_curve.png", dpi=160)
+    plt.close()
+
+
+def _plot_reward_by_dataset_grid(plt: Any, figs_dir: Path, records: list[dict[str, Any]]) -> None:
+    datasets = [d for d in _structured_dataset_names(records, include_overall=False)]
+    if not datasets:
+        return
+    cols = 2
+    rows = math.ceil(len(datasets) / cols)
+    fig, axes = plt.subplots(rows, cols, figsize=(15, max(4.2, rows * 3.6)), squeeze=False)
+    flat = [ax for row in axes for ax in row]
+    for ax, dataset in zip(flat, datasets):
+        plotted = False
+        for key, label, color in (
+            ("reward/total", "total", "tab:blue"),
+            ("reward/raw", "raw", "tab:green"),
+            ("reward/exploration", "exploration", "tab:orange"),
+        ):
+            xs, ys = _structured_series(records, dataset, key, break_gaps=False)
+            plotted |= _plot_series_line(ax, xs, ys, label, color=color)
+        ax.axhline(0, color="gray", ls=":", lw=0.8)
+        ax.set_title(dataset)
+        _style_axes(ax, ylabel="mean reward")
+        if plotted:
+            ax.legend(fontsize=8, frameon=False)
+        else:
+            ax.text(0.5, 0.5, "no reward fields", ha="center", va="center", transform=ax.transAxes)
+    for ax in flat[len(datasets):]:
+        ax.axis("off")
+    fig.suptitle("Reward components split by environment", fontsize=13)
+    plt.tight_layout()
+    plt.savefig(figs_dir / "reward_by_dataset.png", dpi=160)
+    plt.close()
+
+
+def _plot_dataset_detail_figs(plt: Any, figs_dir: Path, records: list[dict[str, Any]]) -> None:
+    datasets = [d for d in _structured_dataset_names(records, include_overall=False)]
+    if not datasets:
+        return
+    by_dataset_dir = figs_dir / "by_dataset"
+    by_dataset_dir.mkdir(parents=True, exist_ok=True)
+    for dataset in datasets:
+        fig, axes = plt.subplots(3, 1, figsize=(13, 9), sharex=True)
+        plotted = False
+        for key, label, color in (
+            ("reward/total", "total reward", "tab:blue"),
+            ("reward/raw", "raw task reward", "tab:green"),
+            ("reward/exploration", "exploration reward", "tab:orange"),
+        ):
+            xs, ys = _structured_series(records, dataset, key, break_gaps=False)
+            plotted |= _plot_series_line(axes[0], xs, ys, label, color=color)
+        axes[0].axhline(0, color="gray", ls=":", lw=0.8)
+        axes[0].set_title(f"{dataset}: reward components")
+        _style_axes(axes[0], ylabel="mean reward")
+        if plotted:
+            axes[0].legend(fontsize=8, frameon=False)
+
+        count_plotted = False
+        for key, label, color in (
+            ("sample_count", "samples", "tab:purple"),
+            ("trainable_count", "trainable", "tab:brown"),
+        ):
+            xs, ys = _structured_series(records, dataset, key, break_gaps=False)
+            count_plotted |= _plot_series_line(axes[1], xs, ys, label, color=color)
+        axes[1].set_title(f"{dataset}: sample counts")
+        _style_axes(axes[1], ylabel="count")
+        if count_plotted:
+            axes[1].legend(fontsize=8, frameon=False)
+
+        resp_xs, resp_ys = _structured_series(records, dataset, "response_length", break_gaps=False)
+        trunc_xs, trunc_ys = _structured_ratio_series(
+            records,
+            dataset,
+            "truncated",
+            "sample_count",
+            ratio_key="truncated_fraction",
+            break_gaps=False,
+        )
+        if resp_ys:
+            axes[2].semilogy(resp_xs, resp_ys, color="tab:cyan", lw=1.7, label="response length")
+            axes[2].set_ylabel("response length (log)")
+        else:
+            axes[2].set_ylabel("response length")
+        ax2 = axes[2].twinx()
+        if trunc_ys:
+            ax2.plot(trunc_xs, trunc_ys, color="tab:red", lw=1.5, alpha=0.75, label="truncated fraction")
+            ax2.set_ylim(-0.03, 1.03)
+        ax2.set_ylabel("truncated fraction")
+        axes[2].set_title(f"{dataset}: response length / truncation")
+        _style_axes(axes[2], ylabel=axes[2].get_ylabel())
+        lines = list(axes[2].lines) + list(ax2.lines)
+        labels = [line.get_label() for line in lines]
+        if lines:
+            axes[2].legend(lines, labels, fontsize=8, frameon=False, loc="upper left")
+
+        fig.suptitle(f"Environment diagnostics: {dataset}", fontsize=13)
+        plt.tight_layout()
+        plt.savefig(by_dataset_dir / f"{_safe_filename_part(dataset)}.png", dpi=160)
+        plt.close()
+
 
 def _load_trajectory_samples(out_dir: Path) -> tuple[list[dict[str, Any]], Counter]:
     path = out_dir / "trajectory_classification.json"
@@ -934,7 +1120,7 @@ def _plot_no_training_diagnostics(parsed: dict[str, Any], out_dir: Path, run_nam
 
     def fig_save(name: str) -> None:
         plt.tight_layout()
-        plt.savefig(figs_dir / name, dpi=120)
+        plt.savefig(figs_dir / name, dpi=160)
         plt.close()
 
     print("[+] plotting no-training diagnostic overview.png")
@@ -1079,24 +1265,18 @@ def _plot_all(
 
     # reward_curve
     print("[+] plotting reward_curve.png")
-    fig, ax = plt.subplots(2, 1, figsize=(11, 6), sharex=True)
-    ax[0].plot(r_ids, raw_rew, ".-", label="raw_reward (outcome)")
-    ax[0].plot(r_ids, rew, ".-", alpha=0.6, label="reward (after norm)")
-    ax[0].axhline(0, color="gray", ls=":", lw=0.8)
-    if collapse is not None:
-        ax[0].axvline(collapse, color="red", ls="--", alpha=0.5, label=f"collapse@{collapse}")
-    ax[0].set_ylabel("reward")
-    ax[0].legend(loc="upper right")
-    ax[0].grid(alpha=0.3)
-    ax[0].set_title("Reward curve — raw_reward = 2·acc - 1 (outcome only)")
-    ax[1].plot(r_ids, [t for t in trunc], ".-", label="truncated_frac")
-    if collapse is not None:
-        ax[1].axvline(collapse, color="red", ls="--", alpha=0.5)
-    ax[1].set_xlabel("rollout")
-    ax[1].set_ylabel("truncated frac")
-    ax[1].legend()
-    ax[1].grid(alpha=0.3)
-    fig_save("reward_curve.png")
+    _plot_structured_reward_curve(
+        plt,
+        figs_dir,
+        structured_records,
+        fallback=(r_ids, raw_rew, rew, trunc),
+        collapse=collapse,
+    )
+    if structured_records:
+        print("[+] plotting reward_by_dataset.png")
+        _plot_reward_by_dataset_grid(plt, figs_dir, structured_records)
+        print("[+] plotting per-dataset diagnostics")
+        _plot_dataset_detail_figs(plt, figs_dir, structured_records)
 
     # response_length
     print("[+] plotting response_length.png")

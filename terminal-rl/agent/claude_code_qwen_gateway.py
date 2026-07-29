@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import threading
 import time
 import uuid
@@ -254,12 +255,31 @@ class ClaudeCodeQwenGateway:
         input_ids = self._client._truncate_input_ids(input_ids)
 
         sampling_params = dict(self._client.sampling_params)
-        max_tokens = payload.get("max_tokens")
-        if max_tokens is not None:
+        default_max_new_tokens = sampling_params.get("max_new_tokens")
+        requested_max_tokens = payload.get("max_tokens")
+        if requested_max_tokens is not None:
             try:
-                sampling_params["max_new_tokens"] = max(1, int(max_tokens))
+                requested_max_tokens_int = max(1, int(requested_max_tokens))
+                if default_max_new_tokens is not None:
+                    sampling_params["max_new_tokens"] = min(
+                        requested_max_tokens_int, max(1, int(default_max_new_tokens))
+                    )
+                else:
+                    sampling_params["max_new_tokens"] = requested_max_tokens_int
             except (TypeError, ValueError):
                 pass
+        max_new_tokens_cap = os.getenv("CLAUDE_CODE_QWEN_MAX_NEW_TOKENS", "").strip()
+        if max_new_tokens_cap:
+            try:
+                sampling_params["max_new_tokens"] = min(
+                    max(1, int(sampling_params.get("max_new_tokens") or max_new_tokens_cap)),
+                    max(1, int(max_new_tokens_cap)),
+                )
+            except (TypeError, ValueError):
+                logger.warning(
+                    "Invalid CLAUDE_CODE_QWEN_MAX_NEW_TOKENS=%r; ignoring",
+                    max_new_tokens_cap,
+                )
         for src_key, dst_key in (("temperature", "temperature"), ("top_p", "top_p"), ("top_k", "top_k")):
             if payload.get(src_key) is not None:
                 sampling_params[dst_key] = payload[src_key]

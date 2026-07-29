@@ -2058,6 +2058,16 @@ class WorkerPool:
         finally:
             await self._finish_run_op(run_slot, "exec_tool", success=success)
 
+    async def handle_agent_reply(
+        self, run_lease_id: str, assistant_text: str
+    ) -> dict[str, Any]:
+        async with self._lock:
+            run_slot = self._get_run_slot(run_lease_id)
+        async with run_slot.lock:
+            result = await run_slot.env.handle_agent_reply(assistant_text)
+            run_slot.last_used_ts = time.time()
+            return dict(result)
+
     async def evaluate(
         self, run_lease_id: str, trajectory: dict[str, Any] | None = None
     ) -> tuple[float, dict[str, Any] | None]:
@@ -4087,6 +4097,42 @@ async def exec_tool(request: Request) -> JSONResponse:
             },
             status_code=410,
         )
+    except Exception as exc:
+        return JSONResponse({"ok": False, "error": str(exc)}, status_code=500)
+
+
+@app.post("/agent_reply")
+async def agent_reply(request: Request) -> JSONResponse:
+    """Handle a non-tool assistant reply for an active environment lease.
+
+    Args:
+        request: FastAPI request containing ``lease_id`` and ``assistant_text``.
+
+    Returns:
+        JSON response with ``ok=True`` and the environment follow-up payload, or
+        an error response when the pool is unavailable or the payload is invalid.
+    """
+    if POOL is None:
+        return JSONResponse(
+            {"ok": False, "error": "Pool is not initialized"}, status_code=500
+        )
+
+    data = await json_payload(request)
+    lease_id = data.get("lease_id")
+    assistant_text = data.get("assistant_text")
+
+    if not lease_id:
+        return JSONResponse(
+            {"ok": False, "error": "lease_id is required"}, status_code=400
+        )
+    if not isinstance(assistant_text, str):
+        return JSONResponse(
+            {"ok": False, "error": "assistant_text is required"}, status_code=400
+        )
+
+    try:
+        result = await POOL.handle_agent_reply(str(lease_id), assistant_text)
+        return JSONResponse({"ok": True, **result})
     except Exception as exc:
         return JSONResponse({"ok": False, "error": str(exc)}, status_code=500)
 
