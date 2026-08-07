@@ -277,18 +277,35 @@ def test_job_report_cli_watch_stops_once_the_job_is_finished(recorded_tbv21_job,
     assert "poll 1" in capsys.readouterr().out
 
 
-@pytest.mark.parametrize("reward", ["1.0", None, True, [], {"a": 1}, float("nan")])
-def test_job_report_tolerates_a_malformed_reward(tmp_path, reward):
-    """The reader is hardened against junk files; a junk value must not crash it."""
+def _one_trial_job(tmp_path, reward) -> Path:
     job = tmp_path / "job"
     (job / "t0").mkdir(parents=True)
     (job / "result.json").write_text(json.dumps({"n_total_trials": 1}), encoding="utf-8")
     (job / "t0" / "result.json").write_text(
         json.dumps({"verifier_result": {"rewards": {"reward": reward}}}), encoding="utf-8"
     )
-    report = harbor_job_report.read_job(job)
-    assert isinstance(report.reward_sum, float)
-    harbor_job_report.format_report(report)
+    return job
+
+
+@pytest.mark.parametrize("reward", ["1.0", 1, 1.0])
+def test_job_report_accepts_a_numeric_reward_in_any_json_form(tmp_path, reward):
+    assert harbor_job_report.read_job(_one_trial_job(tmp_path, reward)).reward_sum == 1.0
+
+
+@pytest.mark.parametrize(
+    "reward",
+    [None, True, [], {"a": 1}, "abc", float("nan"), float("inf")],
+    ids=["null", "bool", "list", "dict", "text", "nan", "inf"],
+)
+def test_an_unusable_reward_scores_zero_rather_than_poisoning_the_job(tmp_path, reward):
+    """NaN would otherwise flow into reward_sum and annihilate every other trial,
+    and json.dumps would emit a bare NaN token that is not valid JSON."""
+    report = harbor_job_report.read_job(_one_trial_job(tmp_path, reward))
+    assert report.reward_sum == 0.0
+    assert report.score == 0.0
+    assert report.rewarded_trials == []
+    assert "nan" not in harbor_job_report.format_report(report).lower()
+    assert "NaN" not in json.dumps(report.to_dict())
 
 
 def test_job_report_watch_that_hits_its_poll_cap_exits_nonzero(tmp_path):
@@ -302,11 +319,18 @@ def test_job_report_watch_that_hits_its_poll_cap_exits_nonzero(tmp_path):
     ) == 1
 
 
-def test_job_report_watch_json_stays_parseable_line_by_line(recorded_tbv21_job, capsys):
-    """Several indented documents concatenated would not parse."""
-    harbor_job_report.main([str(recorded_tbv21_job), "--watch", "--interval", "0", "--json"])
+def test_job_report_watch_json_stays_parseable_line_by_line(tmp_path, capsys):
+    """Several indent=2 documents concatenated would not parse, so watch emits one per line."""
+    job = _write_harbor_job(
+        tmp_path, n_total_trials=9, solved=[], zero_reward=1, timeouts=0, no_reward=0,
+        finished=False,
+    )
+    harbor_job_report.main(
+        [str(job), "--watch", "--interval", "0", "--max-polls", "3", "--json"]
+    )
     lines = [line for line in capsys.readouterr().out.splitlines() if line.strip()]
-    assert lines and all(json.loads(line)["is_finished"] for line in lines)
+    assert len(lines) == 3
+    assert all(json.loads(line)["is_finished"] is False for line in lines)
 
 
 def test_job_report_cli_emits_json(recorded_tbv21_job, capsys):

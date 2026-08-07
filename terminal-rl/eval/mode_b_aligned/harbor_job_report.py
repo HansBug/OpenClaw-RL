@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import sys
 import time
 from collections import Counter
@@ -103,9 +104,12 @@ def _as_reward(value: Any) -> float | None:
     if value is None or isinstance(value, bool):
         return None
     try:
-        return float(value)
+        number = float(value)
     except (TypeError, ValueError):
         return None
+    # NaN would propagate into reward_sum and annihilate every other trial's
+    # score, and json.dumps emits it as a bare NaN token that is not valid JSON.
+    return number if math.isfinite(number) else None
 
 
 def _read_json(path: Path) -> dict[str, Any]:

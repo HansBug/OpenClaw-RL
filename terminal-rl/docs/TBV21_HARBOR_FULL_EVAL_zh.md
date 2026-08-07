@@ -137,7 +137,9 @@ bash bin/run_one_task_eval_qwen3_8b.sh regex-chess
 TARGET_PANE=tbv21_full_eval:0.0
 tmux has-session -t "${TARGET_PANE%%:*}" 2>/dev/null || tmux new-session -d -s "${TARGET_PANE%%:*}" -n eval
 tmux send-keys -t "$TARGET_PANE" "cd '$TBV21_HOME' && source ./env.sh" C-m
-tmux send-keys -t "$TARGET_PANE" "export TBV21_FULL_EVAL_JOB_NAME=full_eval_tbv21_${TBV21_MODEL_NAME}_\$(date +%Y%m%d_%H%M%S)" C-m
+# 在外层 shell 先定名字，再送进 pane：否则监控 shell 拿不到它
+export TBV21_FULL_EVAL_JOB_NAME="full_eval_tbv21_${TBV21_MODEL_NAME}_$(date +%Y%m%d_%H%M%S)"
+tmux send-keys -t "$TARGET_PANE" "export TBV21_FULL_EVAL_JOB_NAME='${TBV21_FULL_EVAL_JOB_NAME}'" C-m
 tmux send-keys -t "$TARGET_PANE" "export TBV21_GPU_IDS=0,1,2,3 TBV21_FULL_EVAL_CONCURRENCY=2 TBV21_FULL_EVAL_MAX_RETRIES=1" C-m
 tmux send-keys -t "$TARGET_PANE" "bash bin/run_full_eval_qwen3_8b.sh" C-m
 ```
@@ -147,9 +149,11 @@ tmux send-keys -t "$TARGET_PANE" "bash bin/run_full_eval_qwen3_8b.sh" C-m
 监控每 5 分钟轮询一次，同时看四样东西：job 进度、`docker ps` 的活跃容器、Harbor 主日志尾部、SGLang 探活。job 进度用 [`../eval/mode_b_aligned/harbor_job_report.py`](../eval/mode_b_aligned/harbor_job_report.py)，它解析 job 目录并在 `finished_at` 出现后退出，不需要每次现写解析代码。
 
 ```bash
-# 从 $TBV21_HOME 里跑；REPO 是 OpenClaw-RL checkout，与 bundle 是两个目录
+# 从 $TBV21_HOME 里跑。JOB 必须来自启动 eval 的那个 shell（见上一段的 export），
+# 空值会让 jobs/${JOB} 塌成 jobs/ 并报出一个看似合理的错误分数。
+: "${TBV21_FULL_EVAL_JOB_NAME:?先在本 shell export TBV21_FULL_EVAL_JOB_NAME}"
 JOB="${TBV21_FULL_EVAL_JOB_NAME}"
-REPO=/path/to/OpenClaw-RL
+REPO=/path/to/OpenClaw-RL   # OpenClaw-RL checkout，与 bundle 是两个目录
 
 python "${REPO}/terminal-rl/eval/mode_b_aligned/harbor_job_report.py" \
   "jobs/${JOB}" --watch --interval 300 &
