@@ -264,6 +264,21 @@ def test_supplement_jsonl_keeps_only_missing_rows_and_records_their_dataset_inde
     assert [r["metadata"]["task_name"] for r in records] == ["1", "3"]
 
 
+def test_a_sample_whose_every_run_went_unscored_is_still_re_queued(tmp_path):
+    """Having a trajectory is not the same as having a score."""
+    dataset = tmp_path / "train.jsonl"
+    _write_dataset(dataset, 2)
+    unscored = _index_row(0, "main", 0, 0.0)
+    unscored.raw_score = None
+    unscored.status = "FAILED"
+    per_sample = analyzer.merge([_sample(0), _sample(1)], [unscored])
+
+    out = tmp_path / "supp.jsonl"
+    assert analyzer.write_supplement_jsonl(dataset, per_sample, out) == 2
+    records = [json.loads(line) for line in out.read_text(encoding="utf-8").splitlines()]
+    assert [r["metadata"]["supplement_sample_index"] for r in records] == [0, 1]
+
+
 def test_supplement_index_is_what_maps_a_retry_back_to_its_dataset_row(tmp_path):
     """Closes the loop: what write_supplement_jsonl emits is what read_run reads."""
     run_dir = tmp_path / "supp1" / "trajectories" / "seta_task-9_uid"
@@ -328,9 +343,13 @@ def test_driver_script_parses_and_is_executable():
 
 
 def _driver_defaults() -> dict[str, str]:
-    """Parse `export NAME="${NAME:-value}"` defaults out of the driver script."""
+    """Parse `export NAME="${NAME:-literal}"` defaults out of the driver script.
+
+    Defaults containing a nested expansion are skipped; the callers below only
+    need the literal ones, and a missing key raises KeyError rather than passing.
+    """
     source = (TERMINAL_RL / "scripts" / "run_seta_env_eval.sh").read_text(encoding="utf-8")
-    return dict(re.findall(r'export (\w+)="\$\{\1:-([^}]*)\}"', source))
+    return dict(re.findall(r'export (\w+)="\$\{\1:-([^${}]*)\}"', source))
 
 
 def test_driver_script_disables_checkpoint_writing_by_default():

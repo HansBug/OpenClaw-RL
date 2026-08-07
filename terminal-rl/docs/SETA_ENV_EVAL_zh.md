@@ -30,7 +30,7 @@ CONCURRENCY=16 \
 bash terminal-rl/scripts/run_seta_env_eval.sh
 ```
 
-驱动脚本把 `SLIME_ENTRYPOINT` 指向 `slime/eval_only.py`，这是它成为只读评测而不是训练的原因；把 `MAX_CKPT_KEEP` 设为 0，因为没有东西需要保存，而默认检查点目录对评测用户未必可写；把 `EVAL_N_SAMPLES` 设为 1，因为它委托到的启动脚本默认是 16，而已发布基线跑的是每条 prompt 一次推演（`run_config.json` 里 `n_samples: 1`）。最后这条不能省：分析脚本对每条样本只保留一条轨迹，继承 16 会让成本涨 16 倍，而且报出来的不再是单次尝试的分数，而是十六次里被最后读到的那一次。想先看解析出来的配置而不真的启动，加 `DRY_RUN=1`。
+驱动脚本把 `SLIME_ENTRYPOINT` 指向 `slime/eval_only.py`，这是它成为只读评测而不是训练的原因；把 `MAX_CKPT_KEEP` 设为 0，因为没有东西需要保存，而默认检查点目录对评测用户未必可写；把 `EVAL_N_SAMPLES` 设为 1，因为它委托到的启动脚本默认是 16，而已发布基线跑的是每条 eval prompt 一次推演——证据是那次运行的 `analysis/all_index_rows.csv` 里每个 `(run_label, sample_index)` 恰好一条轨迹。最后这条不能省：分析脚本对每条样本只保留一条轨迹，继承 16 会让成本涨 16 倍，而且报出来的不再是单次尝试的分数，而是十六次里被最后读到的那一次。脚本同时把训练侧的 `N_SAMPLES` 钉为 1，它不被 `eval_only.py` 读取，钉住只是让 `run_config.json` 继续记录已发布的 `n_samples: 1`。想先看解析出来的配置而不真的启动，加 `DRY_RUN=1`。
 
 第二步，分析并导出补跑清单。
 

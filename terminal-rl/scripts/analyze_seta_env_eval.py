@@ -132,7 +132,7 @@ def _as_float(value: Any) -> float | None:
         return None
     try:
         return float(value)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         return None
 
 
@@ -511,6 +511,10 @@ def write_supplement_jsonl(
 ) -> int:
     """Write a retry JSONL holding only the samples that produced no result.
 
+    A sample qualifies when it has no trajectory at all, and equally when every
+    run produced a trajectory that never reached the verifier: both leave it
+    without a score, and both need the same retry.
+
     The supplement is a filtered subset, so the rollout's own sample index no
     longer matches the dataset. ``supplement_sample_index`` is injected into each
     row's metadata and travels into the trajectory's ``sample_metadata``, which is
@@ -519,7 +523,7 @@ def write_supplement_jsonl(
     missing = {
         int(row["sample_index"])
         for row in per_sample
-        if row.get("has_result") in (0, "0")
+        if row.get("has_result") in (0, "0") or row.get("raw_score") in ("", None)
     }
     if not missing:
         return 0

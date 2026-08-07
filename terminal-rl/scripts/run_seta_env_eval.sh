@@ -21,9 +21,11 @@
 # Optional:
 #   PROMPT_DATA=terminal-rl/dataset/seta_env_convert/train.filtered.jsonl
 #   CONCURRENCY=16    drives batch size, eval concurrency and active task cap
-#   EVAL_N_SAMPLES=1  rollouts per prompt; 1 is what the published baseline ran
+#   EVAL_N_SAMPLES=1  rollouts per eval prompt; 1 is what the published baseline ran
+#   N_SAMPLES=1       rollouts per training prompt; unused by eval_only.py, pinned
+#                     to 1 so run_config.json records the published value
 #   RUN_ID            defaults to the launcher's own generated id
-#   DRY_RUN=1         print the resolved environment and exit
+#   DRY_RUN=1         print the resolved settings below and exit without launching
 set -euo pipefail
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &>/dev/null && pwd)"
@@ -67,11 +69,14 @@ export ROLLOUT_BATCH_SIZE="${ROLLOUT_BATCH_SIZE:-${CONCURRENCY}}"
 export EVAL_ROLLOUT_MAX_CONCURRENCY="${EVAL_ROLLOUT_MAX_CONCURRENCY:-${CONCURRENCY}}"
 export ENV_REMOTE_MAX_ACTIVE_TASKS="${ENV_REMOTE_MAX_ACTIVE_TASKS:-${CONCURRENCY}}"
 
-# One rollout per prompt, which is what the published baseline ran
-# (configs/main/run_config.json: "n_samples": 1). The launcher this delegates to
-# defaults EVAL_N_SAMPLES to 16, and the analyzer keeps one trajectory per
-# sample, so inheriting that default would cost 16x and silently report one
-# arbitrary rollout out of sixteen instead of a single-attempt score.
+# One rollout per eval prompt. The launcher this delegates to defaults
+# EVAL_N_SAMPLES to 16, and the analyzer keeps one trajectory per sample, so
+# inheriting that default would cost 16x and silently report one arbitrary
+# rollout out of sixteen instead of a single-attempt score. Evidence that the
+# published baseline ran 1: its analysis/all_index_rows.csv holds exactly one
+# trajectory per (run_label, sample_index). N_SAMPLES is a separate, train-side
+# knob that eval_only.py never reads; it is pinned only so run_config.json keeps
+# recording the published "n_samples": 1.
 export EVAL_N_SAMPLES="${EVAL_N_SAMPLES:-1}"
 export N_SAMPLES="${N_SAMPLES:-1}"
 
@@ -87,7 +92,7 @@ echo "[INFO] checkpoint    ${HF_CKPT}"
 echo "[INFO] prompt data   ${ROLLOUT_PROMPT_DATA} (${PROMPT_COUNT} samples)"
 echo "[INFO] entrypoint    ${SLIME_ENTRYPOINT}"
 echo "[INFO] concurrency   ${CONCURRENCY}"
-echo "[INFO] rollouts/prompt ${EVAL_N_SAMPLES}"
+echo "[INFO] rollouts/prompt ${EVAL_N_SAMPLES} (eval) / ${N_SAMPLES} (train-side, unused here)"
 echo "[INFO] env server    ${ENV_SERVER_URL}"
 
 if [[ "${DRY_RUN:-0}" == "1" ]]; then
