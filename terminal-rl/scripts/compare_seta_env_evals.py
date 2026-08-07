@@ -1,19 +1,28 @@
 #!/usr/bin/env python3
-"""Compare SETA-env eval runs, with intervals rather than bare point estimates.
+"""Compare SETA-env eval runs with a two-proportion test, not by eyeballing bars.
 
-Filling a benchmark table one checkpoint at a time invites reading 21.6% and
-23.4% as an improvement. Exact-pass is a binomial count over the dataset, so the
-question of whether two checkpoints differ has an answer, and it is usually "not
-at this sample size". This prints Wilson 95% intervals next to every rate and
-says plainly when a pair's intervals overlap.
+Filling a benchmark table one checkpoint at a time invites reading 21.61% next
+to 23.60% as an improvement. exact_pass is a binomial count over the dataset, so
+whether two checkpoints differ has an actual answer.
 
     python terminal-rl/scripts/compare_seta_env_evals.py \\
         baseline=runs/<run-a>/final_analysis/summary.json \\
         rl-iter499=runs/<run-b>/final_analysis/summary.json
 
-Overlapping Wilson intervals are not a formal test of no difference, only a cheap
-signal that the gap is within sampling noise. Use a two-proportion test when a
-claim depends on it.
+Each run gets a Wilson 95% interval, which describes where that run's own rate
+sits. Whether two runs differ is a separate question and is answered by a
+two-proportion z-test, because comparing the intervals by eye does not answer it:
+non-overlap does imply significance, but overlap does NOT imply its absence. On
+1356 samples, 293 vs 352 exact passes have overlapping Wilson intervals and yet
+p = 0.008. Reading that pair off the intervals would throw away a real effect,
+which is the exact mistake this tool exists to prevent, so the reported verdict
+comes from the test and the intervals are shown as description only.
+
+The z-test is the normal approximation to the difference of two proportions. It
+is appropriate here (every expected count is far above 5) but is not exact; a
+result near the threshold deserves an exact test. With k runs the tool makes
+k(k-1)/2 comparisons at nominal alpha, so p values close to 0.05 in a wide table
+should be read with that in mind.
 """
 
 from __future__ import annotations
@@ -40,12 +49,27 @@ def wilson_interval(successes: int, trials: int, z: float = Z_95) -> tuple[float
     return (centre - margin) / denominator, (centre + margin) / denominator
 
 
+def two_proportion_test(k1: int, n1: int, k2: int, n2: int) -> tuple[float, float]:
+    """Pooled two-proportion z-test; returns (z, two-sided p).
+
+    Normal approximation. Returns (0.0, 1.0) when it does not apply, so a
+    degenerate run is reported as "no evidence" rather than as a difference.
+    """
+    if n1 <= 0 or n2 <= 0:
+        return 0.0, 1.0
+    pooled = (k1 + k2) / (n1 + n2)
+    variance = pooled * (1 - pooled) * (1 / n1 + 1 / n2)
+    if variance <= 0:
+        return 0.0, 1.0
+    z = (k2 / n2 - k1 / n1) / math.sqrt(variance)
+    return z, math.erfc(abs(z) / math.sqrt(2))
+
+
 @dataclass(frozen=True)
 class Run:
     label: str
     total: int
     exact_pass: int
-    nonzero: int
     raw_score_mean: float
     missing: int
 
@@ -58,27 +82,64 @@ class Run:
         return wilson_interval(self.exact_pass, self.total)
 
 
+@dataclass(frozen=True)
+class Pair:
+    left: Run
+    right: Run
+    z: float
+    p_value: float
+
+    @property
+    def delta_pp(self) -> float:
+        return (self.right.exact_pass_rate - self.left.exact_pass_rate) * 100
+
+    @property
+    def is_significant(self) -> bool:
+        return self.p_value < 0.05
+
+    @property
+    def intervals_overlap(self) -> bool:
+        low_l, high_l = self.left.exact_pass_interval
+        low_r, high_r = self.right.exact_pass_interval
+        return low_l <= high_r and low_r <= high_l
+
+
+REQUIRED_KEYS = (
+    "dataset_total",
+    "exact_pass_count",
+    "raw_score_mean_all_dataset_missing_as_zero",
+    "missing_count",
+)
+
+
 def load_run(label: str, summary_path: Path) -> Run:
     summary = json.loads(summary_path.read_text(encoding="utf-8"))
+    absent = [key for key in REQUIRED_KEYS if key not in summary]
+    if absent:
+        raise KeyError(
+            f"{summary_path} is missing {', '.join(absent)}; "
+            "expected a summary.json written by analyze_seta_env_eval.py"
+        )
     return Run(
         label=label,
         total=int(summary["dataset_total"]),
         exact_pass=int(summary["exact_pass_count"]),
-        nonzero=int(summary["nonzero_score_count"]),
-        # The conservative denominator, matching what the docs report.
-        raw_score_mean=float(summary["raw_score_mean_all_dataset_missing_as_zero"]),
+        # The conservative denominator, matching what the docs report. None when
+        # the dataset was empty.
+        raw_score_mean=float(summary["raw_score_mean_all_dataset_missing_as_zero"] or 0.0),
         missing=int(summary["missing_count"]),
     )
 
 
-def overlapping_pairs(runs: Sequence[Run]) -> list[tuple[Run, Run]]:
+def compare_pairs(runs: Sequence[Run]) -> list[Pair]:
+    """Every unordered pair, tested. Order within a pair is (earlier, later)."""
     pairs = []
-    for i, left in enumerate(runs):
-        for right in runs[i + 1:]:
-            low_l, high_l = left.exact_pass_interval
-            low_r, high_r = right.exact_pass_interval
-            if low_l <= high_r and low_r <= high_l:
-                pairs.append((left, right))
+    for index, left in enumerate(runs):
+        for right in runs[index + 1:]:
+            z, p_value = two_proportion_test(
+                left.exact_pass, left.total, right.exact_pass, right.total
+            )
+            pairs.append(Pair(left=left, right=right, z=z, p_value=p_value))
     return pairs
 
 
@@ -96,18 +157,27 @@ def format_comparison(runs: Sequence[Run]) -> str:
             f"{run.exact_pass_rate * 100:6.2f}%  {low * 100:6.2f}% - {high * 100:6.2f}%"
         )
 
+    if any(run.total <= 0 for run in runs):
+        lines.append("")
+        lines.append("WARNING: a run has dataset_total = 0; it cannot be compared.")
+
     if len(runs) < 2:
         return "\n".join(lines)
 
     lines.append("")
-    overlaps = overlapping_pairs(runs)
-    if overlaps:
-        lines.append("exact-pass intervals overlap, so these pairs are not separable here:")
-        for left, right in overlaps:
-            delta = (right.exact_pass_rate - left.exact_pass_rate) * 100
-            lines.append(f"  {left.label} vs {right.label}   delta {delta:+.2f} pp")
-    else:
-        lines.append("no exact-pass intervals overlap; every pair is separable at this sample size.")
+    lines.append("exact_pass, two-proportion z-test (pooled, normal approximation):")
+    for pair in compare_pairs(runs):
+        verdict = "differ (p < 0.05)" if pair.is_significant else "no evidence of a difference"
+        note = "" if pair.is_significant == (not pair.intervals_overlap) else \
+            "   [intervals overlap; the test, not the overlap, decides]"
+        lines.append(
+            f"  {pair.left.label} vs {pair.right.label}   delta {pair.delta_pp:+.2f} pp   "
+            f"z {pair.z:+.3f}   p {pair.p_value:.4f}   {verdict}{note}"
+        )
+    lines.append(
+        "Comparing the Wilson intervals by eye does not answer this: overlap does not imply"
+        " absence of a difference."
+    )
     lines.append(
         "Note: raw_score is average partial credit, not a solve rate; exact_pass is the solve rate."
     )
@@ -150,7 +220,18 @@ def main(argv: Sequence[str] | None = None) -> int:
                     }
                     for run in runs
                 ],
-                "overlapping_pairs": [[a.label, b.label] for a, b in overlapping_pairs(runs)],
+                "pairs": [
+                    {
+                        "left": pair.left.label,
+                        "right": pair.right.label,
+                        "delta_pp": pair.delta_pp,
+                        "z": pair.z,
+                        "p_value": pair.p_value,
+                        "significant_at_0_05": pair.is_significant,
+                        "wilson_intervals_overlap": pair.intervals_overlap,
+                    }
+                    for pair in compare_pairs(runs)
+                ],
             },
             indent=2,
         ))

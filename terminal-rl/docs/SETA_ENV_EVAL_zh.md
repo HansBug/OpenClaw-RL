@@ -66,7 +66,9 @@ python terminal-rl/scripts/analyze_seta_env_eval.py \
 
 ## 4. 跨 checkpoint 比较
 
-benchmark 表按 checkpoint 一行一行填时，最容易犯的错是把 21.61% 和 23.60% 读成"提升了两个点"。`exact_pass` 是 1356 条上的二项计数，两个 checkpoint 到底能不能分开是有答案的，而在这个样本量下答案通常是不能。`scripts/compare_seta_env_evals.py` 吃多个 `summary.json`，每个比率都带 Wilson 95% 区间，并直接点名哪些配对的区间重叠。
+benchmark 表按 checkpoint 一行一行填时，最容易犯的错是把 21.61% 和 23.60% 读成"提升了两个点"。`exact_pass` 是 1356 条上的二项计数，两个 checkpoint 到底能不能分开是有答案的。`scripts/compare_seta_env_evals.py` 吃多个 `summary.json`，给每个运行配一个 Wilson 95% 区间（描述该运行自身比率的位置），再用**两比例 z 检验**回答"两者是否不同"这个独立的问题。
+
+之所以不靠看区间是否重叠来判断：**不重叠确实蕴含显著，但重叠并不蕴含不显著**。这是个常见陷阱，而且在本数据集的量级上真会踩到。
 
 ```bash
 python terminal-rl/scripts/compare_seta_env_evals.py \
@@ -83,13 +85,17 @@ qwen3-8b-base   1356     2     38.77%         293   21.61%   19.50% -  23.88%
 rl-iter499      1356     0     42.48%         320   23.60%   21.42% -  25.93%
 rl-iter399      1356     0     46.73%         352   25.96%   23.70% -  28.36%
 
-exact-pass intervals overlap, so these pairs are not separable here:
-  qwen3-8b-base vs rl-iter499   delta +1.99 pp
-  qwen3-8b-base vs rl-iter399   delta +4.35 pp
-  rl-iter499 vs rl-iter399   delta +2.36 pp
+exact_pass, two-proportion z-test (pooled, normal approximation):
+  qwen3-8b-base vs rl-iter499   delta +1.99 pp   z +1.240   p 0.2151   no evidence of a difference
+  qwen3-8b-base vs rl-iter399   delta +4.35 pp   z +2.661   p 0.0078   differ (p < 0.05)   [intervals overlap; the test, not the overlap, decides]
+  rl-iter499 vs rl-iter399   delta +2.36 pp   z +1.423   p 0.1547   no evidence of a difference
+Comparing the Wilson intervals by eye does not answer this: overlap does not imply absence of a difference.
+Note: raw_score is average partial credit, not a solve rate; exact_pass is the solve rate.
 ```
 
-上面第二、三行是构造出来演示读法的，不是实测结果；只有 `qwen3-8b-base` 那一行是 issue #33 的真实数据。可以看到即便点估计差了 4.35 个百分点，区间仍然重叠。区间重叠不是"无差异"的正式检验，只是一个廉价信号，说明这个差距落在采样噪声范围内；结论依赖它时应改用两比例检验。
+上面第二、三行是构造出来演示读法的，不是实测结果；只有 `qwen3-8b-base` 那一行是 issue #33 的真实数据。第二条配对正是那个陷阱：`293` 与 `352` 的 Wilson 区间明明重叠，检验却给出 `p = 0.0078`。如果按"区间重叠所以不可分"来读，就会把一个真实效应当噪声丢掉——这恰好是这个工具要防的错误，所以判定一律以检验为准，区间只作描述，两者结论不一致时输出会明确标出来。
+
+两处限制要记住：z 检验是正态近似，本数据集的期望计数远大于 5 所以适用，但贴近 0.05 的结果值得再做一次精确检验；k 个运行会产生 k(k-1)/2 次比较，宽表里接近 0.05 的 p 值要按多重比较来看。
 
 ## 5. 产物
 

@@ -400,7 +400,6 @@ def _summary(tmp_path, name: str, exact_pass: int, total: int = 1356) -> Path:
             {
                 "dataset_total": total,
                 "exact_pass_count": exact_pass,
-                "nonzero_score_count": exact_pass,
                 "raw_score_mean_all_dataset_missing_as_zero": exact_pass / total,
                 "missing_count": 0,
             }
@@ -410,37 +409,109 @@ def _summary(tmp_path, name: str, exact_pass: int, total: int = 1356) -> Path:
     return path
 
 
-def test_a_small_gap_is_reported_as_not_separable(tmp_path):
-    """293 vs 320 out of 1356 is under 2 pp; the intervals still overlap."""
+def test_a_gap_within_noise_is_reported_as_no_evidence(tmp_path):
+    """293 vs 320 out of 1356: under 2 pp, p = 0.22."""
     runs = [
         compare.load_run("baseline", _summary(tmp_path, "a.json", 293)),
         compare.load_run("rl", _summary(tmp_path, "b.json", 320)),
     ]
-    assert compare.overlapping_pairs(runs)
+    (pair,) = compare.compare_pairs(runs)
+    assert pair.p_value == pytest.approx(0.2151, abs=5e-4)
+    assert pair.is_significant is False
     text = compare.format_comparison(runs)
-    assert "not separable" in text
+    assert "no evidence of a difference" in text
     assert "+1.99 pp" in text
 
 
-def test_a_large_gap_is_reported_as_separable(tmp_path):
+def test_overlapping_intervals_do_not_override_a_significant_test(tmp_path):
+    """The overlap fallacy, pinned.
+
+    293 vs 352 out of 1356 have overlapping Wilson intervals and p = 0.008.
+    Reading that pair off the intervals would discard a real effect, so the
+    verdict must come from the test and the disagreement must be called out.
+    """
+    runs = [
+        compare.load_run("baseline", _summary(tmp_path, "a.json", 293)),
+        compare.load_run("rl", _summary(tmp_path, "b.json", 352)),
+    ]
+    (pair,) = compare.compare_pairs(runs)
+    assert pair.intervals_overlap is True
+    assert pair.p_value == pytest.approx(0.0078, abs=5e-4)
+    assert pair.is_significant is True
+
+    text = compare.format_comparison(runs)
+    assert "differ (p < 0.05)" in text
+    assert "the test, not the overlap, decides" in text
+    assert "overlap does not imply" in text
+
+
+def test_a_large_gap_is_significant(tmp_path):
     runs = [
         compare.load_run("baseline", _summary(tmp_path, "a.json", 293)),
         compare.load_run("much-better", _summary(tmp_path, "b.json", 700)),
     ]
-    assert compare.overlapping_pairs(runs) == []
-    assert "every pair is separable" in compare.format_comparison(runs)
+    (pair,) = compare.compare_pairs(runs)
+    assert pair.is_significant
+    assert pair.intervals_overlap is False
+    assert "differ (p < 0.05)" in compare.format_comparison(runs)
+
+
+def test_two_proportion_test_is_symmetric_and_zero_for_identical_runs(tmp_path):
+    z, p_value = compare.two_proportion_test(293, 1356, 293, 1356)
+    assert z == 0.0
+    assert p_value == 1.0
+    forward = compare.two_proportion_test(293, 1356, 352, 1356)
+    backward = compare.two_proportion_test(352, 1356, 293, 1356)
+    assert forward[0] == pytest.approx(-backward[0])
+    assert forward[1] == pytest.approx(backward[1])
+
+
+def test_a_degenerate_run_is_flagged_not_declared_different(tmp_path):
+    """dataset_total = 0 must not read as 'separable from everything'."""
+    empty = tmp_path / "empty.json"
+    empty.write_text(
+        json.dumps(
+            {
+                "dataset_total": 0,
+                "exact_pass_count": 0,
+                "raw_score_mean_all_dataset_missing_as_zero": None,
+                "missing_count": 0,
+            }
+        ),
+        encoding="utf-8",
+    )
+    runs = [
+        compare.load_run("baseline", _summary(tmp_path, "a.json", 293)),
+        compare.load_run("empty", empty),
+    ]
+    (pair,) = compare.compare_pairs(runs)
+    assert pair.is_significant is False
+    assert "WARNING: a run has dataset_total = 0" in compare.format_comparison(runs)
+
+
+def test_load_run_names_the_file_and_the_missing_keys(tmp_path):
+    bad = tmp_path / "bad.json"
+    bad.write_text(json.dumps({"dataset_total": 10}), encoding="utf-8")
+    with pytest.raises(KeyError) as excinfo:
+        compare.load_run("bad", bad)
+    message = str(excinfo.value)
+    assert "bad.json" in message
+    assert "exact_pass_count" in message
 
 
 def test_comparison_cli_emits_json(tmp_path, capsys):
     args = [
         f"baseline={_summary(tmp_path, 'a.json', 293)}",
-        f"rl={_summary(tmp_path, 'b.json', 320)}",
+        f"rl={_summary(tmp_path, 'b.json', 352)}",
         "--json",
     ]
     assert compare.main(args) == 0
     payload = json.loads(capsys.readouterr().out)
     assert [r["label"] for r in payload["runs"]] == ["baseline", "rl"]
-    assert payload["overlapping_pairs"] == [["baseline", "rl"]]
+    (pair,) = payload["pairs"]
+    assert pair["significant_at_0_05"] is True
+    assert pair["wilson_intervals_overlap"] is True
+    assert pair["p_value"] == pytest.approx(0.0078, abs=5e-4)
 
 
 def test_comparison_cli_rejects_a_missing_label(tmp_path):
