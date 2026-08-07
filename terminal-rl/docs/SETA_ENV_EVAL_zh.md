@@ -70,6 +70,8 @@ benchmark 表按 checkpoint 一行一行填时，最容易犯的错是把 21.61%
 
 之所以不靠看区间是否重叠来判断：**不重叠确实蕴含显著，但重叠并不蕴含不显著**。这是个常见陷阱，而且在本数据集的量级上真会踩到。
 
+还有一层更重要：两个 checkpoint 跑的是**同一批 1356 条样本**，这是配对数据，而两比例 z 检验假设两个样本相互独立。同物品重复测量带来的正相关会让独立检验偏保守——它不会造假阳性，但会把真实效应报成"无证据"。所以只要把 `per_sample.csv` 而不是 `summary.json` 传给脚本，它就按 `sample_index` 做连接，改用**精确 McNemar 检验**（只看两边结论不一致的那些样本）。差别可以很大：下面演示数据里同样是 +1.99 pp，独立检验给 `p = 0.215` 判为"无证据"，而若两边的不一致样本是 8 对 35，McNemar 给出 `p < 0.001`。
+
 ```bash
 python terminal-rl/scripts/compare_seta_env_evals.py \
   qwen3-8b-base=runs/<run-a>/final_analysis/summary.json \
@@ -85,17 +87,26 @@ qwen3-8b-base   1356     2     38.77%         293   21.61%   19.50% -  23.88%
 rl-iter499      1356     0     42.48%         320   23.60%   21.42% -  25.93%
 rl-iter399      1356     0     46.73%         352   25.96%   23.70% -  28.36%
 
-exact_pass, two-proportion z-test (pooled, normal approximation):
-  qwen3-8b-base vs rl-iter499   delta +1.99 pp   z +1.240   p 0.2151   no evidence of a difference
-  qwen3-8b-base vs rl-iter399   delta +4.35 pp   z +2.661   p 0.0078   differ (p < 0.05)   [intervals overlap; the test, not the overlap, decides]
-  rl-iter499 vs rl-iter399   delta +2.36 pp   z +1.423   p 0.1547   no evidence of a difference
+exact_pass, per pair:
+  qwen3-8b-base vs rl-iter499   delta +1.99 pp   two-proportion z (unpaired)   z +1.240   p 0.2151   no evidence of a difference
+  qwen3-8b-base vs rl-iter399   delta +4.35 pp   two-proportion z (unpaired)   z +2.661   p 0.0078   differ (p < 0.05)   [Wilson intervals overlap; the test, not the intervals, decides]
+  rl-iter499 vs rl-iter399   delta +2.36 pp   two-proportion z (unpaired)   z +1.423   p 0.1547   no evidence of a difference
+The unpaired test assumes independent samples. Two runs over the same dataset are paired; pass per_sample.csv instead of summary.json for an exact McNemar test, which has more power here.
 Comparing the Wilson intervals by eye does not answer this: overlap does not imply absence of a difference.
 Note: raw_score is average partial credit, not a solve rate; exact_pass is the solve rate.
 ```
 
 上面第二、三行是构造出来演示读法的，不是实测结果；只有 `qwen3-8b-base` 那一行是 issue #33 的真实数据。第二条配对正是那个陷阱：`293` 与 `352` 的 Wilson 区间明明重叠，检验却给出 `p = 0.0078`。如果按"区间重叠所以不可分"来读，就会把一个真实效应当噪声丢掉——这恰好是这个工具要防的错误，所以判定一律以检验为准，区间只作描述，两者结论不一致时输出会明确标出来。
 
-两处限制要记住：z 检验是正态近似，本数据集的期望计数远大于 5 所以适用，但贴近 0.05 的结果值得再做一次精确检验；k 个运行会产生 k(k-1)/2 次比较，宽表里接近 0.05 的 p 值要按多重比较来看。
+限制要记住：`summary.json` 只够做独立两比例检验，而同数据集的比较本质是配对的，所以那条路径偏保守，能拿到 `per_sample.csv` 就用配对模式；z 检验是正态近似，本数据集期望计数远大于 5，但贴近 0.05 的结果值得再做精确检验；k 个运行产生 k(k-1)/2 次比较，宽表里接近 0.05 的 p 值要按多重比较来看。
+
+用配对模式只要把路径换掉：
+
+```bash
+python terminal-rl/scripts/compare_seta_env_evals.py \
+  qwen3-8b-base=runs/<run-a>/final_analysis/per_sample.csv \
+  rl-iter499=runs/<run-b>/final_analysis/per_sample.csv
+```
 
 ## 5. 产物
 

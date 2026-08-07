@@ -18,9 +18,17 @@ p = 0.008. Reading that pair off the intervals would throw away a real effect,
 which is the exact mistake this tool exists to prevent, so the reported verdict
 comes from the test and the intervals are shown as description only.
 
-The z-test is the normal approximation to the difference of two proportions. It
-is appropriate here (every expected count is far above 5) but is not exact; a
-result near the threshold deserves an exact test. With k runs the tool makes
+Two runs over the same dataset are paired data, and the two-proportion z-test
+assumes independent samples. Pass ``per_sample.csv`` instead of ``summary.json``
+and the tool joins on ``sample_index`` and uses an exact McNemar test on the
+discordant items, which is the right test and the more powerful one: the
+unpaired test is conservative under the positive correlation that same-item
+measurement produces, so it can report "no evidence" for a real effect. The
+unpaired test remains for summary-only input, labelled as such.
+
+The z-test is a normal approximation (appropriate when expected counts are
+comfortably above 5, as they are at this dataset size) and additionally assumes
+independence, which paired input does not satisfy. With k runs the tool makes
 k(k-1)/2 comparisons at nominal alpha, so p values close to 0.05 in a wide table
 should be read with that in mind.
 """
@@ -28,6 +36,7 @@ should be read with that in mind.
 from __future__ import annotations
 
 import argparse
+import csv
 import json
 import math
 import sys
@@ -65,13 +74,29 @@ def two_proportion_test(k1: int, n1: int, k2: int, n2: int) -> tuple[float, floa
     return z, math.erfc(abs(z) / math.sqrt(2))
 
 
+def mcnemar_exact(only_left: int, only_right: int) -> float:
+    """Two-sided exact McNemar p-value over the discordant pairs.
+
+    Concordant items carry no information about a difference, so the test is a
+    binomial sign test on the ``only_left`` / ``only_right`` split.
+    """
+    discordant = only_left + only_right
+    if discordant == 0:
+        return 1.0
+    smaller = min(only_left, only_right)
+    tail = sum(math.comb(discordant, i) for i in range(smaller + 1)) * 0.5 ** discordant
+    return min(1.0, 2 * tail)
+
+
 @dataclass(frozen=True)
 class Run:
     label: str
     total: int
     exact_pass: int
-    raw_score_mean: float
+    raw_score_mean: float | None
     missing: int
+    # sample_index -> exact_pass, present only when loaded from per_sample.csv
+    per_sample: dict[int, bool] | None = None
 
     @property
     def exact_pass_rate(self) -> float:
@@ -86,8 +111,10 @@ class Run:
 class Pair:
     left: Run
     right: Run
-    z: float
+    z: float | None
     p_value: float
+    test: str                      # "mcnemar-exact" (paired) or "two-proportion-z"
+    discordant: tuple[int, int] | None = None   # (only_left, only_right)
 
     @property
     def delta_pp(self) -> float:
@@ -112,7 +139,36 @@ REQUIRED_KEYS = (
 )
 
 
+def load_per_sample(label: str, csv_path: Path) -> Run:
+    """Load a per_sample.csv, keeping the per-item exact_pass needed for pairing."""
+    with csv_path.open(encoding="utf-8", newline="") as handle:
+        rows = list(csv.DictReader(handle))
+    if not rows:
+        raise ValueError(f"{csv_path} has no rows")
+    per_sample, scores, missing = {}, [], 0
+    for row in rows:
+        index = int(row["sample_index"])
+        raw = row.get("raw_score")
+        if raw in ("", None):
+            per_sample[index] = False
+            missing += 1
+            continue
+        score = float(raw)
+        per_sample[index] = score == 1.0
+        scores.append(score)
+    return Run(
+        label=label,
+        total=len(rows),
+        exact_pass=sum(1 for passed in per_sample.values() if passed),
+        raw_score_mean=(sum(scores) / len(rows)) if rows else None,
+        missing=missing,
+        per_sample=per_sample,
+    )
+
+
 def load_run(label: str, summary_path: Path) -> Run:
+    if summary_path.suffix.lower() == ".csv":
+        return load_per_sample(label, summary_path)
     summary = json.loads(summary_path.read_text(encoding="utf-8"))
     absent = [key for key in REQUIRED_KEYS if key not in summary]
     if absent:
@@ -124,22 +180,47 @@ def load_run(label: str, summary_path: Path) -> Run:
         label=label,
         total=int(summary["dataset_total"]),
         exact_pass=int(summary["exact_pass_count"]),
-        # The conservative denominator, matching what the docs report. None when
-        # the dataset was empty.
-        raw_score_mean=float(summary["raw_score_mean_all_dataset_missing_as_zero"] or 0.0),
+        # The conservative denominator, matching what the docs report. Genuinely
+        # None on an empty dataset; rendered as n/a rather than silently 0.00%.
+        raw_score_mean=(
+            None if summary["raw_score_mean_all_dataset_missing_as_zero"] is None
+            else float(summary["raw_score_mean_all_dataset_missing_as_zero"])
+        ),
         missing=int(summary["missing_count"]),
     )
 
 
 def compare_pairs(runs: Sequence[Run]) -> list[Pair]:
-    """Every unordered pair, tested. Order within a pair is (earlier, later)."""
+    """Every unordered pair, tested. Paired when both sides carry per-sample data."""
     pairs = []
     for index, left in enumerate(runs):
         for right in runs[index + 1:]:
+            shared = (
+                sorted(set(left.per_sample) & set(right.per_sample))
+                if left.per_sample is not None and right.per_sample is not None
+                else []
+            )
+            if shared:
+                only_left = sum(
+                    1 for i in shared if left.per_sample[i] and not right.per_sample[i]
+                )
+                only_right = sum(
+                    1 for i in shared if right.per_sample[i] and not left.per_sample[i]
+                )
+                pairs.append(Pair(
+                    left=left, right=right, z=None,
+                    p_value=mcnemar_exact(only_left, only_right),
+                    test="mcnemar-exact", discordant=(only_left, only_right),
+                ))
+                continue
             z, p_value = two_proportion_test(
                 left.exact_pass, left.total, right.exact_pass, right.total
             )
-            pairs.append(Pair(left=left, right=right, z=z, p_value=p_value))
+            degenerate = left.total <= 0 or right.total <= 0
+            pairs.append(Pair(
+                left=left, right=right, z=None if degenerate else z,
+                p_value=p_value, test="two-proportion-z",
+            ))
     return pairs
 
 
@@ -151,10 +232,12 @@ def format_comparison(runs: Sequence[Run]) -> str:
     ]
     for run in runs:
         low, high = run.exact_pass_interval
+        mean = "     n/a" if run.raw_score_mean is None else f"{run.raw_score_mean * 100:8.2f}%"
+        interval = "            n/a" if run.total <= 0 else \
+            f"{low * 100:6.2f}% - {high * 100:6.2f}%"
         lines.append(
             f"{run.label.ljust(width)}  {run.total:5d}  {run.missing:4d}  "
-            f"{run.raw_score_mean * 100:8.2f}%  {run.exact_pass:10d}  "
-            f"{run.exact_pass_rate * 100:6.2f}%  {low * 100:6.2f}% - {high * 100:6.2f}%"
+            f"{mean}  {run.exact_pass:10d}  {run.exact_pass_rate * 100:6.2f}%  {interval}"
         )
 
     if any(run.total <= 0 for run in runs):
@@ -164,15 +247,31 @@ def format_comparison(runs: Sequence[Run]) -> str:
     if len(runs) < 2:
         return "\n".join(lines)
 
+    pairs = compare_pairs(runs)
     lines.append("")
-    lines.append("exact_pass, two-proportion z-test (pooled, normal approximation):")
-    for pair in compare_pairs(runs):
+    lines.append("exact_pass, per pair:")
+    for pair in pairs:
         verdict = "differ (p < 0.05)" if pair.is_significant else "no evidence of a difference"
-        note = "" if pair.is_significant == (not pair.intervals_overlap) else \
-            "   [intervals overlap; the test, not the overlap, decides]"
+        if pair.test == "mcnemar-exact":
+            only_left, only_right = pair.discordant or (0, 0)
+            statistic = f"McNemar exact   discordant {only_left}/{only_right}"
+        else:
+            statistic = "two-proportion z (unpaired)   z " + (
+                "  n/a" if pair.z is None else f"{pair.z:+.3f}"
+            )
+        note = ""
+        if pair.is_significant != (not pair.intervals_overlap):
+            overlap = "overlap" if pair.intervals_overlap else "do not overlap"
+            note = f"   [Wilson intervals {overlap}; the test, not the intervals, decides]"
         lines.append(
             f"  {pair.left.label} vs {pair.right.label}   delta {pair.delta_pp:+.2f} pp   "
-            f"z {pair.z:+.3f}   p {pair.p_value:.4f}   {verdict}{note}"
+            f"{statistic}   p {pair.p_value:.4f}   {verdict}{note}"
+        )
+    if any(pair.test == "two-proportion-z" for pair in pairs):
+        lines.append(
+            "The unpaired test assumes independent samples. Two runs over the same dataset are"
+            " paired; pass per_sample.csv instead of summary.json for an exact McNemar test,"
+            " which has more power here."
         )
     lines.append(
         "Comparing the Wilson intervals by eye does not answer this: overlap does not imply"
@@ -198,8 +297,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
     )
     parser.add_argument(
-        "runs", nargs="+", type=_parse_run, metavar="LABEL=SUMMARY_JSON",
-        help="summary.json produced by analyze_seta_env_eval.py",
+        "runs", nargs="+", type=_parse_run, metavar="LABEL=PATH",
+        help="summary.json, or per_sample.csv to enable the paired McNemar test",
     )
     parser.add_argument("--json", action="store_true", dest="as_json", help="emit JSON")
     args = parser.parse_args(argv)
@@ -225,7 +324,9 @@ def main(argv: Sequence[str] | None = None) -> int:
                         "left": pair.left.label,
                         "right": pair.right.label,
                         "delta_pp": pair.delta_pp,
+                        "test": pair.test,
                         "z": pair.z,
+                        "discordant": list(pair.discordant) if pair.discordant else None,
                         "p_value": pair.p_value,
                         "significant_at_0_05": pair.is_significant,
                         "wilson_intervals_overlap": pair.intervals_overlap,

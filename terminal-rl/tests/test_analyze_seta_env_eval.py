@@ -441,7 +441,7 @@ def test_overlapping_intervals_do_not_override_a_significant_test(tmp_path):
 
     text = compare.format_comparison(runs)
     assert "differ (p < 0.05)" in text
-    assert "the test, not the overlap, decides" in text
+    assert "the test, not the intervals, decides" in text
     assert "overlap does not imply" in text
 
 
@@ -454,6 +454,83 @@ def test_a_large_gap_is_significant(tmp_path):
     assert pair.is_significant
     assert pair.intervals_overlap is False
     assert "differ (p < 0.05)" in compare.format_comparison(runs)
+
+
+def test_two_proportion_test_matches_a_known_unequal_n_case():
+    """Pins the pooling and the 1/n1 + 1/n2 term, which equal-n cases cannot."""
+    z, p_value = compare.two_proportion_test(50, 500, 90, 1500)
+    assert p_value == pytest.approx(0.00239832, rel=1e-6)
+    assert z == pytest.approx(-3.0358837, rel=1e-6)
+
+
+@pytest.mark.parametrize(
+    "only_left, only_right, expected",
+    [
+        (0, 0, 1.0),        # no discordant items carries no information
+        (5, 5, 1.0),
+        (1, 0, 1.0),        # 2 * 0.5 = 1.0
+        (0, 10, 0.001953125),
+        (8, 35, 4.1934157934520044e-05),   # == scipy binomtest(8, 43, 0.5)
+    ],
+)
+def test_mcnemar_exact_matches_the_binomial_sign_test(only_left, only_right, expected):
+    assert compare.mcnemar_exact(only_left, only_right) == pytest.approx(expected, rel=1e-4)
+
+
+def _per_sample(tmp_path, name: str, passes: list[bool]) -> Path:
+    path = tmp_path / name
+    with path.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=["sample_index", "raw_score", "has_result"])
+        writer.writeheader()
+        for index, passed in enumerate(passes):
+            writer.writerow(
+                {"sample_index": index, "raw_score": 1.0 if passed else 0.0, "has_result": 1}
+            )
+    return path
+
+
+def test_per_sample_input_switches_to_the_paired_test(tmp_path):
+    """Two runs over the same dataset are paired; the unpaired test loses power.
+
+    Same 1356 items, 8 items only the baseline solves and 35 only the RL run
+    solves. Unpaired that is +1.99 pp at p = 0.215, reported as no evidence;
+    McNemar on the discordant items is p < 0.001.
+    """
+    total = 1356
+    baseline = [index < 293 for index in range(total)]
+    rl = list(baseline)
+    for index in [i for i in range(total) if not baseline[i]][:35]:
+        rl[index] = True
+    for index in range(8):
+        rl[index] = False
+
+    runs = [
+        compare.load_run("baseline", _per_sample(tmp_path, "a.csv", baseline)),
+        compare.load_run("rl", _per_sample(tmp_path, "b.csv", rl)),
+    ]
+    (pair,) = compare.compare_pairs(runs)
+    assert pair.test == "mcnemar-exact"
+    assert pair.discordant == (8, 35)
+    assert pair.p_value < 0.001
+    assert pair.is_significant
+
+    unpaired_p = compare.two_proportion_test(293, total, 320, total)[1]
+    assert unpaired_p > 0.2, "the unpaired test on the same data finds no evidence"
+
+    text = compare.format_comparison(runs)
+    assert "McNemar exact   discordant 8/35" in text
+    assert "the test, not the intervals, decides" in text
+
+
+def test_summary_input_says_the_unpaired_test_is_the_weaker_choice(tmp_path):
+    runs = [
+        compare.load_run("baseline", _summary(tmp_path, "a.json", 293)),
+        compare.load_run("rl", _summary(tmp_path, "b.json", 320)),
+    ]
+    text = compare.format_comparison(runs)
+    assert "two-proportion z (unpaired)" in text
+    assert "assumes independent samples" in text
+    assert "pass per_sample.csv" in text
 
 
 def test_two_proportion_test_is_symmetric_and_zero_for_identical_runs(tmp_path):
@@ -486,7 +563,17 @@ def test_a_degenerate_run_is_flagged_not_declared_different(tmp_path):
     ]
     (pair,) = compare.compare_pairs(runs)
     assert pair.is_significant is False
-    assert "WARNING: a run has dataset_total = 0" in compare.format_comparison(runs)
+    text = compare.format_comparison(runs)
+    assert "WARNING: a run has dataset_total = 0" in text
+    # The intervals do NOT overlap here, so the note must not claim they do, and
+    # an undefined z must not be printed as a confident +0.000.
+    assert pair.intervals_overlap is False
+    assert "intervals overlap" not in text
+    assert "Wilson intervals do not overlap" in text
+    assert pair.z is None
+    assert "+0.000" not in text
+    # A null mean on an empty dataset renders as n/a, not as a real 0.00%.
+    assert "n/a" in text
 
 
 def test_load_run_names_the_file_and_the_missing_keys(tmp_path):
