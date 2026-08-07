@@ -12,7 +12,8 @@
 #
 # Optional:
 #   JOBS_DIR=./harbor_jobs      output root (`-o`)
-#   JOB_NAME=modeB_<SERVED_NAME>_<UTC timestamp>
+#   JOB_NAME       default modeB_<SERVED_NAME>_<UTC timestamp>, with the served
+#                  name reduced to [A-Za-z0-9._-]; an explicit value is used as given
 #   K=3                         attempts per task (`-k`)
 #   N_CONCURRENT=4              concurrent trials (`-n`)
 #   TASK_ID=                    when set, restrict to one task (`-i`); use for smoke runs
@@ -28,8 +29,9 @@ set -euo pipefail
 : "${DATASET_DIR:?DATASET_DIR is required (Terminal-Bench dataset root)}"
 
 JOBS_DIR="${JOBS_DIR:-./harbor_jobs}"
-# A served name may legitimately contain "/" (e.g. an org-prefixed name); leaving
-# it in would turn the job name into a path.
+# Only the generated default is sanitised: a served name may legitimately contain
+# "/" (e.g. an org-prefixed name), which would turn the job name into a path. An
+# explicitly passed JOB_NAME is the caller's choice and is used verbatim.
 JOB_NAME="${JOB_NAME:-modeB_${SERVED_NAME//[^A-Za-z0-9._-]/_}_$(date -u +%Y%m%dT%H%M%SZ)}"
 K="${K:-3}"
 N_CONCURRENT="${N_CONCURRENT:-4}"

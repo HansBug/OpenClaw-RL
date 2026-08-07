@@ -24,7 +24,7 @@ Harbor 自带的 `terminus-2` agent 与 terminal-rl 训练侧的 `CamelAgent` �
 | 12 | `tool_call_parser` | Harbor 内建 | `qwen25` | `SGLangTurnClient(tool_call_parser='qwen25')` |
 | 13 | `non_think_mode` | 不注入 | 由 kwarg 控制，默认 False | `non_think_mode` kwarg |
 
-有一个参数容易被误读成对齐 knob：`rollout_seed`（默认 42）**没有下发给 SGLang**。`_build_sampling_params()`（`adapter/openclaw_camel_adapter.py:318-328`）只发 `temperature`、`top_p`、`max_new_tokens`、`skip_special_tokens`，以及 `top_k > 0` 时的 `top_k`，不含 `seed`；`inference_client.py` 里也没有任何 `seed`。它只被写进轨迹 metadata（`:719`）。因此 mode B 的采样实际不是逐 trial 可复现的，真正生效的只有 SGLang 服务端的 `--random-seed`。这一点在七次历史评测中同样成立，改它会让结果不再与那七次同口径，所以这里只做记录，不做修改。
+有一个参数容易被误读成对齐 knob：`rollout_seed`（默认 42）**没有下发给 SGLang**。`_build_sampling_params()`（`adapter/openclaw_camel_adapter.py:314-328`）只发 `temperature`、`top_p`、`max_new_tokens`、`skip_special_tokens`，以及 `top_k > 0` 时的 `top_k`，不含 `seed`；`inference_client.py` 里也没有任何 `seed`。它只被写进轨迹 metadata（`:719`）。因此 mode B 的采样实际不是逐 trial 可复现的，真正生效的只有 SGLang 服务端的 `--random-seed`。这一点在七次历史评测中同样成立，改它会让结果不再与那七次同口径，所以这里只做记录，不做修改。
 
 ## 2. 适配器结构
 
@@ -71,4 +71,4 @@ transformers 5.x 起，`apply_chat_template(tokenize=True)` 返回 `BatchEncodin
 
 ## 6. 已知边界
 
-适配器只对齐了上表 14 个 knob，Docker 镜像版本、Terminal-Bench harness 自身的补丁、checkpoint 是否与历史评测字节一致这几项在历史评测中未逐项核对。评测跑出 task 级超时属于评测结果而非基础设施故障，不应该临场改任务；只有 SGLang 退出、Docker daemon 不通、Harbor 主进程退出但 job 未写 `finished_at` 这几类才是需要介入的基础设施问题，判据见 [`TBV21_HARBOR_FULL_EVAL_zh.md`](TBV21_HARBOR_FULL_EVAL_zh.md)。
+适配器只覆盖上表这 13 个 knob，issue #23 清单里的 SGLang 服务端项由 `launch_sglang.sh` 钉住；Docker 镜像版本、Terminal-Bench harness 自身的补丁、checkpoint 是否与历史评测字节一致这几项在历史评测中未逐项核对。mode B 的采样也没有逐 trial 固定种子，见 §1 末尾关于 `rollout_seed` 的说明。评测跑出 task 级超时属于评测结果而非基础设施故障，不应该临场改任务；只有 SGLang 退出、Docker daemon 不通、Harbor 主进程退出但 job 未写 `finished_at` 这几类才是需要介入的基础设施问题，判据见 [`TBV21_HARBOR_FULL_EVAL_zh.md`](TBV21_HARBOR_FULL_EVAL_zh.md)。
