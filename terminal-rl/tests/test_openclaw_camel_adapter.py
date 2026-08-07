@@ -9,6 +9,7 @@ kind of drift a test has to catch.
 
 from __future__ import annotations
 
+import json
 import subprocess
 import sys
 import tempfile
@@ -30,8 +31,9 @@ LAUNCHERS = sorted((MODE_B / "launchers").glob("*.sh"))
 pytest.importorskip("harbor", reason="harbor is required to import the adapter")
 pytest.importorskip("camel", reason="camel-ai is required to import the adapter")
 
-if str(ADAPTER_DIR) not in sys.path:
-    sys.path.insert(0, str(ADAPTER_DIR))
+for _extra in (ADAPTER_DIR, MODE_B):
+    if str(_extra) not in sys.path:
+        sys.path.insert(0, str(_extra))
 
 import openclaw_camel_adapter as adapter_module  # noqa: E402
 
@@ -146,6 +148,144 @@ def test_runtime_files_carry_no_site_specific_absolute_paths(path):
         or "/nfs/eval_results/" in line
     ]
     assert not offenders, "site-specific absolute paths must not be hardcoded:\n" + "\n".join(offenders)
+
+
+# --- Harbor job report -------------------------------------------------------
+
+import harbor_job_report  # noqa: E402
+
+
+def _write_harbor_job(
+    root: Path,
+    *,
+    n_total_trials: int,
+    solved: list[str],
+    zero_reward: int,
+    timeouts: int,
+    no_reward: int,
+    finished: bool = True,
+) -> Path:
+    """Build a Harbor job directory with a known shape."""
+    job = root / "job"
+    job.mkdir(parents=True)
+    aggregate: dict[str, object] = {
+        "started_at": "2026-07-01T22:00:13.674888",
+        "n_total_trials": n_total_trials,
+    }
+    if finished:
+        aggregate["finished_at"] = "2026-07-02T07:22:00.608529"
+    (job / "result.json").write_text(json.dumps(aggregate), encoding="utf-8")
+
+    def _trial(name: str, payload: dict[str, object]) -> None:
+        directory = job / name
+        directory.mkdir()
+        (directory / "result.json").write_text(json.dumps(payload), encoding="utf-8")
+
+    for name in solved:
+        _trial(name, {"verifier_result": {"rewards": {"reward": 1.0}}})
+    for index in range(zero_reward):
+        _trial(f"zero-{index}", {"verifier_result": {"rewards": {"reward": 0.0}}})
+    for index in range(timeouts):
+        _trial(
+            f"timeout-{index}",
+            {
+                "verifier_result": {"rewards": {"reward": 0.0}},
+                "exception_info": {
+                    "exception_type": "AgentTimeoutError",
+                    "exception_message": "AgentTimeoutError: 20",
+                },
+            },
+        )
+    for index in range(no_reward):
+        _trial(f"no-reward-{index}", {"exception_info": {"exception_type": "RewardFileNotFoundError"}})
+    return job
+
+
+@pytest.fixture
+def recorded_tbv21_job(tmp_path):
+    """The run recorded in docs/TBV21_HARBOR_FULL_EVAL_zh.md.
+
+    89 trials, reward_sum 2.0, 20 AgentTimeoutError, and exactly one trial that
+    never reached the verifier -- which is what makes the two denominators differ.
+    """
+    return _write_harbor_job(
+        tmp_path,
+        n_total_trials=89,
+        solved=["configure-git-webserver__zVAaSVv", "hf-model-inference__72rnD2H"],
+        zero_reward=66,
+        timeouts=20,
+        no_reward=1,
+    )
+
+
+def test_job_report_reproduces_the_recorded_tbv21_run(recorded_tbv21_job):
+    report = harbor_job_report.read_job(recorded_tbv21_job)
+    assert len(report.trials) == 89
+    assert report.n_total_trials == 89
+    assert report.reward_sum == 2.0
+    assert report.error_counts["AgentTimeoutError"] == 20
+    assert sorted(t.name for t in report.solved) == [
+        "configure-git-webserver__zVAaSVv",
+        "hf-model-inference__72rnD2H",
+    ]
+    assert report.is_finished
+
+
+def test_job_report_denominator_is_every_intended_trial(recorded_tbv21_job):
+    """2.0/89, not 2.0/88: a trial that errored before the verifier still counts."""
+    report = harbor_job_report.read_job(recorded_tbv21_job)
+    assert len(report.rewarded_trials) == 88
+    assert report.score == pytest.approx(0.0224719101, abs=1e-10)
+    assert report.score_over_rewarded_only == pytest.approx(0.0227272727, abs=1e-10)
+    assert report.score < report.score_over_rewarded_only
+
+
+def test_job_report_names_both_denominators_in_its_output(recorded_tbv21_job):
+    """The inflated number must never appear without the reporting one beside it."""
+    text = harbor_job_report.format_report(harbor_job_report.read_job(recorded_tbv21_job))
+    assert "2.0 / 89" in text
+    assert "report this one" in text
+    assert "not the reporting number" in text
+
+
+def test_job_report_marks_an_unfinished_job(tmp_path):
+    job = _write_harbor_job(
+        tmp_path, n_total_trials=89, solved=[], zero_reward=3, timeouts=0, no_reward=0,
+        finished=False,
+    )
+    report = harbor_job_report.read_job(job)
+    assert report.is_finished is False
+    assert len(report.trials) == 3
+
+
+def test_job_report_survives_a_half_written_trial_result(tmp_path):
+    """A watch loop must not die on a file Harbor is mid-write."""
+    job = _write_harbor_job(
+        tmp_path, n_total_trials=2, solved=["ok"], zero_reward=0, timeouts=0, no_reward=0,
+    )
+    partial = job / "half-written"
+    partial.mkdir()
+    (partial / "result.json").write_text('{"verifier_result": {"rew', encoding="utf-8")
+
+    report = harbor_job_report.read_job(job)
+    assert report.reward_sum == 1.0
+    assert len(report.trials) == 2
+
+
+def test_job_report_cli_watch_stops_once_the_job_is_finished(recorded_tbv21_job, capsys):
+    assert harbor_job_report.main([str(recorded_tbv21_job), "--watch", "--interval", "0"]) == 0
+    assert "poll 1" in capsys.readouterr().out
+
+
+def test_job_report_cli_emits_json(recorded_tbv21_job, capsys):
+    assert harbor_job_report.main([str(recorded_tbv21_job), "--json"]) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["score"] == pytest.approx(2.0 / 89)
+    # The trial that never reached the verifier is an error too, and is what makes
+    # n_rewarded_trials 88 rather than 89.
+    assert payload["error_counts"] == {"AgentTimeoutError": 20, "RewardFileNotFoundError": 1}
+    assert payload["n_result_files"] == 89
+    assert payload["n_rewarded_trials"] == 88
 
 
 # --- eval-history figure -----------------------------------------------------

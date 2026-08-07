@@ -11,6 +11,7 @@
 | `adapter/openclaw_camel_adapter.py` | Harbor `BaseAgent` 适配器，唯一的运行时代码 |
 | `launchers/launch_sglang.sh` | 起 SGLang 服务，评测相关 flag 全部按历史评测口径钉死 |
 | `launchers/run_harbor_eval.sh` | 起 Harbor 评测，full 与 smoke 由环境变量区分 |
+| `harbor_job_report.py` | 解析任意 Harbor job 目录：进度、聚合分数、解出任务、错误分布；`--watch` 轮询到结束 |
 | `analysis/` | issue #21–#25 的一次性复现脚本，见下面「analysis/ 的定位」 |
 
 ## 快速开始
@@ -43,6 +44,18 @@ DATASET_DIR=/path/to/terminal-bench-dataset \
 K=3 N_CONCURRENT=4 JOBS_DIR=/path/to/jobs \
 bash launchers/run_harbor_eval.sh
 ```
+
+## 读结果
+
+`harbor_job_report.py` 解析 job 目录，不需要每次现写 JSON 遍历：
+
+```bash
+python harbor_job_report.py /path/to/jobs/<job-name>            # 人读
+python harbor_job_report.py /path/to/jobs/<job-name> --json     # 入库
+python harbor_job_report.py /path/to/jobs/<job-name> --watch    # 轮询到 finished_at 出现
+```
+
+它同时打印两个分母：Harbor 的报告口径 `reward_sum / n_total_trials`，以及只对跑到 verifier 的 trial 求的均值。后者更高，因为它把"没跑到 verifier 就报错"的 trial 移出了分母；两个数并排出现，是为了让这个差距无处可藏。
 
 ## 换 checkpoint 不需要改代码
 

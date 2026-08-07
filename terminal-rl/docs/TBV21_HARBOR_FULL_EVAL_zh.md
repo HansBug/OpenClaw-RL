@@ -59,15 +59,74 @@ source ./env.sh
 
 按顺序执行，不要跳步。
 
-第一步核对 bundle 资源：89 个 task 目录、`bin/harbor`、`bin/python_sglang`、`runtime/tmux_runtime/bin/tmux`、`runtime/tools/bin/uv`、`runtime/wheelhouse`、`docker-cli-plugins/docker-compose` 全部存在且可执行，模型 symlink 的目标 `config.json` 可读。`bin/harbor` 和 `bin/python_sglang` 是指向共享 conda 环境的 wrapper，必须验证 wrapper 目标真的可执行（`bin/harbor --version`），目标不可读时先修 Python 环境，不要继续。
+第一步核对 bundle 资源。`bin/harbor` 和 `bin/python_sglang` 是指向共享 conda 环境的 wrapper，必须验证 wrapper 目标真的可执行，目标不可读时先修 Python 环境，不要继续。
 
-第二步核对集群能力：当前用户有 NOPASSWD sudo（rootless Docker wrapper 依赖它），`docker` 与 `dockerd` 二进制存在，宿主有 `tmux`，代理可达。sudo 不可用时这套 wrapper 无法按当前方式自动启动，需要改用集群支持的其他路线。
+```bash
+set -euo pipefail
+cd "$TBV21_HOME" && source ./env.sh
 
-第三步起 rootless Docker。`/tmp` 至少预留 60 GiB。首次需要先跑 `bin/setup_worker_rootless_docker.sh` 安装 rootless extras 与 slirp4netns。启动后确认 `docker info` 显示 driver 是 `fuse-overlayfs`、root 在 `/tmp/tbv21-rootless-docker-<user>` 而不是共享存储。
+test "$(find "$TBV21_TASKS_DIR" -mindepth 1 -maxdepth 1 -type d | wc -l)" = 89
+for p in bin/harbor bin/python_sglang bin/setup_worker_rootless_docker.sh \
+         bin/use_worker_rootless_docker.sh bin/prepull_tbv21_images.sh \
+         bin/start_sglang.sh bin/run_full_eval_qwen3_8b.sh \
+         runtime/tmux_runtime/bin/tmux runtime/tools/bin/uv \
+         docker-cli-plugins/docker-compose; do
+  test -x "$p" || { echo "[MISS] $p" >&2; exit 1; }
+done
+test -d runtime/wheelhouse
 
-第四步跑容器联网 smoke（`bin/use_worker_rootless_docker.sh smoke`），必须看到 hello-world 与 alpine 访问外网都成功，否则不要进入 Harbor。
+MODEL_REAL="$(readlink -f "$TBV21_MODEL_PATH")"
+test -r "$MODEL_REAL/config.json" || { echo "[ERROR] unreadable: $MODEL_REAL/config.json" >&2; exit 1; }
 
-第五步预拉镜像，必须 `failed=0`。第六步起 SGLang 并确认 `/v1/models` 返回目标模型。第七步跑单任务 smoke，能建容器、能调模型、能写出 `result.json` 之后，再跑全量。
+bin/harbor --version
+bin/python_sglang - <<'PY'
+import importlib.util, torch
+print("cuda_count", torch.cuda.device_count())
+for name in ("sglang", "openai", "transformers"):
+    print(name, bool(importlib.util.find_spec(name)))
+PY
+```
+
+bundle 自带 `bin/doctor.sh`，但它与上面的手工检查结论冲突时以手工检查为准。
+
+第二步核对集群能力。sudo 不可用时这套 wrapper 无法按当前方式自动启动，需要改用集群支持的其他路线。
+
+```bash
+sudo -n true          || { echo "[ERROR] rootless Docker wrapper needs NOPASSWD sudo" >&2; exit 1; }
+command -v docker     || { echo "[ERROR] docker CLI missing" >&2; exit 1; }
+command -v dockerd    || { echo "[ERROR] dockerd binary missing" >&2; exit 1; }
+command -v tmux       || { echo "[ERROR] tmux missing on host" >&2; exit 1; }
+curl -x "$TBV21_PROXY_URL" -fsS --max-time 10 http://example.com >/dev/null \
+                      || { echo "[ERROR] proxy unreachable: $TBV21_PROXY_URL" >&2; exit 1; }
+```
+
+第三到第七步是一条直线，每步的期望输出都写在注释里；任何一步不满足就停下来修，不要跳过。
+
+```bash
+# 3. rootless Docker：/tmp 至少 60 GiB；期望 driver=fuse-overlayfs 且 root 在 /tmp 而非共享存储
+df -h /tmp
+[ -x "$HOME/.local/bin/dockerd-rootless-launch.sh" ] || bash bin/setup_worker_rootless_docker.sh
+bash bin/use_worker_rootless_docker.sh start
+source "$TBV21_DOCKER_HOST_ENV"
+docker info --format 'server={{.ServerVersion}} root={{.DockerRootDir}} driver={{.Driver}}'
+docker compose version
+
+# 4. 容器联网 smoke：必须看到 hello-world 与 alpine 访问外网都成功
+bash bin/use_worker_rootless_docker.sh smoke
+
+# 5. 预拉 89 个镜像：必须 failed=0
+bash bin/prepull_tbv21_images.sh "$TBV21_TASKS_DIR"
+
+# 6. SGLang：必须返回 $TBV21_MODEL_NAME
+export TBV21_GPU_IDS=0,1,2,3
+bash bin/start_sglang.sh "$TBV21_GPU_IDS"
+curl --noproxy '*' -fsS --max-time 10 "http://${TBV21_SGLANG_HOST}:${TBV21_SGLANG_PORT}/v1/models"
+
+# 7. 单任务 smoke：能建容器、能调模型、能写出 result.json 之后再跑全量
+bash bin/run_one_task_eval_qwen3_8b.sh regex-chess
+```
+
+`docker version` 在这套 rootless 组合下可能报 EOF 而 `docker info` 正常，健康判据以 `docker info` 为准。SGLang 若 CUDA OOM，先降 `TBV21_SGLANG_MEM_FRACTION`（例如 0.50）再重启。rootless Docker 的 data root 若指到共享存储上，设 `TBV21_ROOTLESS_DOCKER_DATA_ROOT=/tmp/tbv21-rootless-docker-${USER}` 后重启。
 
 ## 5. 全量评测与监控
 
@@ -84,13 +143,48 @@ tmux send-keys -t "$TARGET_PANE" "bash bin/run_full_eval_qwen3_8b.sh" C-m
 
 启动后 10 秒内必须确认 `logs/${JOB}.log` 已生成且非空，否则说明 tmux target 写错了，实际没跑起来。脚本名里的 `qwen3_8b` 是历史命名，它读的是 `TBV21_MODEL_NAME` 和 `TBV21_MODEL_PATH`，换模型不需要改脚本名。脚本在调用 Harbor 之前会自检 config，必须看到 `[OK] Harbor config has proxy env, noninteractive apt env, and model_info`；自检失败时修 config 生成逻辑，不要手工绕过去直接起 Harbor。
 
-监控每 5 分钟轮询一次，同时看四样东西：`jobs/$JOB/result.json` 的 `finished_at` 与已落盘 trial 数、`docker ps` 的活跃容器、Harbor 主日志尾部、SGLang `/v1/models` 探活。正常推进的表现是已完成数持续增加，或当前容器的运行时长还没超过该 task 的 timeout；`docker ps` 里有一两个 task 容器且名字随任务完成不断更换；`AgentTimeoutError` 计数增加但新任务继续启动。
+监控每 5 分钟轮询一次，同时看四样东西：job 进度、`docker ps` 的活跃容器、Harbor 主日志尾部、SGLang 探活。job 进度用 [`../eval/mode_b_aligned/harbor_job_report.py`](../eval/mode_b_aligned/harbor_job_report.py)，它解析 job 目录并在 `finished_at` 出现后退出，不需要每次现写解析代码。
+
+```bash
+JOB=<你设置的 TBV21_FULL_EVAL_JOB_NAME>
+
+python terminal-rl/eval/mode_b_aligned/harbor_job_report.py \
+  "jobs/${JOB}" --watch --interval 300 &
+
+while sleep 300; do
+  docker ps --format '{{.Names}} {{.Status}} {{.Image}}'
+  tail -n 5 "logs/${JOB}.log"
+  curl --noproxy '*' -fsS --max-time 5 \
+    "http://${TBV21_SGLANG_HOST}:${TBV21_SGLANG_PORT}/v1/models" >/dev/null \
+    && echo 'sglang: ok' || echo 'sglang: BAD'
+done
+```
+
+正常推进的表现是已完成数持续增加，或当前容器的运行时长还没超过该 task 的 timeout；`docker ps` 里有一两个 task 容器且名字随任务完成不断更换；`AgentTimeoutError` 计数增加但新任务继续启动。
 
 判断是否需要介入只看基础设施：SGLang 探活失败且日志显示进程退出、`docker info` 失败或 daemon 不通、`docker ps` 卡死、Harbor 主进程退出但 job 没有 `finished_at`、某容器远超 task timeout 仍未释放且 Harbor 没写该 task 的结果。以下情况不要介入：单个 task 跑 15 到 60 分钟（TBv2.1 有任务 timeout 为 3600 秒，个别更久）、`AgentTimeoutError`、主日志里的 `Unclosed client session` 警告。
 
 ## 6. 结果口径
 
-Harbor 的聚合分数分母是 `n_total_trials`，报告时统一用这个口径。验证运行的数字是 `reward_sum = 2.0`、`n_total_trials = 89`，即 `2.0 / 89 = 0.0224719101`；如果只对有 `reward` 字段的 88 个结果求均值会得到 `2.0 / 88 = 0.0227272727`，这不是报告口径。`error_counts` 里的 `AgentTimeoutError: 20` 是 task / 模型层面的超时，不是 Harbor、Docker 或 SGLang 崩溃。
+Harbor 的聚合分数分母是 `n_total_trials`，报告时统一用这个口径。只对带 `reward` 字段的结果求均值会把"没跑到 verifier 就报错"的 trial 移出分母，从而高估分数；同一个脚本把两个数一起打出来，就是为了让这个差距无处可藏。
+
+```bash
+python terminal-rl/eval/mode_b_aligned/harbor_job_report.py "jobs/${JOB}"
+python terminal-rl/eval/mode_b_aligned/harbor_job_report.py "jobs/${JOB}" --json   # 便于入库
+```
+
+验证运行的实际输出：
+
+```text
+progress         89 / 89 trial results on disk
+reward_sum       2.0
+score            2.0 / 89 = 0.0224719101   <- report this one
+  (over the 88 trials that reached the verifier: 0.0227272727 -- not the reporting number)
+error_counts     {'RewardFileNotFoundError': 1, 'AgentTimeoutError': 20}
+solved_tasks     ['configure-git-webserver__zVAaSVv', 'hf-model-inference__72rnD2H']
+```
+
+`AgentTimeoutError: 20` 是 task / 模型层面的超时，不是 Harbor、Docker 或 SGLang 崩溃。这段输出被 `tests/test_openclaw_camel_adapter.py` 用同形状的夹具钉住，改动脚本时会立刻发现口径漂移。
 
 ## 7. 验证运行的完整记录
 
@@ -107,12 +201,28 @@ Harbor 的聚合分数分母是 `n_total_trials`，报告时统一用这个口�
 | 解出任务 | `configure-git-webserver__zVAaSVv`、`hf-model-inference__72rnD2H` |
 | 收尾状态 | 无残留 task container，SGLang 保持健康 |
 
-job 名里的 `_ready_20260701_215702` 只是这次验证运行的历史标记，不是脚本要求；新的运行用 `full_eval_tbv21_${TBV21_MODEL_NAME}_$(date +%Y%m%d_%H%M%S)` 即可。
+job 名里的 `_ready_20260701_215702` 只是这次验证运行的历史标记，不是脚本要求；新的运行用 `full_eval_tbv21_${TBV21_MODEL_NAME}_$(date +%Y%m%d_%H%M%S)` 即可。这次运行的证据落在 bundle 的四个位置：`jobs/<JOB>/`（含每个 trial 的 `result.json`）、`logs/<JOB>.log`、`state/<JOB>.config.json`、`state/<JOB>.env`。找最近一次 full eval：
 
-## 8. 常见问题
+```bash
+find jobs -maxdepth 1 -type d -name 'full_eval_tbv21_*' -printf '%T@ %p\n' | sort -n | tail -10
+```
+
+## 8. 收尾检查
+
+```bash
+source ./env.sh && source "$TBV21_DOCKER_HOST_ENV"
+docker ps -a --format 'table {{.Names}}\t{{.Status}}\t{{.Image}}' | head -50
+curl --noproxy '*' -fsS --max-time 5 "http://${TBV21_SGLANG_HOST}:${TBV21_SGLANG_PORT}/v1/models"
+ps -ef | grep -E 'sglang|harbor run|run_full_eval' | grep -v grep || true
+nvidia-smi --query-gpu=index,memory.used,memory.total,utilization.gpu --format=csv,noheader
+```
+
+期望是没有残留 task container、SGLang 仍健康、Harbor 主流程已结束。如果还要继续跑别的 eval，**不要**停 SGLang，也不要 `docker prune` 镜像——重新预拉 89 个镜像的代价远大于占用的磁盘。确实要释放资源时：`tmux kill-session -t tbv21_sglang_30000` 放 GPU，`bash bin/use_worker_rootless_docker.sh stop` 停 Docker。
+
+## 9. 常见问题
 
 镜像拉取报 TLS handshake timeout 或 context deadline exceeded 时，跑预拉脚本并确认镜像站 fallback 生效。容器内 apt 卡住或 tzdata 等待交互时，检查 `DEBIAN_FRONTEND`、`TZ`、`APT_CONFIG` 和代理四项是否都注入了。LiteLLM 报 unknown model 或 context fallback 时，检查 Harbor agent config 是否带了 `model_info` 的 `max_input_tokens` / `max_output_tokens`，只写 `model_name` 不够。SGLang pid 文件缺失时先用 `/v1/models` 探活，健康就复用，不要杀 tmux session。Harbor 跑完仍有容器残留时，先确认 job 已写 `finished_at`，再按名字删对应容器，不要 `docker prune` 镜像。rootless daemon 日志里的 cgroup 清理噪声可以忽略，判据是 `docker ps -a` 无残留、Harbor result 完成、SGLang 健康三项。
 
-## 9. Ready 判据
+## 10. Ready 判据
 
 同时满足以下六条才算这套流程就绪：所有脚本 `bash -n` 通过；`docker info` 显示 rootless + fuse-overlayfs 且 root 在大容量盘；预拉输出 `failed=0`；SGLang `/v1/models` 正常返回目标模型；Harbor config 自检输出 `[OK]`；`jobs/$JOB/result.json` 最终有非空 `finished_at` 且 `docker ps -a` 无残留 task container。
