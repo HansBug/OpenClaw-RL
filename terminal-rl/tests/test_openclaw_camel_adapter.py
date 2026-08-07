@@ -304,7 +304,7 @@ def test_an_unusable_reward_scores_zero_rather_than_poisoning_the_job(tmp_path, 
     assert report.reward_sum == 0.0
     assert report.score == 0.0
     assert report.rewarded_trials == []
-    # Scan only the numeric lines: the full report embeds job_dir, so a tmp path
+    # Scan the two score lines only: the full report embeds job_dir, so a path
     # containing "nan" would otherwise decide this assertion.
     numeric = [
         line for line in harbor_job_report.format_report(report).splitlines()
