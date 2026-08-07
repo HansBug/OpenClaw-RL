@@ -53,6 +53,13 @@ transformers 5.x 起，`apply_chat_template(...)` 在带 `tools=` 参数时可�
 | [#28](https://github.com/HansBug/OpenClaw-RL/issues/28) | TB 2.1 | RL outcome_gate iter299 | **mode B** | 2.25%（6/267） | 4.49%（4/89） | `modernize-scientific-stack`、`prove-plus-comm`、`qemu-startup`、`sqlite-with-gcov` |
 | [#29](https://github.com/HansBug/OpenClaw-RL/issues/29) | TB 2.1 | SETA-DAPO baseline mt10 iter899 | **mode B** | 1.87%（5/267） | 5.62%（5/89） | `configure-git-webserver`、`filter-js-from-html`、`hf-model-inference`、`modernize-scientific-stack`、`pypi-server` |
 
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="assets/harbor_camel_mode_b/modeb_pass_at_1_dark.png">
+  <img alt="七次全量评测的 pass@1 点估计与 Wilson 95% 置信区间，区间两两重叠" src="assets/harbor_camel_mode_b/modeb_pass_at_1_light.png">
+</picture>
+
+把七行的点估计和 Wilson 95% 区间画在一起，是为了让"两两重叠"这件事一眼可见：表格里 1.12% 和 3.00% 看起来差了快三倍，但在 n=267、成功数只有个位数的量级上，它们的区间几乎完全套在一起。图由 `scripts/plot_modeb_eval_history.py` 生成，其 Wilson 实现在 `tests/test_openclaw_camel_adapter.py` 里对 #27、#28、#29 已公布的区间做了回归。
+
 另有一次 TB 2.1 × Qwen3-8B 的 `terminus-2`（mode A）单次全量跑，89 个 trial 聚合分数 2.0 / 89 = 2.25%，解出 `configure-git-webserver` 与 `hf-model-inference`；它是 [`TBV21_HARBOR_FULL_EVAL_zh.md`](TBV21_HARBOR_FULL_EVAL_zh.md) 里那套运维流程的验证运行，k=1 而非 k=3，不与上表同口径，不要与 #27 的 mode B 数字混用。
 
 ## 5. 从这些数字能得出和不能得出的结论

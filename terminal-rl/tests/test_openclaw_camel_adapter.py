@@ -18,6 +18,8 @@ import pytest
 
 ROOT = Path(__file__).resolve().parents[2]
 TERMINAL_RL = ROOT / "terminal-rl"
+if str(TERMINAL_RL / "scripts") not in sys.path:
+    sys.path.insert(0, str(TERMINAL_RL / "scripts"))
 MODE_B = TERMINAL_RL / "eval" / "mode_b_aligned"
 ADAPTER_DIR = MODE_B / "adapter"
 ADAPTER_PY = ADAPTER_DIR / "openclaw_camel_adapter.py"
@@ -129,3 +131,42 @@ def test_runtime_files_carry_no_site_specific_absolute_paths(path):
         or "/nfs/eval_results/" in line
     ]
     assert not offenders, "site-specific absolute paths must not be hardcoded:\n" + "\n".join(offenders)
+
+
+# --- eval-history figure -----------------------------------------------------
+
+import plot_modeb_eval_history as history_plot  # noqa: E402
+
+
+@pytest.mark.parametrize(
+    "issue, successes, trials, published_low, published_high",
+    [
+        # Percentages as printed in each issue body's TL;DR.
+        ("#27 pass@1", 5, 267, 0.80, 4.31),
+        ("#27 pass@3", 3, 89, 1.15, 9.45),
+        ("#28 pass@1", 6, 267, 1.03, 4.82),
+        ("#28 pass@3", 4, 89, 1.76, 10.99),
+        ("#29 pass@3", 5, 89, 2.42, 12.49),
+    ],
+)
+def test_wilson_interval_reproduces_the_published_intervals(
+    issue, successes, trials, published_low, published_high
+):
+    """The figure must not draw intervals that disagree with the issues it cites."""
+    low, high = history_plot.wilson_interval(successes, trials)
+    assert round(low * 100, 2) == published_low, issue
+    assert round(high * 100, 2) == published_high, issue
+
+
+def test_eval_history_rows_match_the_documented_pass_at_1():
+    """Keeps the figure's table and the doc's table from drifting apart."""
+    documented = {
+        "#21": (3, 267), "#22": (8, 267), "#24": (6, 267), "#25": (3, 267),
+        "#27": (5, 267), "#28": (6, 267), "#29": (5, 267),
+    }
+    assert {e.issue: (e.successes, e.trials) for e in history_plot.EVALS} == documented
+
+    doc = (TERMINAL_RL / "docs" / "HARBOR_CAMEL_MODE_B_zh.md").read_text(encoding="utf-8")
+    for row in history_plot.EVALS:
+        rendered = f"{row.successes / row.trials * 100:.2f}%（{row.successes}/{row.trials}）"
+        assert rendered in doc, f"{row.issue}: {rendered} missing from the history table"
