@@ -84,7 +84,18 @@ def mcnemar_exact(only_left: int, only_right: int) -> float:
     if discordant == 0:
         return 1.0
     smaller = min(only_left, only_right)
-    tail = sum(math.comb(discordant, i) for i in range(smaller + 1)) * 0.5 ** discordant
+    # Summed in log space: math.comb returns an exact int that overflows float
+    # before the 0.5**n scaling can bring it back, from 1025 discordant pairs up.
+    log_half = discordant * math.log(0.5)
+    tail = math.fsum(
+        math.exp(
+            math.lgamma(discordant + 1)
+            - math.lgamma(i + 1)
+            - math.lgamma(discordant - i + 1)
+            + log_half
+        )
+        for i in range(smaller + 1)
+    )
     return min(1.0, 2 * tail)
 
 
@@ -148,6 +159,11 @@ def load_per_sample(label: str, csv_path: Path) -> Run:
     per_sample, scores, missing = {}, [], 0
     for row in rows:
         index = int(row["sample_index"])
+        if index in per_sample:
+            raise ValueError(
+                f"{csv_path} repeats sample_index {index}; "
+                "the denominator and the per-item join would disagree"
+            )
         raw = row.get("raw_score")
         if raw in ("", None):
             per_sample[index] = False
@@ -160,7 +176,7 @@ def load_per_sample(label: str, csv_path: Path) -> Run:
         label=label,
         total=len(rows),
         exact_pass=sum(1 for passed in per_sample.values() if passed),
-        raw_score_mean=(sum(scores) / len(rows)) if rows else None,
+        raw_score_mean=sum(scores) / len(rows),
         missing=missing,
         per_sample=per_sample,
     )
@@ -260,7 +276,8 @@ def format_comparison(runs: Sequence[Run]) -> str:
                 "  n/a" if pair.z is None else f"{pair.z:+.3f}"
             )
         note = ""
-        if pair.is_significant != (not pair.intervals_overlap):
+        degenerate = pair.left.total <= 0 or pair.right.total <= 0
+        if not degenerate and pair.is_significant != (not pair.intervals_overlap):
             overlap = "overlap" if pair.intervals_overlap else "do not overlap"
             note = f"   [Wilson intervals {overlap}; the test, not the intervals, decides]"
         lines.append(

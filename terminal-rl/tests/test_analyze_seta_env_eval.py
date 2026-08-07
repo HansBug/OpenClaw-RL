@@ -522,6 +522,81 @@ def test_per_sample_input_switches_to_the_paired_test(tmp_path):
     assert "the test, not the intervals, decides" in text
 
 
+def test_mcnemar_survives_a_discordant_count_that_overflows_a_float():
+    """math.comb returns an exact int that overflows float from 1025 pairs up."""
+    assert compare.mcnemar_exact(512, 513) == pytest.approx(1.0, abs=1e-9)
+    assert compare.mcnemar_exact(400, 800) < 1e-20
+    assert compare.mcnemar_exact(2000, 2000) == pytest.approx(1.0, abs=1e-9)
+
+
+def test_paired_join_uses_only_the_shared_samples(tmp_path):
+    """A union or a left-only join would count items the other run never saw."""
+    left = _per_sample(tmp_path, "a.csv", [True, True, False, False])
+    right = tmp_path / "b.csv"
+    with right.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=["sample_index", "raw_score", "has_result"])
+        writer.writeheader()
+        # Overlaps on 2 and 3 only; 4 and 5 are unique to this run.
+        for index, score in [(2, 1.0), (3, 0.0), (4, 1.0), (5, 1.0)]:
+            writer.writerow({"sample_index": index, "raw_score": score, "has_result": 1})
+
+    runs = [compare.load_run("a", left), compare.load_run("b", right)]
+    (pair,) = compare.compare_pairs(runs)
+    assert pair.test == "mcnemar-exact"
+    # Shared indices are 2 and 3. On 2: a fails, b passes. On 3: both fail.
+    assert pair.discordant == (0, 1)
+
+
+def test_disjoint_sample_sets_fall_back_to_the_unpaired_test(tmp_path):
+    left = _per_sample(tmp_path, "a.csv", [True, False])
+    right = tmp_path / "b.csv"
+    with right.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=["sample_index", "raw_score", "has_result"])
+        writer.writeheader()
+        for index in (100, 101):
+            writer.writerow({"sample_index": index, "raw_score": 1.0, "has_result": 1})
+    (pair,) = compare.compare_pairs(
+        [compare.load_run("a", left), compare.load_run("b", right)]
+    )
+    assert pair.test == "two-proportion-z"
+
+
+def test_one_sided_per_sample_input_falls_back_to_the_unpaired_test(tmp_path):
+    runs = [
+        compare.load_run("csv", _per_sample(tmp_path, "a.csv", [True, False])),
+        compare.load_run("summary", _summary(tmp_path, "b.json", 1, total=2)),
+    ]
+    (pair,) = compare.compare_pairs(runs)
+    assert pair.test == "two-proportion-z"
+
+
+def test_per_sample_rows_without_a_score_count_as_missing_non_passes(tmp_path):
+    path = tmp_path / "a.csv"
+    with path.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=["sample_index", "raw_score", "has_result"])
+        writer.writeheader()
+        writer.writerow({"sample_index": 0, "raw_score": 1.0, "has_result": 1})
+        writer.writerow({"sample_index": 1, "raw_score": 0.5, "has_result": 1})
+        writer.writerow({"sample_index": 2, "raw_score": "", "has_result": 0})
+
+    run = compare.load_run("a", path)
+    assert run.total == 3
+    assert run.missing == 1
+    assert run.exact_pass == 1                      # 0.5 is partial credit, not a pass
+    assert run.raw_score_mean == pytest.approx(0.5)  # (1.0 + 0.5 + 0) / 3
+
+
+def test_a_repeated_sample_index_is_rejected(tmp_path):
+    path = tmp_path / "dup.csv"
+    with path.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=["sample_index", "raw_score", "has_result"])
+        writer.writeheader()
+        for _ in range(2):
+            writer.writerow({"sample_index": 0, "raw_score": 1.0, "has_result": 1})
+    with pytest.raises(ValueError, match="repeats sample_index 0"):
+        compare.load_run("dup", path)
+
+
 def test_summary_input_says_the_unpaired_test_is_the_weaker_choice(tmp_path):
     runs = [
         compare.load_run("baseline", _summary(tmp_path, "a.json", 293)),
@@ -567,9 +642,9 @@ def test_a_degenerate_run_is_flagged_not_declared_different(tmp_path):
     assert "WARNING: a run has dataset_total = 0" in text
     # The intervals do NOT overlap here, so the note must not claim they do, and
     # an undefined z must not be printed as a confident +0.000.
-    assert pair.intervals_overlap is False
-    assert "intervals overlap" not in text
-    assert "Wilson intervals do not overlap" in text
+    # The table prints n/a for a zero-sample interval, so the per-pair note must
+    # not claim anything about overlap. The closing general remark still may.
+    assert "[Wilson intervals" not in text
     assert pair.z is None
     assert "+0.000" not in text
     # A null mean on an empty dataset renders as n/a, not as a real 0.00%.
