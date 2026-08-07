@@ -21,6 +21,7 @@
 # Optional:
 #   PROMPT_DATA=terminal-rl/dataset/seta_env_convert/train.filtered.jsonl
 #   CONCURRENCY=16    drives batch size, eval concurrency and active task cap
+#   EVAL_N_SAMPLES=1  rollouts per prompt; 1 is what the published baseline ran
 #   RUN_ID            defaults to the launcher's own generated id
 #   DRY_RUN=1         print the resolved environment and exit
 set -euo pipefail
@@ -32,6 +33,12 @@ REPO_ROOT="$(cd -- "${TERMINAL_RL_DIR}/.." &>/dev/null && pwd)"
 : "${HF_CKPT:?HF_CKPT is required (checkpoint to evaluate)}"
 : "${WORKER_URLS:?WORKER_URLS is required (Docker worker endpoints)}"
 : "${ENV_SERVER_URL:?ENV_SERVER_URL is required (environment router endpoint)}"
+
+# Fail on a typo'd checkpoint path now, not minutes later after Ray has started.
+if [[ ! -r "${HF_CKPT}/config.json" ]]; then
+  echo "[ERROR] ${HF_CKPT}/config.json is missing or unreadable" >&2
+  exit 1
+fi
 
 export HF_CKPT
 export REF_LOAD="${REF_LOAD:-${HF_CKPT}}"
@@ -60,14 +67,27 @@ export ROLLOUT_BATCH_SIZE="${ROLLOUT_BATCH_SIZE:-${CONCURRENCY}}"
 export EVAL_ROLLOUT_MAX_CONCURRENCY="${EVAL_ROLLOUT_MAX_CONCURRENCY:-${CONCURRENCY}}"
 export ENV_REMOTE_MAX_ACTIVE_TASKS="${ENV_REMOTE_MAX_ACTIVE_TASKS:-${CONCURRENCY}}"
 
+# One rollout per prompt, which is what the published baseline ran
+# (configs/main/run_config.json: "n_samples": 1). The launcher this delegates to
+# defaults EVAL_N_SAMPLES to 16, and the analyzer keeps one trajectory per
+# sample, so inheriting that default would cost 16x and silently report one
+# arbitrary rollout out of sixteen instead of a single-attempt score.
+export EVAL_N_SAMPLES="${EVAL_N_SAMPLES:-1}"
+export N_SAMPLES="${N_SAMPLES:-1}"
+
 # Nothing is trained, so keeping checkpoints only risks filling a directory the
 # evaluating user may not even be able to write to.
 export MAX_CKPT_KEEP="${MAX_CKPT_KEEP:-0}"
 
+# grep -c counts non-empty lines, so a JSONL without a trailing newline is not
+# undercounted the way wc -l would undercount it.
+PROMPT_COUNT="$(grep -c '[^[:space:]]' "${ROLLOUT_PROMPT_DATA}" || true)"
+
 echo "[INFO] checkpoint    ${HF_CKPT}"
-echo "[INFO] prompt data   ${ROLLOUT_PROMPT_DATA} ($(wc -l < "${ROLLOUT_PROMPT_DATA}") samples)"
+echo "[INFO] prompt data   ${ROLLOUT_PROMPT_DATA} (${PROMPT_COUNT} samples)"
 echo "[INFO] entrypoint    ${SLIME_ENTRYPOINT}"
 echo "[INFO] concurrency   ${CONCURRENCY}"
+echo "[INFO] rollouts/prompt ${EVAL_N_SAMPLES}"
 echo "[INFO] env server    ${ENV_SERVER_URL}"
 
 if [[ "${DRY_RUN:-0}" == "1" ]]; then

@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import csv
 import json
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -40,7 +41,8 @@ def golden_summary() -> dict[str, object]:
     return json.loads(GOLDEN_SUMMARY.read_text(encoding="utf-8"))
 
 
-def test_golden_fixture_covers_the_whole_dataset(golden_rows, golden_summary):
+def test_golden_fixture_is_intact(golden_rows, golden_summary):
+    """Fixture integrity only. Asserts nothing about the analyzer."""
     assert len(golden_rows) == golden_summary["dataset_total"] == 1356
 
 
@@ -83,15 +85,29 @@ def test_summarize_reproduces_the_headline_baseline(golden_rows):
     assert round(summary["exact_pass_rate_all_dataset_missing_as_zero"], 4) == 0.2161
 
 
-def test_summarize_reproduces_published_distributions(golden_rows, golden_summary):
-    summary = analyzer.summarize(golden_rows)
-    assert summary["status_counts"] == golden_summary["status_counts"]
-    assert summary["raw_score_distribution"] == golden_summary["raw_score_distribution"]
+@pytest.mark.parametrize(
+    "key",
+    [
+        "status_counts",
+        "raw_score_distribution",
+        "run_counts",
+        "turns",
+        "tool_calls",
+        "input_tokens",
+        "output_tokens",
+    ],
+)
+def test_summarize_reproduces_published_distributions(golden_rows, golden_summary, key):
+    assert analyzer.summarize(golden_rows)[key] == golden_summary[key]
 
 
-def test_exact_pass_is_stricter_than_nonzero(golden_summary):
+def test_exact_pass_is_stricter_than_nonzero(golden_rows, golden_summary):
     """Partial verifier credit must not be counted as solving the task."""
-    assert golden_summary["exact_pass_count"] < golden_summary["nonzero_score_count"]
+    summary = analyzer.summarize(golden_rows)
+    assert summary["exact_pass_count"] < summary["nonzero_score_count"]
+    assert summary["exact_pass_count"] == golden_summary["exact_pass_count"]
+    # 0.5 scored a partial pass in this run and must not be an exact pass.
+    assert golden_summary["raw_score_distribution"]["0.5"] > 0
 
 
 def test_dataset_sample_index_is_the_line_number():
@@ -172,6 +188,29 @@ def test_later_runs_win_so_retries_replace_the_original_attempt():
         [_index_row(0, "main", 0, 0.0), _index_row(0, "supp1", 1, 1.0)],
     )
     assert [(r["run_label"], r["raw_score"], r["exact_pass"]) for r in merged] == [("supp1", 1.0, 1)]
+
+
+def test_an_unscored_retry_does_not_displace_a_scored_attempt():
+    """Otherwise the sample is neither scored, nor missing, nor re-queued."""
+    unscored = _index_row(0, "supp1", 1, 0.0)
+    unscored.raw_score = None
+    unscored.status = "FAILED"
+    merged = analyzer.merge([_sample(0)], [_index_row(0, "main", 0, 1.0), unscored])
+
+    assert [(r["run_label"], r["raw_score"]) for r in merged] == [("main", 1.0)]
+    summary = analyzer.summarize(merged)
+    assert summary["scored_count"] == 1
+    assert summary["raw_score_mean_all_dataset_missing_as_zero"] == 1.0
+
+
+def test_scored_count_exposes_a_present_row_that_carries_no_score():
+    """result_count and the *_completed_rows denominator are not the same set."""
+    unscored = _index_row(0, "main", 0, 0.0)
+    unscored.raw_score = None
+    summary = analyzer.summarize(analyzer.merge([_sample(0)], [unscored]))
+    assert summary["result_count"] == 1
+    assert summary["scored_count"] == 0
+    assert summary["missing_count"] == 0
 
 
 def test_samples_with_no_trajectory_are_missing_and_score_zero():
@@ -288,8 +327,27 @@ def test_driver_script_parses_and_is_executable():
     assert script.stat().st_mode & 0o111, "run_seta_env_eval.sh is not executable"
 
 
+def _driver_defaults() -> dict[str, str]:
+    """Parse `export NAME="${NAME:-value}"` defaults out of the driver script."""
+    source = (TERMINAL_RL / "scripts" / "run_seta_env_eval.sh").read_text(encoding="utf-8")
+    return dict(re.findall(r'export (\w+)="\$\{\1:-([^}]*)\}"', source))
+
+
 def test_driver_script_disables_checkpoint_writing_by_default():
     """Nothing is trained, and the default checkpoint dir may not be writable."""
-    script = (TERMINAL_RL / "scripts" / "run_seta_env_eval.sh").read_text()
-    assert 'MAX_CKPT_KEEP="${MAX_CKPT_KEEP:-0}"' in script
-    assert "eval_only.py" in script
+    assert _driver_defaults()["MAX_CKPT_KEEP"] == "0"
+    assert "eval_only.py" in (TERMINAL_RL / "scripts" / "run_seta_env_eval.sh").read_text()
+
+
+def test_driver_script_pins_one_rollout_per_prompt():
+    """The launcher this delegates to defaults EVAL_N_SAMPLES to 16.
+
+    The published baseline ran n_samples=1, and the analyzer keeps one trajectory
+    per sample, so inheriting 16 would cost 16x and report one arbitrary rollout
+    out of sixteen. Guard the override rather than the comment explaining it.
+    """
+    launcher = (TERMINAL_RL / "terminal-rl_qwen3-8b_mixed_dapo_nodynamic_pu.sh").read_text()
+    assert 'EVAL_N_SAMPLES="${EVAL_N_SAMPLES:-16}"' in launcher, (
+        "the downstream default changed; re-check what this driver must override"
+    )
+    assert _driver_defaults()["EVAL_N_SAMPLES"] == "1"

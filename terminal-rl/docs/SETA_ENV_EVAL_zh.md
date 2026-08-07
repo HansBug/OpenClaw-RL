@@ -30,7 +30,7 @@ CONCURRENCY=16 \
 bash terminal-rl/scripts/run_seta_env_eval.sh
 ```
 
-驱动脚本把 `SLIME_ENTRYPOINT` 指向 `slime/eval_only.py`，这是它成为只读评测而不是训练的原因；同时把 `MAX_CKPT_KEEP` 设为 0，因为没有东西需要保存，而默认检查点目录对评测用户未必可写。想先看解析出来的配置而不真的启动，加 `DRY_RUN=1`。
+驱动脚本把 `SLIME_ENTRYPOINT` 指向 `slime/eval_only.py`，这是它成为只读评测而不是训练的原因；把 `MAX_CKPT_KEEP` 设为 0，因为没有东西需要保存，而默认检查点目录对评测用户未必可写；把 `EVAL_N_SAMPLES` 设为 1，因为它委托到的启动脚本默认是 16，而已发布基线跑的是每条 prompt 一次推演（`run_config.json` 里 `n_samples: 1`）。最后这条不能省：分析脚本对每条样本只保留一条轨迹，继承 16 会让成本涨 16 倍，而且报出来的不再是单次尝试的分数，而是十六次里被最后读到的那一次。想先看解析出来的配置而不真的启动，加 `DRY_RUN=1`。
 
 第二步，分析并导出补跑清单。
 
@@ -99,8 +99,10 @@ python terminal-rl/scripts/analyze_seta_env_eval.py \
 
 `analyze_seta_env_eval.py` 是按 issue #33 审计包的输出格式重写的，不是当时那份脚本的副本。它与已发布结果的一致性有四条可复核的证据。审计包 `seta_qwen3_8b_base_core_audit_20260709_101409.tar.gz` 的 SHA256 为 `889f634decddfb681c1cc8b2c52b1c5dbad005313abb218812120893093ce110`，与 issue 正文记录一致。聚合层在 `tests/test_analyze_seta_env_eval.py` 里针对该审计包的 1356 行 `per_sample.csv` 运行，复现出全部计数与比率，浮点求和顺序造成的末位差异在 1e-12 相对容差内。逐轨迹派生量（轮数、工具调用数、解析错误轮数、输入输出 token）在审计包附带的 60 条真实轨迹上逐字段零误差。失败事件解析在三个轮次的日志上解析出 114 个唯一 uid，与已发布的 `failure_events.csv` 的 uid 集合完全相同。
 
-需要说明清楚的边界：`per_sample.csv` 的列顺序和 `summary.json` 的键顺序按本脚本的定义生成，与当时那份产物不保证逐字节相同；对齐的是数值与语义，不是文件格式。
+四条里只有第二条在仓库内可重跑：`tests/test_analyze_seta_env_eval.py` 用提交进 `tests/data/` 的精简夹具覆盖它。第一、三、四条需要完整的 3.6 MB 审计包，重跑脚本与全部原始输出放在审计 gist：https://gist.github.com/HansBug/aaaa08f8ced69faad5b6d2dd591af6b7 。
+
+需要说明清楚的边界：`per_sample.csv` 的列顺序和 `summary.json` 的键顺序按本脚本的定义生成，与当时那份产物不保证逐字节相同；对齐的是数值与语义，不是文件格式。本脚本的 `summary.json` 比当时那份多一个 `scored_count` 字段，它是所有 `*_completed_rows` 比率的真实分母；正常运行中它等于 `result_count`，只有当某条样本有轨迹却没有 `raw_score` 时才会小于后者，这时两个数必须能被分辨开。
 
 ## 7. 复现已发布基线所需的外部条件
 
-内网端点需要同一内网的环境路由与 Docker worker 服务才能复现。已发布运行使用 4 张 H200、TP=4，评测温度 1，最大响应长度 8192，最大上下文 16384，观测到的最大轮数为 10。这些参数由 `configs/rollout_qwen3_think.yaml` 与启动脚本决定，改动它们会让结果不再与上表同口径。
+内网端点需要同一内网的环境路由与 Docker worker 服务才能复现。已发布运行使用 4 张 H200、TP=4，评测温度 1，最大响应长度 8192，最大上下文 16384，每条 prompt 一次推演（`n_samples: 1`），观测到的最大轮数为 10。这些参数由 `configs/rollout_qwen3_think.yaml`、启动脚本和 `EVAL_N_SAMPLES` 决定，改动它们会让结果不再与上表同口径。

@@ -47,13 +47,20 @@ def render(summary: dict[str, Any], mode: str, out_path: Path) -> None:
     scored = sum(counts)
     zero = distribution.get("0.0", 0)
     exact = distribution.get("1.0", 0)
-    missing = summary["dataset_total"] - scored
+    # missing_count is authoritative; it counts samples with no result at all,
+    # which is not always dataset_total minus the scored histogram.
+    missing = summary["missing_count"]
 
     ax_scores.set_facecolor(theme["surface"])
     bars = ax_scores.bar(range(len(keys)), counts, color=theme["accent"], width=0.72, zorder=2)
-    # The two ends carry the headline: no credit at all, versus every check passed.
-    bars[0].set_color(theme["muted"])
-    bars[-1].set_color(theme["highlight"])
+    # Highlight the two ends by value, not by position: a run whose distribution
+    # happens to lack a 0.0 or 1.0 bucket must not get its lowest partial-credit
+    # bar painted as "no credit".
+    for bar, key in zip(bars, keys):
+        if float(key) == 0.0:
+            bar.set_color(theme["muted"])
+        elif float(key) == 1.0:
+            bar.set_color(theme["highlight"])
     for position, count in enumerate(counts):
         if count >= 40:
             ax_scores.text(position, count + 8, str(count), ha="center", va="bottom",

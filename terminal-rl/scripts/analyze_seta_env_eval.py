@@ -138,7 +138,14 @@ def _as_float(value: Any) -> float | None:
 
 def _as_int(value: Any) -> int | None:
     number = _as_float(value)
-    return None if number is None else int(number)
+    if number is None:
+        return None
+    try:
+        return int(number)
+    except (OverflowError, ValueError):
+        # NaN and infinity reach here; treat them like any other unusable value
+        # rather than aborting a whole run on one malformed meta.json.
+        return None
 
 
 def read_dataset(path: Path) -> list[DatasetSample]:
@@ -260,11 +267,25 @@ def read_failure_events(log_path: Path, run_label: str) -> list[FailureEvent]:
 
 
 def merge(dataset: Sequence[DatasetSample], index_rows: Iterable[IndexRow]) -> list[dict[str, Any]]:
-    """One row per dataset sample; the highest run_order that produced a result wins."""
+    """One row per dataset sample; the highest run_order that produced a score wins.
+
+    "Produced a score" matters: a retry that itself failed to reach the verifier
+    must not displace an earlier scored attempt, or the sample would be reported
+    as present-but-unscored -- neither counted in the mean nor listed as missing
+    nor re-queued by :func:`write_supplement_jsonl`.
+    """
     best: dict[int, IndexRow] = {}
     for row in index_rows:
         current = best.get(row.sample_index)
-        if current is None or row.run_order >= current.run_order:
+        if current is None:
+            best[row.sample_index] = row
+            continue
+        if current.raw_score is not None and row.raw_score is None:
+            continue
+        if row.raw_score is not None and current.raw_score is None:
+            best[row.sample_index] = row
+            continue
+        if row.run_order >= current.run_order:
             best[row.sample_index] = row
 
     per_sample: list[dict[str, Any]] = []
@@ -378,6 +399,10 @@ def summarize(
         "dataset_total": total,
         "result_count": len(present),
         "missing_count": total - len(present),
+        # Denominator of every *_completed_rows rate. Equal to result_count in a
+        # healthy run; smaller if a present row somehow carries no raw_score, and
+        # the two must be visibly distinct when that happens.
+        "scored_count": len(scores),
         "raw_score_sum_completed_rows": score_sum,
         "raw_score_mean_completed_rows": (score_sum / len(scores)) if scores else None,
         "raw_score_mean_all_dataset_missing_as_zero": (score_sum / total) if total else None,
@@ -507,7 +532,10 @@ def write_supplement_jsonl(
             if not line or line_no not in missing:
                 continue
             record = json.loads(line)
-            record.setdefault("metadata", {})["supplement_sample_index"] = line_no
+            # setdefault is not enough: the key may be present but null.
+            if not isinstance(record.get("metadata"), dict):
+                record["metadata"] = {}
+            record["metadata"]["supplement_sample_index"] = line_no
             dst.write(json.dumps(record, ensure_ascii=False) + "\n")
             written += 1
     return written
@@ -563,12 +591,19 @@ def main(argv: Sequence[str] | None = None) -> int:
         print(f"supplement rows         {written} -> {args.supplement_out}")
 
     summary = analysis.summary
+
+    def _rate(key: str) -> str:
+        # None whenever the dataset is empty; formatting it would crash.
+        value = summary[key]
+        return "n/a" if value is None else f"{value:.6f}"
+
     print(f"dataset_total            {summary['dataset_total']}")
     print(f"result_count             {summary['result_count']}")
+    print(f"scored_count             {summary['scored_count']}")
     print(f"missing_count            {summary['missing_count']}")
-    print(f"raw_score mean (all)     {summary['raw_score_mean_all_dataset_missing_as_zero']:.6f}")
+    print(f"raw_score mean (all)     {_rate('raw_score_mean_all_dataset_missing_as_zero')}")
     print(f"exact_pass (all)         {summary['exact_pass_count']} "
-          f"({summary['exact_pass_rate_all_dataset_missing_as_zero']:.6f})")
+          f"({_rate('exact_pass_rate_all_dataset_missing_as_zero')})")
     print(f"status_counts            {summary['status_counts']}")
     print(f"outputs                  {args.out}")
     return 0
