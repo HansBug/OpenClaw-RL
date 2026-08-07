@@ -144,27 +144,31 @@ tmux send-keys -t "$TARGET_PANE" "export TBV21_GPU_IDS=0,1,2,3 TBV21_FULL_EVAL_C
 tmux send-keys -t "$TARGET_PANE" "bash bin/run_full_eval_qwen3_8b.sh" C-m
 ```
 
-启动后 10 秒内必须确认 `logs/${JOB}.log` 已生成且非空，否则说明 tmux target 写错了，实际没跑起来。脚本名里的 `qwen3_8b` 是历史命名，它读的是 `TBV21_MODEL_NAME` 和 `TBV21_MODEL_PATH`，换模型不需要改脚本名。脚本在调用 Harbor 之前会自检 config，必须看到 `[OK] Harbor config has proxy env, noninteractive apt env, and model_info`；自检失败时修 config 生成逻辑，不要手工绕过去直接起 Harbor。
+启动后 10 秒内必须确认 `logs/${TBV21_FULL_EVAL_JOB_NAME}.log` 已生成且非空，否则说明 tmux target 写错了，实际没跑起来。脚本名里的 `qwen3_8b` 是历史命名，它读的是 `TBV21_MODEL_NAME` 和 `TBV21_MODEL_PATH`，换模型不需要改脚本名。脚本在调用 Harbor 之前会自检 config，必须看到 `[OK] Harbor config has proxy env, noninteractive apt env, and model_info`；自检失败时修 config 生成逻辑，不要手工绕过去直接起 Harbor。
 
 监控每 5 分钟轮询一次，同时看四样东西：job 进度、`docker ps` 的活跃容器、Harbor 主日志尾部、SGLang 探活。job 进度用 [`../eval/mode_b_aligned/harbor_job_report.py`](../eval/mode_b_aligned/harbor_job_report.py)，它解析 job 目录并在 `finished_at` 出现后退出，不需要每次现写解析代码。
 
+整段包在子 shell 里：`:?` 只在非交互 shell 中会终止进程，而这份手册是拿来粘贴到交互 shell 的，不包起来的话变量为空时它只打印一行警告然后照跑，`jobs/${JOB}` 会塌成 `jobs/` —— 那是个真实存在的目录，于是每 5 分钟稳定报出一个看似合理的错误分数。
+
 ```bash
-# 从 $TBV21_HOME 里跑。JOB 必须来自启动 eval 的那个 shell（见上一段的 export），
-# 空值会让 jobs/${JOB} 塌成 jobs/ 并报出一个看似合理的错误分数。
-: "${TBV21_FULL_EVAL_JOB_NAME:?先在本 shell export TBV21_FULL_EVAL_JOB_NAME}"
-JOB="${TBV21_FULL_EVAL_JOB_NAME}"
+# 从 $TBV21_HOME 里跑。JOB 必须来自启动 eval 的那个 shell（见上一段的 export）。
 REPO=/path/to/OpenClaw-RL   # OpenClaw-RL checkout，与 bundle 是两个目录
 
-python "${REPO}/terminal-rl/eval/mode_b_aligned/harbor_job_report.py" \
-  "jobs/${JOB}" --watch --interval 300 &
+(
+  set -u
+  JOB="${TBV21_FULL_EVAL_JOB_NAME:?先在本 shell export TBV21_FULL_EVAL_JOB_NAME}"
 
-while sleep 300; do
-  docker ps --format '{{.Names}} {{.Status}} {{.Image}}'
-  tail -n 5 "logs/${JOB}.log"
-  curl --noproxy '*' -fsS --max-time 5 \
-    "http://${TBV21_SGLANG_HOST}:${TBV21_SGLANG_PORT}/v1/models" >/dev/null \
-    && echo 'sglang: ok' || echo 'sglang: BAD'
-done
+  python "${REPO}/terminal-rl/eval/mode_b_aligned/harbor_job_report.py" \
+    "jobs/${JOB}" --watch --interval 300 &
+
+  while sleep 300; do
+    docker ps --format '{{.Names}} {{.Status}} {{.Image}}'
+    tail -n 5 "logs/${JOB}.log"
+    curl --noproxy '*' -fsS --max-time 5 \
+      "http://${TBV21_SGLANG_HOST}:${TBV21_SGLANG_PORT}/v1/models" >/dev/null \
+      && echo 'sglang: ok' || echo 'sglang: BAD'
+  done
+)
 ```
 
 正常推进的表现是已完成数持续增加，或当前容器的运行时长还没超过该 task 的 timeout；`docker ps` 里有一两个 task 容器且名字随任务完成不断更换；`AgentTimeoutError` 计数增加但新任务继续启动。
@@ -176,8 +180,13 @@ done
 Harbor 的聚合分数分母是 `n_total_trials`，报告时统一用这个口径。只对带 `reward` 字段的结果求均值会把"没跑到 verifier 就报错"的 trial 移出分母，从而高估分数；同一个脚本把两个数一起打出来，就是为了让这个差距无处可藏。
 
 ```bash
-python "${REPO}/terminal-rl/eval/mode_b_aligned/harbor_job_report.py" "jobs/${JOB}"
-python "${REPO}/terminal-rl/eval/mode_b_aligned/harbor_job_report.py" "jobs/${JOB}" --json
+(
+  set -u
+  JOB="${TBV21_FULL_EVAL_JOB_NAME:?先在本 shell export TBV21_FULL_EVAL_JOB_NAME}"
+  REPORT="${REPO:?先设 REPO 指向 OpenClaw-RL checkout}/terminal-rl/eval/mode_b_aligned/harbor_job_report.py"
+  python "$REPORT" "jobs/${JOB}"
+  python "$REPORT" "jobs/${JOB}" --json
+)
 ```
 
 验证运行的实际输出：
