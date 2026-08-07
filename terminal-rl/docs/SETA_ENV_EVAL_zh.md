@@ -88,6 +88,13 @@ python terminal-rl/scripts/analyze_seta_env_eval.py \
 | 状态分布 | COMPLETED 737、TRUNCATED 544、FAILED 73、MISSING 2 |
 | 失败事件 | 114，全部为 `HTTPStatusError` |
 
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="assets/seta_env_eval/seta_env_baseline_20260709_dark.png">
+  <img alt="Qwen3-8B 基线在 SETA-env 上的 raw_score 分布与终止状态分布" src="assets/seta_env_eval/seta_env_baseline_20260709_light.png">
+</picture>
+
+左图是为什么必须区分两个指标：`raw_score` 呈明显的双峰，582 条一分未得、293 条满分，中间 479 条拿到部分分数。只看均值 38.77% 会把这三群混成一个数。右图是为什么不能用状态代替准确率：TRUNCATED 有 544 条，但其中不乏 `raw_score = 1.0` 的样本。两张图都由 `scripts/plot_seta_env_eval.py` 从 `summary.json` 生成，换一次运行重跑即可。
+
 ## 6. 这套脚本与已发布结果的关系
 
 `analyze_seta_env_eval.py` 是按 issue #33 审计包的输出格式重写的，不是当时那份脚本的副本。它与已发布结果的一致性有四条可复核的证据。审计包 `seta_qwen3_8b_base_core_audit_20260709_101409.tar.gz` 的 SHA256 为 `889f634decddfb681c1cc8b2c52b1c5dbad005313abb218812120893093ce110`，与 issue 正文记录一致。聚合层在 `tests/test_analyze_seta_env_eval.py` 里针对该审计包的 1356 行 `per_sample.csv` 运行，复现出全部计数与比率，浮点求和顺序造成的末位差异在 1e-12 相对容差内。逐轨迹派生量（轮数、工具调用数、解析错误轮数、输入输出 token）在审计包附带的 60 条真实轨迹上逐字段零误差。失败事件解析在三个轮次的日志上解析出 114 个唯一 uid，与已发布的 `failure_events.csv` 的 uid 集合完全相同。
