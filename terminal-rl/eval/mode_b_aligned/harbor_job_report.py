@@ -98,6 +98,16 @@ class JobReport:
         }
 
 
+def _as_reward(value: Any) -> float | None:
+    """A malformed reward must not abort a report the way a malformed file must not."""
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
 def _read_json(path: Path) -> dict[str, Any]:
     try:
         return json.loads(path.read_text(encoding="utf-8"))
@@ -119,7 +129,7 @@ def read_job(job_dir: Path) -> JobReport:
         trials.append(
             Trial(
                 name=trial_result.parent.name,
-                reward=rewards.get("reward"),
+                reward=_as_reward(rewards.get("reward")),
                 exception_type=exception.get("exception_type"),
                 exception_message=str(exception.get("exception_message") or ""),
             )
@@ -169,7 +179,10 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument("job_dir", type=Path, help="Harbor job directory")
     parser.add_argument("--watch", action="store_true", help="poll until finished_at is set")
-    parser.add_argument("--interval", type=float, default=300.0, help="seconds between polls")
+    parser.add_argument(
+        "--interval", type=float, default=300.0,
+        help="seconds between polls; floored at 0.1 so a typo cannot busy-loop the job dir",
+    )
     parser.add_argument("--max-polls", type=int, help="stop after this many polls (for testing)")
     parser.add_argument("--json", action="store_true", dest="as_json", help="emit JSON")
     args = parser.parse_args(argv)
@@ -179,7 +192,9 @@ def main(argv: list[str] | None = None) -> int:
         report = read_job(args.job_dir)
         polls += 1
         if args.as_json:
-            print(json.dumps(report.to_dict(), indent=2, ensure_ascii=False))
+            # One document per line while watching, so the stream stays parseable.
+            print(json.dumps(report.to_dict(), ensure_ascii=False,
+                             indent=None if args.watch else 2))
         else:
             print(f"=== poll {polls} {time.strftime('%F %T')} ===" if args.watch else "", end="")
             print("\n" if args.watch else "", end="")
@@ -188,9 +203,9 @@ def main(argv: list[str] | None = None) -> int:
             break
         if args.max_polls is not None and polls >= args.max_polls:
             break
-        time.sleep(args.interval)
+        time.sleep(max(args.interval, 0.1))
 
-    return 0 if read_job(args.job_dir).is_finished or not args.watch else 1
+    return 0 if report.is_finished or not args.watch else 1
 
 
 if __name__ == "__main__":

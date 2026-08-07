@@ -43,7 +43,7 @@ TBv2.1 的任务会在运行中访问公网或内网镜像源，处理方式是�
 代理相关的变量优先级是：当前 shell 已有的 `HTTP_PROXY` 优先于 `TBV21_PROXY_URL`，后者再优先于内置默认值。换 worker 或换代理时显式设置后重新 source：
 
 ```bash
-export TBV21_PROXY_URL=http://<proxy-host>:<port>
+export TBV21_PROXY_URL="http://PROXY_HOST:PORT"   # 换成本 worker 可用的代理
 export HTTP_PROXY="$TBV21_PROXY_URL"
 export HTTPS_PROXY="$TBV21_PROXY_URL"
 export http_proxy="$HTTP_PROXY"
@@ -69,6 +69,7 @@ test "$(find "$TBV21_TASKS_DIR" -mindepth 1 -maxdepth 1 -type d | wc -l)" = 89
 for p in bin/harbor bin/python_sglang bin/setup_worker_rootless_docker.sh \
          bin/use_worker_rootless_docker.sh bin/prepull_tbv21_images.sh \
          bin/start_sglang.sh bin/run_full_eval_qwen3_8b.sh \
+         bin/run_one_task_eval_qwen3_8b.sh \
          runtime/tmux_runtime/bin/tmux runtime/tools/bin/uv \
          docker-cli-plugins/docker-compose; do
   test -x "$p" || { echo "[MISS] $p" >&2; exit 1; }
@@ -146,9 +147,11 @@ tmux send-keys -t "$TARGET_PANE" "bash bin/run_full_eval_qwen3_8b.sh" C-m
 监控每 5 分钟轮询一次，同时看四样东西：job 进度、`docker ps` 的活跃容器、Harbor 主日志尾部、SGLang 探活。job 进度用 [`../eval/mode_b_aligned/harbor_job_report.py`](../eval/mode_b_aligned/harbor_job_report.py)，它解析 job 目录并在 `finished_at` 出现后退出，不需要每次现写解析代码。
 
 ```bash
-JOB=<你设置的 TBV21_FULL_EVAL_JOB_NAME>
+# 从 $TBV21_HOME 里跑；REPO 是 OpenClaw-RL checkout，与 bundle 是两个目录
+JOB="${TBV21_FULL_EVAL_JOB_NAME}"
+REPO=/path/to/OpenClaw-RL
 
-python terminal-rl/eval/mode_b_aligned/harbor_job_report.py \
+python "${REPO}/terminal-rl/eval/mode_b_aligned/harbor_job_report.py" \
   "jobs/${JOB}" --watch --interval 300 &
 
 while sleep 300; do
@@ -169,8 +172,8 @@ done
 Harbor 的聚合分数分母是 `n_total_trials`，报告时统一用这个口径。只对带 `reward` 字段的结果求均值会把"没跑到 verifier 就报错"的 trial 移出分母，从而高估分数；同一个脚本把两个数一起打出来，就是为了让这个差距无处可藏。
 
 ```bash
-python terminal-rl/eval/mode_b_aligned/harbor_job_report.py "jobs/${JOB}"
-python terminal-rl/eval/mode_b_aligned/harbor_job_report.py "jobs/${JOB}" --json   # 便于入库
+python "${REPO}/terminal-rl/eval/mode_b_aligned/harbor_job_report.py" "jobs/${JOB}"
+python "${REPO}/terminal-rl/eval/mode_b_aligned/harbor_job_report.py" "jobs/${JOB}" --json
 ```
 
 验证运行的实际输出：

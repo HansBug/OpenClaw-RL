@@ -240,11 +240,11 @@ def test_job_report_denominator_is_every_intended_trial(recorded_tbv21_job):
     assert report.score < report.score_over_rewarded_only
 
 
-def test_job_report_names_both_denominators_in_its_output(recorded_tbv21_job):
-    """The inflated number must never appear without the reporting one beside it."""
+def test_job_report_attaches_each_label_to_the_right_number(recorded_tbv21_job):
+    """Binding matters: marking 2.0/88 as the one to report would be the bug."""
     text = harbor_job_report.format_report(harbor_job_report.read_job(recorded_tbv21_job))
-    assert "2.0 / 89" in text
-    assert "report this one" in text
+    assert "2.0 / 89 = 0.0224719101   <- report this one" in text
+    assert "over the 88 trials that reached the verifier: 0.0227272727" in text
     assert "not the reporting number" in text
 
 
@@ -275,6 +275,38 @@ def test_job_report_survives_a_half_written_trial_result(tmp_path):
 def test_job_report_cli_watch_stops_once_the_job_is_finished(recorded_tbv21_job, capsys):
     assert harbor_job_report.main([str(recorded_tbv21_job), "--watch", "--interval", "0"]) == 0
     assert "poll 1" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("reward", ["1.0", None, True, [], {"a": 1}, float("nan")])
+def test_job_report_tolerates_a_malformed_reward(tmp_path, reward):
+    """The reader is hardened against junk files; a junk value must not crash it."""
+    job = tmp_path / "job"
+    (job / "t0").mkdir(parents=True)
+    (job / "result.json").write_text(json.dumps({"n_total_trials": 1}), encoding="utf-8")
+    (job / "t0" / "result.json").write_text(
+        json.dumps({"verifier_result": {"rewards": {"reward": reward}}}), encoding="utf-8"
+    )
+    report = harbor_job_report.read_job(job)
+    assert isinstance(report.reward_sum, float)
+    harbor_job_report.format_report(report)
+
+
+def test_job_report_watch_that_hits_its_poll_cap_exits_nonzero(tmp_path):
+    """An unfinished job must not report success just because polling stopped."""
+    job = _write_harbor_job(
+        tmp_path, n_total_trials=2, solved=[], zero_reward=1, timeouts=0, no_reward=0,
+        finished=False,
+    )
+    assert harbor_job_report.main(
+        [str(job), "--watch", "--interval", "0", "--max-polls", "2"]
+    ) == 1
+
+
+def test_job_report_watch_json_stays_parseable_line_by_line(recorded_tbv21_job, capsys):
+    """Several indented documents concatenated would not parse."""
+    harbor_job_report.main([str(recorded_tbv21_job), "--watch", "--interval", "0", "--json"])
+    lines = [line for line in capsys.readouterr().out.splitlines() if line.strip()]
+    assert lines and all(json.loads(line)["is_finished"] for line in lines)
 
 
 def test_job_report_cli_emits_json(recorded_tbv21_job, capsys):
