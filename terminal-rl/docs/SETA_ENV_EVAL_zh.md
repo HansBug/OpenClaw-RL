@@ -64,7 +64,34 @@ python terminal-rl/scripts/analyze_seta_env_eval.py \
   --out runs/<main-run-dir>/final_analysis
 ```
 
-## 4. 产物
+## 4. 跨 checkpoint 比较
+
+benchmark 表按 checkpoint 一行一行填时，最容易犯的错是把 21.61% 和 23.60% 读成"提升了两个点"。`exact_pass` 是 1356 条上的二项计数，两个 checkpoint 到底能不能分开是有答案的，而在这个样本量下答案通常是不能。`scripts/compare_seta_env_evals.py` 吃多个 `summary.json`，每个比率都带 Wilson 95% 区间，并直接点名哪些配对的区间重叠。
+
+```bash
+python terminal-rl/scripts/compare_seta_env_evals.py \
+  qwen3-8b-base=runs/<run-a>/final_analysis/summary.json \
+  rl-iter499=runs/<run-b>/final_analysis/summary.json \
+  rl-iter399=runs/<run-c>/final_analysis/summary.json
+```
+
+输出形如：
+
+```text
+run                n  miss  raw_score  exact_pass     rate         Wilson 95%
+qwen3-8b-base   1356     2     38.77%         293   21.61%   19.50% -  23.88%
+rl-iter499      1356     0     42.48%         320   23.60%   21.42% -  25.93%
+rl-iter399      1356     0     46.73%         352   25.96%   23.70% -  28.36%
+
+exact-pass intervals overlap, so these pairs are not separable here:
+  qwen3-8b-base vs rl-iter499   delta +1.99 pp
+  qwen3-8b-base vs rl-iter399   delta +4.35 pp
+  rl-iter499 vs rl-iter399   delta +2.36 pp
+```
+
+上面第二、三行是构造出来演示读法的，不是实测结果；只有 `qwen3-8b-base` 那一行是 issue #33 的真实数据。可以看到即便点估计差了 4.35 个百分点，区间仍然重叠。区间重叠不是"无差异"的正式检验，只是一个廉价信号，说明这个差距落在采样噪声范围内；结论依赖它时应改用两比例检验。
+
+## 5. 产物
 
 | 文件 | 内容 |
 |---|---|
@@ -74,7 +101,7 @@ python terminal-rl/scripts/analyze_seta_env_eval.py \
 | `status_counts.csv` | 状态分布及占数据集比例 |
 | `failure_events.csv` | 从训练日志解析出的 `Generate failed` 事件，按轮次内的单次推演去重，不是一次重试一行 |
 
-## 5. 基线数字
+## 6. 基线数字
 
 以下来自 [issue #33](https://github.com/HansBug/OpenClaw-RL/issues/33)，被测对象是未经任何 RL 训练的 Qwen3-8B 原始基线。
 
@@ -95,7 +122,7 @@ python terminal-rl/scripts/analyze_seta_env_eval.py \
 
 左图是为什么必须区分两个指标：`raw_score` 呈明显的双峰，582 条一分未得、293 条满分，中间 479 条拿到部分分数。只看均值 38.77% 会把这三群混成一个数。右图是为什么不能用状态代替准确率：TRUNCATED 有 544 条，但其中不乏 `raw_score = 1.0` 的样本。两张图都由 `scripts/plot_seta_env_eval.py` 从 `summary.json` 生成，换一次运行重跑即可。
 
-## 6. 这套脚本与已发布结果的关系
+## 7. 这套脚本与已发布结果的关系
 
 `analyze_seta_env_eval.py` 是按 issue #33 审计包的输出格式重写的，不是当时那份脚本的副本。它与已发布结果的一致性有四条可复核的证据。审计包 `seta_qwen3_8b_base_core_audit_20260709_101409.tar.gz` 的 SHA256 为 `889f634decddfb681c1cc8b2c52b1c5dbad005313abb218812120893093ce110`，与 issue 正文记录一致。聚合层在 `tests/test_analyze_seta_env_eval.py` 里针对该审计包的 1356 行 `per_sample.csv` 运行，复现出全部计数与比率，浮点求和顺序造成的末位差异在 1e-12 相对容差内。逐轨迹派生量（轮数、工具调用数、解析错误轮数、输入输出 token）在审计包附带的 60 条真实轨迹上逐字段零误差。失败事件解析在三个轮次的日志上解析出 114 个唯一 uid，与已发布的 `failure_events.csv` 的 uid 集合完全相同。
 
@@ -103,6 +130,6 @@ python terminal-rl/scripts/analyze_seta_env_eval.py \
 
 需要说明清楚的边界：`per_sample.csv` 的列顺序和 `summary.json` 的键顺序按本脚本的定义生成，与当时那份产物不保证逐字节相同；对齐的是数值与语义，不是文件格式。本脚本的 `summary.json` 比当时那份多一个 `scored_count` 字段，它是所有 `*_completed_rows` 比率的真实分母；正常运行中它等于 `result_count`，只有当某条样本有轨迹却没有 `raw_score` 时才会小于后者，这时两个数必须能被分辨开。
 
-## 7. 复现已发布基线所需的外部条件
+## 8. 复现已发布基线所需的外部条件
 
 内网端点需要同一内网的环境路由与 Docker worker 服务才能复现。已发布运行使用 4 张 H200、TP=4，评测温度 1，最大响应长度 8192，最大上下文 16384，每条 prompt 一次推演（`n_samples: 1`），观测到的最大轮数为 10。这些参数由 `configs/rollout_qwen3_think.yaml`、启动脚本和 `EVAL_N_SAMPLES` 决定，改动它们会让结果不再与上表同口径。

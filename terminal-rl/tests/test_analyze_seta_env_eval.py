@@ -358,6 +358,96 @@ def test_driver_script_disables_checkpoint_writing_by_default():
     assert "eval_only.py" in (TERMINAL_RL / "scripts" / "run_seta_env_eval.sh").read_text()
 
 
+# --- cross-run comparison ----------------------------------------------------
+
+import compare_seta_env_evals as compare  # noqa: E402
+
+
+@pytest.mark.parametrize(
+    "successes, trials, low, high",
+    [
+        # The intervals published in issues #27/#28/#29, as printed there.
+        (5, 267, 0.80, 4.31),
+        (3, 89, 1.15, 9.45),
+        (6, 267, 1.03, 4.82),
+        (4, 89, 1.76, 10.99),
+        (5, 89, 2.42, 12.49),
+    ],
+)
+def test_wilson_interval_reproduces_published_intervals(successes, trials, low, high):
+    """A comparison tool must not draw intervals that disagree with the record."""
+    got_low, got_high = compare.wilson_interval(successes, trials)
+    assert round(got_low * 100, 2) == low
+    assert round(got_high * 100, 2) == high
+
+
+def test_comparison_reports_the_published_baseline(tmp_path):
+    out = tmp_path / "summary.json"
+    out.write_text(GOLDEN_SUMMARY.read_text(encoding="utf-8"), encoding="utf-8")
+    run = compare.load_run("baseline", out)
+    assert run.total == 1356
+    assert run.exact_pass == 293
+    assert round(run.exact_pass_rate * 100, 2) == 21.61
+    assert round(run.raw_score_mean * 100, 2) == 38.77
+    low, high = run.exact_pass_interval
+    assert low < run.exact_pass_rate < high
+
+
+def _summary(tmp_path, name: str, exact_pass: int, total: int = 1356) -> Path:
+    path = tmp_path / name
+    path.write_text(
+        json.dumps(
+            {
+                "dataset_total": total,
+                "exact_pass_count": exact_pass,
+                "nonzero_score_count": exact_pass,
+                "raw_score_mean_all_dataset_missing_as_zero": exact_pass / total,
+                "missing_count": 0,
+            }
+        ),
+        encoding="utf-8",
+    )
+    return path
+
+
+def test_a_small_gap_is_reported_as_not_separable(tmp_path):
+    """293 vs 320 out of 1356 is under 2 pp; the intervals still overlap."""
+    runs = [
+        compare.load_run("baseline", _summary(tmp_path, "a.json", 293)),
+        compare.load_run("rl", _summary(tmp_path, "b.json", 320)),
+    ]
+    assert compare.overlapping_pairs(runs)
+    text = compare.format_comparison(runs)
+    assert "not separable" in text
+    assert "+1.99 pp" in text
+
+
+def test_a_large_gap_is_reported_as_separable(tmp_path):
+    runs = [
+        compare.load_run("baseline", _summary(tmp_path, "a.json", 293)),
+        compare.load_run("much-better", _summary(tmp_path, "b.json", 700)),
+    ]
+    assert compare.overlapping_pairs(runs) == []
+    assert "every pair is separable" in compare.format_comparison(runs)
+
+
+def test_comparison_cli_emits_json(tmp_path, capsys):
+    args = [
+        f"baseline={_summary(tmp_path, 'a.json', 293)}",
+        f"rl={_summary(tmp_path, 'b.json', 320)}",
+        "--json",
+    ]
+    assert compare.main(args) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert [r["label"] for r in payload["runs"]] == ["baseline", "rl"]
+    assert payload["overlapping_pairs"] == [["baseline", "rl"]]
+
+
+def test_comparison_cli_rejects_a_missing_label(tmp_path):
+    with pytest.raises(SystemExit):
+        compare.main([str(_summary(tmp_path, "a.json", 293))])
+
+
 def test_driver_script_pins_one_rollout_per_prompt():
     """The launcher this delegates to defaults EVAL_N_SAMPLES to 16.
 
