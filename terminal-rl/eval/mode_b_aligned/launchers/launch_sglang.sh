@@ -15,7 +15,8 @@
 #   HOST=127.0.0.1  PORT=30000
 #   MEM_FRACTION=0.6     leaves ~40% of VRAM for the KV cache
 #   CONTEXT_LENGTH=40960
-#   RANDOM_SEED=1234     server-side seed; the adapter seeds sampling separately
+#   RANDOM_SEED=1234     the only seed in play: the adapter's rollout_seed is
+#                        recorded in trajectory metadata but never sent to SGLang
 #   CONDA_SH, CONDA_ENV  sourced/activated when both are set
 set -euo pipefail
 

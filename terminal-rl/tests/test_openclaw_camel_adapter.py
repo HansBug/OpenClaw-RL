@@ -78,7 +78,7 @@ def test_checkpoint_identity_kwargs_are_required(kwargs, missing):
 
 
 def test_aligned_knob_defaults_match_the_recorded_evals():
-    """Pins knobs 5-14 of the alignment table in docs/HARBOR_CAMEL_MODE_B_zh.md."""
+    """Pins knobs 5-13 of the alignment table in docs/HARBOR_CAMEL_MODE_B_zh.md."""
     agent = _agent()
     assert agent.max_iteration == 10
     assert agent.max_parse_errors == 3
@@ -88,9 +88,24 @@ def test_aligned_knob_defaults_match_the_recorded_evals():
     assert agent.max_new_tokens == 8192
     assert agent.max_total_tokens == 16384
     assert agent.rollout_skip_special_tokens is False
-    assert agent.rollout_seed == 42
     assert agent.tool_call_parser == "qwen25"
     assert agent.non_think_mode is False
+
+
+def test_sampling_params_carry_exactly_the_knobs_that_reach_sglang():
+    """rollout_seed is metadata only, so the payload must not imply seeded sampling.
+
+    top_k is omitted rather than sent as -1, matching the seven recorded evals.
+    """
+    params = _agent()._build_sampling_params()
+    assert params == {
+        "temperature": 1.0,
+        "top_p": 1.0,
+        "max_new_tokens": 8192,
+        "skip_special_tokens": False,
+    }
+    assert "seed" not in params
+    assert _agent(top_k=20)._build_sampling_params()["top_k"] == 20
 
 
 def test_sglang_url_is_normalised_to_the_generate_endpoint():

@@ -26,7 +26,8 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt  # noqa: E402
 from matplotlib.ticker import FuncFormatter  # noqa: E402
 
-# Validated categorical palette; see docs/HARBOR_CAMEL_MODE_B_zh.md.
+# Two-hue categorical palette, checked for colorblind separation and for >=3:1
+# contrast against each surface it is paired with.
 THEME = {
     "light": dict(surface="#fcfcfb", primary="#0b0b0b", secondary="#52514e",
                   grid="#e3e2dc", mode_a="#eb6834", mode_b="#2a78d6"),

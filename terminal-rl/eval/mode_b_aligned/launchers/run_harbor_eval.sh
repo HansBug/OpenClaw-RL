@@ -28,7 +28,9 @@ set -euo pipefail
 : "${DATASET_DIR:?DATASET_DIR is required (Terminal-Bench dataset root)}"
 
 JOBS_DIR="${JOBS_DIR:-./harbor_jobs}"
-JOB_NAME="${JOB_NAME:-modeB_${SERVED_NAME}_$(date -u +%Y%m%dT%H%M%SZ)}"
+# A served name may legitimately contain "/" (e.g. an org-prefixed name); leaving
+# it in would turn the job name into a path.
+JOB_NAME="${JOB_NAME:-modeB_${SERVED_NAME//[^A-Za-z0-9._-]/_}_$(date -u +%Y%m%dT%H%M%SZ)}"
 K="${K:-3}"
 N_CONCURRENT="${N_CONCURRENT:-4}"
 ENVIRONMENT="${ENVIRONMENT:-docker}"
