@@ -97,7 +97,7 @@ def test_aligned_knob_defaults_match_the_recorded_evals():
 def test_sampling_params_carry_exactly_the_knobs_that_reach_sglang():
     """rollout_seed is metadata only, so the payload must not imply seeded sampling.
 
-    top_k is omitted rather than sent as -1, matching the seven recorded evals.
+    top_k is omitted rather than sent as -1, matching the eight recorded evals.
     """
     params = _agent()._build_sampling_params()
     assert params == {
@@ -379,7 +379,7 @@ def test_eval_history_rows_match_the_documented_pass_at_1():
     """Keeps the figure's table and the doc's table from drifting apart."""
     documented = {
         "#21": (3, 267), "#22": (8, 267), "#24": (6, 267), "#25": (3, 267),
-        "#27": (5, 267), "#28": (6, 267), "#29": (5, 267),
+        "#27": (5, 267), "#28": (6, 267), "#29": (5, 267), "#31": (3, 267),
     }
     assert {e.issue: (e.successes, e.trials) for e in history_plot.EVALS} == documented
 

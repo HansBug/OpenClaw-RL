@@ -24,7 +24,7 @@ Harbor 自带的 `terminus-2` agent 与 terminal-rl 训练侧的 `CamelAgent` �
 | 12 | `tool_call_parser` | Harbor 内建 | `qwen25` | `SGLangTurnClient(tool_call_parser='qwen25')` |
 | 13 | `non_think_mode` | 不注入 | 由 kwarg 控制，默认 False | `non_think_mode` kwarg |
 
-有一个参数容易被误读成对齐 knob：`rollout_seed`（默认 42）**没有下发给 SGLang**。`_build_sampling_params()`（`adapter/openclaw_camel_adapter.py:314-328`）只发 `temperature`、`top_p`、`max_new_tokens`、`skip_special_tokens`，以及 `top_k > 0` 时的 `top_k`，不含 `seed`；`inference_client.py` 里也没有任何 `seed`。它只被写进轨迹 metadata（`:719`）。因此 mode B 的采样实际不是逐 trial 可复现的，真正生效的只有 SGLang 服务端的 `--random-seed`。这一点在七次历史评测中同样成立，改它会让结果不再与那七次同口径，所以这里只做记录，不做修改。
+有一个参数容易被误读成对齐 knob：`rollout_seed`（默认 42）**没有下发给 SGLang**。`_build_sampling_params()`（`adapter/openclaw_camel_adapter.py:314-328`）只发 `temperature`、`top_p`、`max_new_tokens`、`skip_special_tokens`，以及 `top_k > 0` 时的 `top_k`，不含 `seed`；`inference_client.py` 里也没有任何 `seed`。它只被写进轨迹 metadata（`:719`）。因此 mode B 的采样实际不是逐 trial 可复现的，真正生效的只有 SGLang 服务端的 `--random-seed`。这一点在八次历史评测中同样成立，改它会让结果不再与那八次同口径，所以这里只做记录，不做修改。
 
 ## 2. 适配器结构
 
@@ -42,7 +42,7 @@ transformers 5.x 起，`apply_chat_template(tokenize=True)` 返回 `BatchEncodin
 
 ## 4. 历史评测
 
-以下 7 次全量评测的数字均取自对应 issue 正文，可逐条回溯。Terminal-Bench 2.0 与 2.1 是两个不同的任务集，跨版本的数字不能直接相减。所有 `k=3` 的行都是 89 任务 × 3 次 = 267 个 trial；pass@3 一列是 empirical pass@3，即"至少通过一次的任务数 / 89"，不是无偏 pass@k 估计。
+以下 8 次全量评测的数字均取自对应 issue 正文，可逐条回溯。Terminal-Bench 2.0 与 2.1 是两个不同的任务集，跨版本的数字不能直接相减。所有 `k=3` 的行都是 89 任务 × 3 次 = 267 个 trial；pass@3 一列是 empirical pass@3，即"至少通过一次的任务数 / 89"，不是无偏 pass@k 估计。
 
 | Issue | 数据集 | 被测 checkpoint | Harness | pass@1 | pass@3 | 解出的任务 |
 |---|---|---|---:|---:|---:|---|
@@ -53,13 +53,14 @@ transformers 5.x 起，`apply_chat_template(tokenize=True)` 返回 `BatchEncodin
 | [#27](https://github.com/HansBug/OpenClaw-RL/issues/27) | TB 2.1 | Qwen3-8B base | **mode B** | 1.87%（5/267） | 3.37%（3/89） | `filter-js-from-html`、`modernize-scientific-stack`、`query-optimize` |
 | [#28](https://github.com/HansBug/OpenClaw-RL/issues/28) | TB 2.1 | RL outcome_gate iter299 | **mode B** | 2.25%（6/267） | 4.49%（4/89） | `modernize-scientific-stack`、`prove-plus-comm`、`qemu-startup`、`sqlite-with-gcov` |
 | [#29](https://github.com/HansBug/OpenClaw-RL/issues/29) | TB 2.1 | SETA-DAPO baseline mt10 iter899 | **mode B** | 1.87%（5/267） | 5.62%（5/89） | `configure-git-webserver`、`filter-js-from-html`、`hf-model-inference`、`modernize-scientific-stack`、`pypi-server` |
+| [#31](https://github.com/HansBug/OpenClaw-RL/issues/31) | TB 2.1 | SETA-DAPO baseline mt10 iter1099 | **mode B** | 1.12%（3/267） | 3.37%（3/89） | `configure-git-webserver`、`modernize-scientific-stack`、`qemu-startup` |
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="assets/harbor_camel_mode_b/modeb_pass_at_1_dark.png">
-  <img alt="七次全量评测的 pass@1 点估计与 Wilson 95% 置信区间，区间两两重叠" src="assets/harbor_camel_mode_b/modeb_pass_at_1_light.png">
+  <img alt="八次全量评测的 pass@1 点估计与 Wilson 95% 置信区间，区间两两重叠" src="assets/harbor_camel_mode_b/modeb_pass_at_1_light.png">
 </picture>
 
-把七行的点估计和 Wilson 95% 区间画在一起，是为了让"两两重叠"这件事一眼可见：表格里 1.12% 和 3.00% 看起来差了快三倍，但在 n=267、成功数只有个位数的量级上，它们的区间几乎完全套在一起。图由 `scripts/plot_modeb_eval_history.py` 生成，其 Wilson 实现在 `tests/test_openclaw_camel_adapter.py` 里对 #27、#28、#29 已公布的区间做了回归。
+把八行的点估计和 Wilson 95% 区间画在一起，是为了让"两两重叠"这件事一眼可见：表格里 1.12% 和 3.00% 看起来差了快三倍，但在 n=267、成功数只有个位数的量级上，它们的区间几乎完全套在一起。图由 `scripts/plot_modeb_eval_history.py` 生成，其 Wilson 实现在 `tests/test_openclaw_camel_adapter.py` 里对 #27、#28、#29 已公布的区间做了回归。
 
 另有一次 TB 2.1 × `qwen3-8b-rl-iter215` 的 `terminus-2`（mode A）单次全量跑，89 个 trial 聚合分数 2.0 / 89 = 2.25%，解出 `configure-git-webserver` 与 `hf-model-inference`；它是 [`TBV21_HARBOR_FULL_EVAL_zh.md`](TBV21_HARBOR_FULL_EVAL_zh.md) 里那套运维流程的验证运行，k=1 而非 k=3，被测 checkpoint 也不是上表里的任何一个，不与上表同口径，不要与 #27 的 mode B 数字混用。
 

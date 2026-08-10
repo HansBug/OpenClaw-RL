@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Plot recorded Terminal-Bench pass@1 with Wilson 95% intervals.
 
-The point of the figure is the overlap. Reporting seven point estimates in a
+The point of the figure is the overlap. Reporting eight point estimates in a
 table invites reading a 1.12% and a 3.00% as different; at n=267 with single
 digit success counts they are not separable, and drawing the intervals is the
 cheapest way to keep that in view.
@@ -59,6 +59,7 @@ EVALS = [
     Eval("#27", "Qwen3-8B base", "TB 2.1", "B", 5, 267),
     Eval("#28", "RL outcome_gate i299", "TB 2.1", "B", 6, 267),
     Eval("#29", "SETA-DAPO mt10 i899", "TB 2.1", "B", 5, 267),
+    Eval("#31", "SETA-DAPO mt10 i1099", "TB 2.1", "B", 3, 267),
 ]
 
 
