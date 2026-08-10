@@ -6,6 +6,9 @@
 
 ## 1. 指标口径
 
+**先明确它测的是什么分布。** 默认数据集 `terminal-rl/dataset/seta_env_convert/train.filtered.jsonl` 就是 SETA 训练所用的那一份（[issue #21](https://github.com/HansBug/OpenClaw-RL/issues/21) 的配置表把同一路径列为训练数据）。所以这套流程量的是「在训练分布上学到了多少」，不是泛化能力；要看泛化，用 Terminal-Bench 那条 held-out 线。两者互补，任何一方的数字都不能替另一方说话。
+
+
 `raw_score` 是 SETA 验证器返回的检查通过比例。`0.333333` 这类分数表示只通过了部分检查，具体检查项由每个任务自己的验证器定义。报告里不把训练过程中的 `task_reward` 或 `total_reward` 当作准确率，它们经过奖励塑形，与验证器分数不是一回事；分析脚本会把它们一并导出，仅供对照。
 
 每个比率都给两个分母。`*_completed_rows` 只统计产出了结果的样本；`*_all_dataset_missing_as_zero` 用整个数据集做分母，并把因基础设施问题没跑出结果的样本按 0 计。**报告口径用后者**，因为前者会把"跑不起来"的样本悄悄从分母里去掉，从而高估准确率。
