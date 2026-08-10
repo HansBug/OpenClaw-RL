@@ -364,6 +364,8 @@ import plot_modeb_eval_history as history_plot  # noqa: E402
         ("#28 pass@1", 6, 267, 1.03, 4.82),
         ("#28 pass@3", 4, 89, 1.76, 10.99),
         ("#29 pass@3", 5, 89, 2.42, 12.49),
+        ("#31 pass@1", 3, 267, 0.38, 3.25),
+        ("#31 pass@3", 3, 89, 1.15, 9.45),
     ],
 )
 def test_wilson_interval_reproduces_the_published_intervals(
