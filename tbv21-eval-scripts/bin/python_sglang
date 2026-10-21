@@ -1,0 +1,3 @@
+#!/usr/bin/env bash
+set -euo pipefail
+exec /mnt/shared-storage-user/tangjia/miniconda3/envs/slime/bin/python "$@"
