@@ -1,0 +1,27 @@
+--- orig/mbridge/models/qwen2.py	2026-10-22 12:06:30.822448356 +0000
++++ /home/ubuntu/miniconda3/envs/tbench-rl/lib/python3.12/site-packages/mbridge/models/qwen2.py	2026-04-23 15:00:31.497550128 +0000
+@@ -53,6 +53,24 @@
+             "model.layers.{layer_number}.post_attention_layernorm.weight"
+         ],
+         "mlp.linear_fc2.weight": ["model.layers.{layer_number}.mlp.down_proj.weight"],
++        # local (non-TE) impl: standalone pre_mlp_layernorm goes here because its
++        # name contains "mlp" so routing sends it to _MLP_MAPPING.
++        "pre_mlp_layernorm.weight": [
++            "model.layers.{layer_number}.post_attention_layernorm.weight"
++        ],
++    }
++    # local (non-TE) transformer_impl: standalone layernorm modules whose names
++    # do not contain "self_attention" or "mlp", so they land in _OTHER_MAPPING.
++    _OTHER_MAPPING = {
++        "input_layernorm.weight": [
++            "model.layers.{layer_number}.input_layernorm.weight"
++        ],
++        "pre_mlp_layernorm.weight": [
++            "model.layers.{layer_number}.post_attention_layernorm.weight"
++        ],
++        "post_attention_layernorm.weight": [
++            "model.layers.{layer_number}.post_attention_layernorm.weight"
++        ],
+     }
+ 
+     def _adjust_mapping_for_shared_weights(self):
